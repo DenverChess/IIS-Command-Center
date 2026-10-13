@@ -1,0 +1,58 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>IIS SENTINEL // AUTHENTICATE</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;700&display=swap">
+  <link rel="icon" href="data:,">
+  <link rel="stylesheet" href="/static/css/style.css">
+  <script src="/static/js/app.js"></script>
+  <script defer src="/static/js/vendor/alpine.min.js"></script>
+</head>
+<body class="login-body">
+  <div class="fx-grid"></div>
+  <div class="fx-vignette"></div>
+  <div class="fx-scanlines"></div>
+
+  <main class="login-wrap" x-data="loginApp()">
+    <form class="login-box" @submit.prevent="submit()" autocomplete="on" novalidate>
+      <span class="corner tl"></span><span class="corner tr"></span>
+      <span class="corner bl"></span><span class="corner br"></span>
+
+      <div class="login-logo">
+        <div class="glyph"><span>S</span></div>
+        <h1 class="neon-cyan">IIS SENTINEL</h1>
+        <p>W3C DEFENSE GRID // ACTIVE DIRECTORY GATE</p>
+      </div>
+
+      <div class="field">
+        <label for="username">AD Username</label>
+        <input id="username" class="input" type="text" x-model="username" x-ref="user" autocomplete="username"
+               spellcheck="false" autocapitalize="off" placeholder="DOMAIN\operator or operator@corp.local" :disabled="busy">
+      </div>
+      <div class="field">
+        <label for="password">Password</label>
+        <input id="password" class="input" type="password" x-model="password" autocomplete="current-password"
+               placeholder="••••••••••••" :disabled="busy">
+      </div>
+
+      <button type="submit" class="btn btn-init" :class="{ busy: busy }" :disabled="busy || !username || !password">
+        <span x-text="busy ? 'AUTHENTICATING…' : 'INITIALIZE SENTINEL'"></span>
+      </button>
+
+      <div class="login-error" x-show="error" x-cloak x-text="error"></div>
+
+      <div class="boot-log" aria-live="polite">
+        <template x-for="(line, i) in boot" :key="i">
+          <div :class="{ ok: line.ok }" x-text="line.text"></div>
+        </template>
+      </div>
+
+      <div class="login-footer">AUTHORISED PERSONNEL ONLY // ALL ACCESS IS LOGGED</div>
+    </form>
+  </main>
+</body>
+</html>
