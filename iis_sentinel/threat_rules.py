@@ -1,6 +1,7 @@
-"""Signature + behaviour threat detection and per-IP threat scoring.
+"""Signature + behaviour threat detection and per-(server, source IP) threat scoring.
 
-Scoring (per source IP, decays with a configurable half-life):
+An attacker hitting IIS-01 and IIS-02 is tracked independently on each server, so a ban is executed on the
+server that is actually under attack. Scoring (decays with a configurable half-life):
     +10  SQL injection signature           +10  XSS signature
     +10  path traversal / LFI signature    +5   known scanner user-agent
     +5   404 spike within the spike window +5   401/403 spike within the spike window
@@ -17,10 +18,10 @@ import time
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import unquote_plus
 
-from database import ConfigStore
+from database import LOCAL_SERVER_ID, ConfigStore
 
 SCORE_SQLI = 10
 SCORE_XSS = 10
@@ -137,6 +138,8 @@ def _match_any(patterns: list[re.Pattern[str]], text: str) -> bool:
 class IPState:
     ip: str
     geo: str
+    server_id: int = LOCAL_SERVER_ID
+    server_name: str = ""
     score: float = 0.0
     first_seen: float = field(default_factory=time.time)
     last_seen: float = field(default_factory=time.time)
@@ -157,8 +160,11 @@ class IPState:
     def to_dict(self, threshold: float) -> dict[str, Any]:
         now = time.time()
         return {
+            "key": f"{self.server_id}|{self.ip}",
             "ip": self.ip,
             "geo": self.geo,
+            "server_id": self.server_id,
+            "server_name": self.server_name,
             "score": round(self.score, 1),
             "peak_score": round(self.peak_score, 1),
             "threshold": threshold,
@@ -185,23 +191,29 @@ class Inspection:
 class ThreatEngine:
     MAX_TRACKED = 50000
 
-    def __init__(self, config: ConfigStore) -> None:
+    def __init__(self, config: ConfigStore, server_name: Callable[[int], str] | None = None) -> None:
         self.config = config
-        self._ips: dict[str, IPState] = {}
+        self._server_name = server_name or (lambda sid: f"SRV-{sid}")
+        self._ips: dict[tuple[int, str], IPState] = {}
         self.total_attacks = 0
 
     # ------------------------------------------------------------------ helpers
     def _cfg(self) -> dict[str, Any]:
         return self.config.get("watchers")
 
-    def _state(self, ip: str) -> IPState:
-        st = self._ips.get(ip)
+    def _state(self, server_id: int, ip: str) -> IPState:
+        key = (server_id, ip)
+        st = self._ips.get(key)
         if st is None:
             if len(self._ips) >= self.MAX_TRACKED:
                 self.prune(force=True)
-            st = IPState(ip=ip, geo=simulate_geo(ip))
-            self._ips[ip] = st
+            st = IPState(ip=ip, geo=simulate_geo(ip), server_id=server_id, server_name=self._server_name(server_id))
+            self._ips[key] = st
         return st
+
+    @staticmethod
+    def _event(st: IPState, **kw: Any) -> dict[str, Any]:
+        return {"ip": st.ip, "server_id": st.server_id, "server_name": st.server_name, **kw}
 
     def _decay(self, st: IPState, now: float, half_life_min: float) -> None:
         elapsed = now - st.last_decay
@@ -221,10 +233,10 @@ class ThreatEngine:
         threshold = float(cfg["threat_score_threshold"])
         if not st.active and st.score > threshold:
             st.active = True
-            return [{"kind": "active_threat", "ip": st.ip, "state": st.to_dict(threshold)}]
+            return [self._event(st, kind="active_threat", state=st.to_dict(threshold))]
         if st.active and st.score < threshold * 0.6:
             st.active = False
-            return [{"kind": "threat_cleared", "ip": st.ip, "state": st.to_dict(threshold)}]
+            return [self._event(st, kind="threat_cleared", state=st.to_dict(threshold))]
         return []
 
     # ------------------------------------------------------------------ public API
@@ -232,7 +244,7 @@ class ThreatEngine:
         cfg = self._cfg()
         now = time.time()
         ip = entry.get("c_ip") or "0.0.0.0"
-        st = self._state(ip)
+        st = self._state(int(entry.get("server_id") or LOCAL_SERVER_ID), ip)
         self._decay(st, now, float(cfg["threat_half_life_minutes"]))
         st.requests += 1
         st.last_seen = now
@@ -277,12 +289,12 @@ class ThreatEngine:
             st.last_404_spike = log_t
             tags.append("404_SPIKE")
             delta += SCORE_404_SPIKE
-            events.append({"kind": "spike", "ip": ip, "spike": "404", "count": len(st.w404), "window": window})
+            events.append(self._event(st, kind="spike", spike="404", count=len(st.w404), window=window))
         if status in (401, 403) and len(st.wauth) >= int(cfg["spike_auth_threshold"]) and log_t - st.last_auth_spike >= window:
             st.last_auth_spike = log_t
             tags.append("AUTH_SPIKE")
             delta += SCORE_AUTH_SPIKE
-            events.append({"kind": "spike", "ip": ip, "spike": "401/403", "count": len(st.wauth), "window": window})
+            events.append(self._event(st, kind="spike", spike="401/403", count=len(st.wauth), window=window))
 
         if tags:
             st.last_attack = now
@@ -293,15 +305,15 @@ class ThreatEngine:
             signature_tags = [t for t in tags if t in ("SQLI", "XSS", "TRAVERSAL", "SCANNER")]
             if signature_tags:
                 self.total_attacks += 1
-                events.append({"kind": "signature", "ip": ip, "tags": signature_tags, "payload": raw[:500], "status": status})
+                events.append(self._event(st, kind="signature", tags=signature_tags, payload=raw[:500], status=status))
             events.extend(self._add(st, delta, cfg))
         else:
             events.extend(self._check_escalation(st, cfg))
         return Inspection(tags=tags, delta=delta, events=events)
 
-    def apply_anomaly(self, ip: str, metric: str, zscore: float) -> tuple[int, list[dict[str, Any]]]:
+    def apply_anomaly(self, server_id: int, ip: str, metric: str, zscore: float) -> tuple[int, list[dict[str, Any]]]:
         cfg = self._cfg()
-        st = self._state(ip)
+        st = self._state(server_id, ip)
         now = time.time()
         self._decay(st, now, float(cfg["threat_half_life_minutes"]))
         st.last_attack = now
@@ -310,13 +322,15 @@ class ThreatEngine:
         st.last_payload = st.last_payload or f"[{tag}] z={zscore:.1f}"
         return SCORE_ZSCORE, self._add(st, SCORE_ZSCORE, cfg)
 
-    def active_threats(self, limit: int = 50, min_score: float = 5.0) -> list[dict[str, Any]]:
+    def active_threats(self, limit: int = 50, min_score: float = 5.0, server_id: int | None = None) -> list[dict[str, Any]]:
         cfg = self._cfg()
         threshold = float(cfg["threat_score_threshold"])
         now = time.time()
         half_life = float(cfg["threat_half_life_minutes"])
         out = []
         for st in self._ips.values():
+            if server_id is not None and st.server_id != server_id:
+                continue
             if st.score <= 0 and not st.active:
                 continue
             self._decay(st, now, half_life)
@@ -325,9 +339,37 @@ class ThreatEngine:
         out.sort(key=lambda d: (d["active"], d["score"]), reverse=True)
         return out[:limit]
 
-    def ip_detail(self, ip: str) -> dict[str, Any] | None:
-        st = self._ips.get(ip)
-        return st.to_dict(float(self._cfg()["threat_score_threshold"])) if st else None
+    def ip_detail(self, ip: str, server_id: int | None = None) -> dict[str, Any] | None:
+        threshold = float(self._cfg()["threat_score_threshold"])
+        if server_id is not None:
+            st = self._ips.get((server_id, ip))
+            return st.to_dict(threshold) if st else None
+        matches = [st for (sid, sip), st in self._ips.items() if sip == ip]
+        if not matches:
+            return None
+        best = max(matches, key=lambda s: s.score)
+        out = best.to_dict(threshold)
+        out["servers"] = [s.to_dict(threshold) for s in sorted(matches, key=lambda s: s.score, reverse=True)]
+        return out
+
+    def rename_server(self, server_id: int, name: str) -> None:
+        for st in self._ips.values():
+            if st.server_id == server_id:
+                st.server_name = name
+
+    def server_ids(self) -> set[int]:
+        return {k[0] for k in self._ips}
+
+    def forget_server(self, server_id: int) -> None:
+        for key in [k for k in self._ips if k[0] == server_id]:
+            del self._ips[key]
+
+    def clear(self, server_id: int, ip: str) -> None:
+        """Reset scoring after a ban so the IP drops off the pending list."""
+        st = self._ips.get((server_id, ip))
+        if st:
+            st.score = 0.0
+            st.active = False
 
     def counts(self) -> dict[str, int]:
         active = sum(1 for s in self._ips.values() if s.active)
@@ -336,10 +378,10 @@ class ThreatEngine:
     def prune(self, force: bool = False) -> int:
         now = time.time()
         idle = 600 if force else 3600
-        stale = [ip for ip, s in self._ips.items() if not s.active and s.score < 1 and now - s.last_seen > idle]
+        stale = [k for k, s in self._ips.items() if not s.active and s.score < 1 and now - s.last_seen > idle]
         if force and len(stale) < len(self._ips) // 10:
-            by_age = sorted(self._ips.values(), key=lambda s: s.last_seen)
-            stale = [s.ip for s in by_age[: len(self._ips) // 5] if not s.active]
-        for ip in stale:
-            del self._ips[ip]
+            by_age = sorted(self._ips.items(), key=lambda kv: kv[1].last_seen)
+            stale = [k for k, s in by_age[: len(self._ips) // 5] if not s.active]
+        for k in stale:
+            del self._ips[k]
         return len(stale)

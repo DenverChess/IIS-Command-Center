@@ -16,10 +16,14 @@ import random
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 from urllib.parse import quote
 
-from database import DEMO_LOG_DIR, ConfigStore
+from database import DEMO_LOG_ROOT, DEMO_SERVERS, ConfigStore
+
+if TYPE_CHECKING:
+    from database import ServerRegistry
+    from remote_manager import RemoteManager
 
 log = logging.getLogger("sentinel.tailer")
 
@@ -261,23 +265,166 @@ class DirectoryTailer:
         return out
 
 
+StatusCallback = Callable[[int, str, bool, "str | None"], Awaitable[None]]
+
+
 class LogTailer:
-    def __init__(self, config: ConfigStore, queue: asyncio.Queue[dict[str, Any]]) -> None:
+    """Runs one independent task per monitored server.
+
+    Remote servers are read over their UNC path through RemoteManager.read_remote_logs(); the optional local
+    server (Sentinel co-located on an IIS box) is read from `watchers.log_dirs`. A failing server only backs
+    off its own task, so one offline IIS box never delays the others.
+    """
+
+    RECONCILE_SECONDS = 5.0
+
+    def __init__(self, config: ConfigStore, registry: "ServerRegistry", remote: "RemoteManager",
+                 queue: asyncio.Queue[dict[str, Any]], on_status: StatusCallback | None = None) -> None:
         self.config = config
+        self.registry = registry
+        self.remote = remote
         self.queue = queue
-        self._tailers: dict[str, DirectoryTailer] = {}
-        self._wake: asyncio.Event | None = None
+        self.on_status = on_status
+        self._tasks: dict[int, tuple[tuple[Any, ...], asyncio.Task[None]]] = {}
+        self._reconcile = asyncio.Event()
+        self._local_tailers: dict[str, DirectoryTailer] = {}
+        self._local_wake: asyncio.Event | None = None
         self._loop: asyncio.AbstractEventLoop | None = None
         self._observer: Any = None
         self._watches: dict[str, Any] = {}
         self._last_watch_attempt: dict[str, float] = {}
         self._cfg_sig: tuple[Any, ...] | None = None
 
+    def reload(self) -> None:
+        self._reconcile.set()
+
     def status(self) -> list[dict[str, Any]]:
-        return [t.info() for t in self._tailers.values()]
+        out = []
+        for server in self.registry.all(enabled_only=False):
+            sid = server["id"]
+            base = {"server_id": sid, "server_name": server["server_name"],
+                    "connection": self.registry.status.get(sid, {}).get("logs")}
+            if server.get("local"):
+                out.extend({**base, **t.info()} for t in self._local_tailers.values())
+            else:
+                info = self.remote.tailer_status(sid) or {"directory": server.get("log_unc_path") or None,
+                                                          "status": "not configured" if not server.get("log_unc_path") else "initialising",
+                                                          "lines_parsed": 0, "parse_errors": 0, "rollovers": 0}
+                out.append({**base, **info})
+        return out
+
+    # ------------------------------------------------------------------ orchestration
+    @staticmethod
+    def _signature(server: dict[str, Any]) -> tuple[Any, ...]:
+        return (server.get("log_unc_path"), tuple(server.get("log_dirs") or ()), server.get("ip_address"),
+                server.get("winrm_username"), server.get("winrm_password"))
+
+    async def run(self) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._local_wake = asyncio.Event()
+        try:
+            while True:
+                self._reconcile_tasks()
+                try:
+                    await asyncio.wait_for(self._reconcile.wait(), timeout=self.RECONCILE_SECONDS)
+                except asyncio.TimeoutError:
+                    pass
+                self._reconcile.clear()
+        finally:
+            for _sig, task in self._tasks.values():
+                task.cancel()
+            await asyncio.gather(*(t for _s, t in self._tasks.values()), return_exceptions=True)
+            self._tasks.clear()
+            self.stop()
+
+    def _reconcile_tasks(self) -> None:
+        desired = {s["id"]: s for s in self.registry.all(enabled_only=True)}
+        for sid in list(self._tasks):
+            sig, task = self._tasks[sid]
+            server = desired.get(sid)
+            if server is None or sig != self._signature(server) or task.done():
+                if task.done() and not task.cancelled() and task.exception():
+                    log.error("Log task for server %s died: %r (restarting)", sid, task.exception())
+                task.cancel()
+                del self._tasks[sid]
+                if server is None:
+                    self.remote.forget(sid)
+                    log.info("Stopped log monitoring for server %s", sid)
+        for sid, server in desired.items():
+            if sid not in self._tasks:
+                task = asyncio.create_task(self._server_loop(sid), name=f"logs:{server['server_name']}")
+                self._tasks[sid] = (self._signature(server), task)
+                log.info("Started log monitoring for %s", server["server_name"])
+
+    async def _report(self, server_id: int, ok: bool, error: str | None) -> None:
+        if self.registry.set_status(server_id, "logs", ok, error):
+            name = self.registry.name(server_id)
+            if ok:
+                log.info("[%s] log feed online", name)
+            else:
+                log.error("[%s] log feed offline: %s", name, error)
+            if self.on_status is not None:
+                try:
+                    await self.on_status(server_id, "logs", ok, error)
+                except Exception:  # noqa: BLE001
+                    log.exception("Log status callback failed")
+
+    async def _server_loop(self, server_id: int) -> None:
+        backoff = 2.0
+        while True:
+            server = self.registry.get(server_id)
+            if server is None:
+                return
+            name = server["server_name"]
+            try:
+                if server.get("local"):
+                    entries, more = await self._poll_local()
+                else:
+                    entries, more = await self.remote.read_remote_logs(server_id)
+                await self._report(server_id, True, None)
+                backoff = 2.0
+                for e in entries:
+                    e["server_id"] = server_id
+                    e["server_name"] = name
+                    await self.queue.put(e)
+                if more:
+                    await asyncio.sleep(0)
+                    continue
+                await self._idle(bool(server.get("local")))
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:  # noqa: BLE001
+                await self._report(server_id, False, f"{type(exc).__name__}: {exc}")
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60.0)
+
+    async def _idle(self, local: bool) -> None:
+        interval = float(self.config.value("watchers", "poll_interval", 2))
+        if local and self._local_wake is not None:
+            try:
+                await asyncio.wait_for(self._local_wake.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+            self._local_wake.clear()
+        else:
+            await asyncio.sleep(interval)
+
+    # ------------------------------------------------------------------ local server (watchdog + polling)
+    async def _poll_local(self) -> tuple[list[dict[str, Any]], bool]:
+        self._sync_local()
+        out: list[dict[str, Any]] = []
+        more = False
+        for tailer in list(self._local_tailers.values()):
+            try:
+                out.extend(await asyncio.to_thread(tailer.poll))
+            except Exception:  # noqa: BLE001
+                log.exception("Local tailer for %s failed", tailer.directory)
+                continue
+            more = more or tailer.has_more
+        return out, more
 
     def _notify(self) -> None:
-        loop, wake = self._loop, self._wake
+        loop, wake = self._loop, self._local_wake
         if loop is None or wake is None:
             return
         try:
@@ -323,58 +470,29 @@ class LogTailer:
         except Exception as exc:  # noqa: BLE001
             log.warning("Could not watch %s (%s); polling only", directory, exc)
 
-    def _sync_config(self) -> None:
+    def _sync_local(self) -> None:
         cfg = self.config.get("watchers")
         dirs = [str(Path(d)) for d in cfg.get("log_dirs") or []]
         sig = (tuple(dirs), cfg.get("file_pattern"), cfg.get("start_at_end"))
         if sig != self._cfg_sig:
             self._cfg_sig = sig
-            for d in list(self._tailers):
+            for d in list(self._local_tailers):
                 if d not in dirs:
-                    del self._tailers[d]
+                    del self._local_tailers[d]
                     watch = self._watches.pop(d, None)
                     if watch is not None and self._observer is not None:
                         try:
                             self._observer.unschedule(watch)
                         except Exception:  # noqa: BLE001
                             pass
-                    log.info("Stopped tailing %s", d)
             for d in dirs:
-                t = self._tailers.get(d)
+                t = self._local_tailers.get(d)
                 if t is None:
-                    self._tailers[d] = DirectoryTailer(Path(d), cfg.get("file_pattern") or "*.log", bool(cfg.get("start_at_end", True)))
+                    self._local_tailers[d] = DirectoryTailer(Path(d), cfg.get("file_pattern") or "*.log", bool(cfg.get("start_at_end", True)))
                 else:
                     t.pattern = cfg.get("file_pattern") or "*.log"
-        for d in self._tailers:
+        for d in self._local_tailers:
             self._watch(d)
-
-    async def run(self) -> None:
-        self._loop = asyncio.get_running_loop()
-        self._wake = asyncio.Event()
-        try:
-            while True:
-                self._sync_config()
-                more = False
-                for tailer in list(self._tailers.values()):
-                    try:
-                        entries = await asyncio.to_thread(tailer.poll)
-                    except Exception:  # noqa: BLE001
-                        log.exception("Tailer for %s failed", tailer.directory)
-                        continue
-                    for e in entries:
-                        await self.queue.put(e)
-                    more = more or tailer.has_more
-                if more:
-                    await asyncio.sleep(0)
-                    continue
-                interval = float(self.config.value("watchers", "poll_interval", 2))
-                try:
-                    await asyncio.wait_for(self._wake.wait(), timeout=interval)
-                except asyncio.TimeoutError:
-                    pass
-                self._wake.clear()
-        finally:
-            self.stop()
 
     def stop(self) -> None:
         if self._observer is not None:
@@ -424,8 +542,9 @@ _SCAN = ["/wp-login.php", "/.env", "/phpmyadmin/", "/admin/config.php", "/backup
 
 
 class DemoTrafficGenerator:
-    def __init__(self, directory: Path = DEMO_LOG_DIR) -> None:
+    def __init__(self, directory: Path, server_ip: str = "10.0.0.15") -> None:
         self.directory = directory
+        self.server_ip = server_ip
         self.directory.mkdir(parents=True, exist_ok=True)
         self.normal_ips = [f"10.20.{random.randint(0, 9)}.{random.randint(2, 250)}" for _ in range(25)] + [
             f"{random.choice([52, 73, 98, 142, 172, 203])}.{random.randint(1, 254)}.{random.randint(1, 254)}.{random.randint(1, 254)}"
@@ -436,7 +555,7 @@ class DemoTrafficGenerator:
         self._segment = 0
         self._segment_started = time.monotonic()
         self._campaign: dict[str, Any] | None = None
-        self._next_campaign = time.monotonic() + 20
+        self._next_campaign = time.monotonic() + random.uniform(15, 60)
 
     def _path(self) -> Path:
         now = datetime.now(timezone.utc)
@@ -451,7 +570,7 @@ class DemoTrafficGenerator:
         sub = 0 if status != 401 else 2
         win32 = 0 if status < 400 else (2 if status == 404 else 5)
         return (
-            f"{now:%Y-%m-%d %H:%M:%S} 10.0.0.15 {method} {stem} {query or '-'} 443 {user} {ip} "
+            f"{now:%Y-%m-%d %H:%M:%S} {self.server_ip} {method} {stem} {query or '-'} 443 {user} {ip} "
             f"{ua.replace(' ', '+')} - {status} {sub} {win32} {nbytes} {random.randint(300, 900)} {tt}"
         )
 
@@ -511,7 +630,7 @@ class DemoTrafficGenerator:
                     self._campaign = None
                     self._next_campaign = mono + random.uniform(30, 90)
 
-                for _ in range(random.randint(1, 6)):
+                for _ in range(random.randint(1, 4)):
                     lines.append(self._normal())
                 if self._campaign:
                     burst = 12 if self._campaign["kind"] == "flood" else random.randint(1, 4)
@@ -522,3 +641,13 @@ class DemoTrafficGenerator:
             except Exception:  # noqa: BLE001
                 log.exception("Demo generator error")
             await asyncio.sleep(random.uniform(0.3, 0.9))
+
+
+async def run_demo_fleet() -> None:
+    """One generator per simulated demo server, each writing to the directory its MonitoredServer row points at."""
+    gens = [
+        DemoTrafficGenerator(DEMO_LOG_ROOT / name / "W3SVC1", server_ip=f"10.0.{i}.15")
+        for i, (name, ip) in enumerate(DEMO_SERVERS, start=1)
+        if ip.startswith("127.")
+    ]
+    await asyncio.gather(*(g.run() for g in gens))

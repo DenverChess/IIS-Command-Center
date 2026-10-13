@@ -6,11 +6,11 @@ import json
 import logging
 import time
 from collections import deque
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 
 from sqlalchemy import update
 
-from database import SEVERITIES, Alert, ConfigStore, iso, run_db, utcnow
+from database import LOCAL_SERVER_ID, SEVERITIES, ActionableAlert, ConfigStore, iso, run_db, utcnow
 
 if TYPE_CHECKING:
     from mailer import Mailer
@@ -69,6 +69,14 @@ class AlertManager:
         self._cooldowns: dict[str, float] = {}
         self._recent: deque[dict[str, Any]] = deque(maxlen=200)
         self._tasks: set[asyncio.Task[Any]] = set()
+        self.server_name: Callable[[int], str] = lambda sid: f"SRV-{sid}"
+
+    def update_recent(self, alert_id: int, **fields: Any) -> dict[str, Any] | None:
+        for rec in self._recent:
+            if rec.get("id") == alert_id:
+                rec.update(fields)
+                return rec
+        return None
 
     def recent(self, limit: int = 50) -> list[dict[str, Any]]:
         return list(self._recent)[:limit]
@@ -96,15 +104,25 @@ class AlertManager:
         details: dict[str, Any] | None = None,
         dedup_key: str | None = None,
         cooldown: float = 0,
+        server_id: int = LOCAL_SERVER_ID,
+        actionable: bool | None = None,
     ) -> dict[str, Any] | None:
         severity = severity if severity in SEVERITY_RANK else "INFO"
         if self._cooling(dedup_key, cooldown):
             return None
         ts = utcnow()
         details = details or {}
+        # Actionable alerts (an attacker IP that can be approved for a firewall ban) start as Pending.
+        if actionable is None:
+            actionable = bool(source_ip) and category in ("attack", "threat")
+        status = "Pending" if actionable and source_ip else "Info"
+        server_name = self.server_name(server_id)
         record: dict[str, Any] = {
             "id": None,
             "ts": iso(ts),
+            "server_id": server_id,
+            "server_name": server_name,
+            "status": status,
             "severity": severity,
             "category": category,
             "title": title[:256],
@@ -117,7 +135,9 @@ class AlertManager:
             payload = json.dumps(details, default=str)
 
             async def _op(s):  # type: ignore[no-untyped-def]
-                row = Alert(
+                row = ActionableAlert(
+                    server_id=server_id,
+                    status=status,
                     ts=ts,
                     severity=severity,
                     category=category,
@@ -136,9 +156,10 @@ class AlertManager:
 
         log.log(
             logging.CRITICAL if severity == "CRITICAL" else logging.WARNING if severity in ("HIGH", "WARNING") else logging.INFO,
-            "ALERT [%s/%s] %s %s",
+            "ALERT [%s/%s] [%s] %s %s",
             severity,
             category,
+            server_name,
             title,
             f"({source_ip})" if source_ip else "",
         )
@@ -159,7 +180,7 @@ class AlertManager:
                 alert_id = record["id"]
 
                 async def _op(s):  # type: ignore[no-untyped-def]
-                    await s.execute(update(Alert).where(Alert.id == alert_id).values(emailed=True))
+                    await s.execute(update(ActionableAlert).where(ActionableAlert.id == alert_id).values(emailed=True))
 
                 await run_db(_op)
         except Exception:  # noqa: BLE001

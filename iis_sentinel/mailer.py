@@ -165,7 +165,8 @@ class Mailer:
             log.warning("Alert mail rate limit (%d/h) reached; not mailing '%s'", limit, record.get("title"))
             return False
         self._alert_times.append(now)
-        subject = f"[IIS Sentinel][{record.get('severity')}] {record.get('title')}"
+        server = f"[{record['server_name']}] " if record.get("server_name") else ""
+        subject = f"[IIS Sentinel][{record.get('severity')}] {server}{record.get('title')}"
         ok, err = await self.send(subject, render_alert_html(record))
         if not ok:
             log.warning("Alert mail not delivered: %s", err)
@@ -221,7 +222,7 @@ def render_alert_html(record: dict[str, Any]) -> str:
 </td></tr>
 <tr><td style="padding:24px;">
 <h2 style="margin:0 0 12px 0;color:{color};font-size:20px;">{esc(str(record.get("title", "")))}</h2>
-<p style="margin:0 0 8px 0;color:#9fb3c8;">Time: {esc(str(record.get("ts", "")))} &nbsp;|&nbsp; Category: {esc(str(record.get("category", "")))}</p>
+<p style="margin:0 0 8px 0;color:#9fb3c8;">Server: <b style="color:#00f3ff;">{esc(str(record.get("server_name") or "-"))}</b> &nbsp;|&nbsp; Time: {esc(str(record.get("ts", "")))} &nbsp;|&nbsp; Category: {esc(str(record.get("category", "")))}</p>
 {source}
 <p style="margin:16px 0;color:#d6f9ff;line-height:1.5;">{esc(str(record.get("message", "")))}</p>
 {f'<table width="100%" cellpadding="0" cellspacing="0" style="margin-top:12px;font-size:12px;border:1px solid #15232b;">{rows}</table>' if rows else ''}
