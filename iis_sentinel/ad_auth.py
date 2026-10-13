@@ -9,6 +9,7 @@ import ssl
 from dataclasses import dataclass, field
 from typing import Any
 
+import local_admin
 from database import DEMO_MODE, ConfigStore
 
 log = logging.getLogger("sentinel.ad")
@@ -39,7 +40,7 @@ class ADAuthenticator:
         if len(username) > 256 or len(password) > 512 or any(ord(c) < 32 for c in username):
             return AuthResult(False, error="Invalid credentials")
 
-        local = self._local_account(username, password)
+        local = await asyncio.to_thread(self._local_account, username, password)
         if local is not None:
             return local
 
@@ -60,14 +61,20 @@ class ADAuthenticator:
     @staticmethod
     def _local_account(username: str, password: str) -> AuthResult | None:
         """Break-glass local login so the console stays reachable when AD is down or not yet configured."""
-        local_user = os.environ.get("SENTINEL_LOCAL_ADMIN_USER", "sentinel-admin")
+        local_user = os.environ.get("SENTINEL_LOCAL_ADMIN_USER", local_admin.DEFAULT_USER)
         local_pass = os.environ.get("SENTINEL_LOCAL_ADMIN_PASSWORD", "")
-        if DEMO_MODE and not local_pass:
+        stored = None if local_pass else local_admin.load()
+        if stored:
+            local_user = stored["user"]
+        elif DEMO_MODE and not local_pass:
             local_user, local_pass = "demo", "demo"
-        if not local_pass:
+        if not local_pass and not stored:
             return None
         if hmac.compare_digest(username.lower().encode(), local_user.lower().encode()):
-            if hmac.compare_digest(password.encode(), local_pass.encode()):
+            ok = local_admin.verify_password(password, stored["hash"]) if stored else hmac.compare_digest(
+                password.encode(), local_pass.encode()
+            )
+            if ok:
                 log.warning("Break-glass local login used by '%s'", username)
                 return AuthResult(True, username=local_user, display_name="Local Administrator", source="local")
             return AuthResult(False, error="Invalid credentials")
