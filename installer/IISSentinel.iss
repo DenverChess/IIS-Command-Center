@@ -5,7 +5,7 @@
 ;   IISSentinel-Setup-2.0.0.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART
 ;       /ADMINPASSWORD=<pw>   break-glass password (required on first install, optional on upgrade)
 ;       /ADMINUSER=<name>     break-glass account name (default sentinel-admin)
-;       /PORT=<port>          console port (default 8443)
+;       /PORT=<port>          console port (default 1337)
 ;       /REMOTEACCESS=1|0     listen on all interfaces + open the port in Windows Firewall (default 0)
 ; Silent uninstall keeps %ProgramData%\IIS Sentinel unless /PURGEDATA is passed to unins000.exe.
 
@@ -261,7 +261,7 @@ begin
   SettingsPage.Add('Break-glass password:', True);
   SettingsPage.Add('Confirm password:', True);
 
-  SettingsPage.Values[0] := GetParam('PORT', GetPreviousData('Port', '8443'));
+  SettingsPage.Values[0] := GetParam('PORT', GetPreviousData('Port', '1337'));
   SettingsPage.Values[1] := GetParam('ADMINUSER', GetPreviousData('AdminUser', 'sentinel-admin'));
   Password := GetParam('ADMINPASSWORD', '');
   SettingsPage.Values[2] := Password;

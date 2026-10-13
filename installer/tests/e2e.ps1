@@ -14,7 +14,7 @@
 param(
     [Parameter(Mandatory)][string]$Installer,
     [string]$ArtifactDir = (Join-Path $PSScriptRoot "e2e-artifacts"),
-    [int]$Port = 8443
+    [int]$Port = 1337
 )
 
 $ErrorActionPreference = "Stop"

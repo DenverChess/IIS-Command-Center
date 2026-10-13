@@ -1,6 +1,6 @@
 """IIS Sentinel - FastAPI application: REST API, WebSocket push and background task orchestration.
 
-Run:  python main.py            (or: uvicorn main:app --host 0.0.0.0 --port 8443)
+Run:  python main.py            (or: uvicorn main:app --host 0.0.0.0 --port 1337)
 """
 from __future__ import annotations
 
@@ -1185,7 +1185,7 @@ if __name__ == "__main__":
     import uvicorn
 
     host = os.environ.get("SENTINEL_HOST", "0.0.0.0")
-    port = int(os.environ.get("SENTINEL_PORT", "8443"))
+    port = int(os.environ.get("SENTINEL_PORT", "1337"))
     ssl_cert = os.environ.get("SENTINEL_SSL_CERT")
     ssl_key = os.environ.get("SENTINEL_SSL_KEY")
     uvicorn.run(
