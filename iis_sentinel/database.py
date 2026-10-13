@@ -254,6 +254,12 @@ def _migrate(sync_conn: Any) -> None:
             if existing and name not in existing:
                 sync_conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
                 log.info("Migrated %s: added column %s", table, name)
+                if (table, name) == ("alerts", "status"):
+                    # Pre-SOC alerts were never approved; only open attacker alerts belong in the approval queue.
+                    sync_conn.exec_driver_sql(
+                        "UPDATE alerts SET status = 'Info' WHERE source_ip IS NULL OR source_ip = '' "
+                        "OR category NOT IN ('attack', 'threat') OR acknowledged = 1"
+                    )
     for ddl in (
         "CREATE INDEX IF NOT EXISTS ix_log_entries_server_id ON log_entries (server_id)",
         "CREATE INDEX IF NOT EXISTS ix_log_server_ts ON log_entries (server_id, ts)",

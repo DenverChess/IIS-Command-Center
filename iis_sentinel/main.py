@@ -280,7 +280,6 @@ class Pipeline:
                 f"{labels.get(metric, metric)} anomaly{f' from {ip}' if ip else ''} (z={a['z']:+.1f})",
                 f"Observed {a['value']:,.0f} {unit} vs baseline mean {a['mean']:,.1f} (std {a['std']:,.1f}, basis: {a['basis']}).",
                 source_ip=ip, details=a, dedup_key=f"anomaly:{sid}:{metric}:{ip or '*'}", cooldown=600, server_id=sid,
-                actionable=bool(ip) and metric in ("rpm", "bpm"),
             )
 
     async def _process(self, entry: dict[str, Any]) -> None:

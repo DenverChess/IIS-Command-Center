@@ -439,7 +439,11 @@ class Baseliner:
             glob = self.global_stats
         return {
             "current": current,
-            "per_server": {sid: lv.current for sid, lv in self._live.items()},
+            "per_server": {
+                sid: {"current": (self._live[sid].current if sid in self._live else _Live().current),
+                      "global": {k: v.to_dict() for k, v in self.server_stats.get(sid, {}).items()}}
+                for sid in set(self._live) | set(self.server_stats)
+            },
             "global": {k: v.to_dict() for k, v in glob.items()},
             "population": {k: v.to_dict() for k, v in self.population.items()},
             "tracked_ips": len(self.ip_stats),
