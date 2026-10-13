@@ -18,9 +18,12 @@ from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy import case, desc, func, select
 
 from database import (
+    LOCAL_SERVER_ID,
     ActionableAlert,
+    BannedIP,
     ConfigStore,
     LogEntry,
+    MonitoredServer,
     ScheduledReport,
     SessionLocal,
     SystemMetric,
@@ -193,9 +196,58 @@ class Reporter:
                 )
             ).one()
             pool_rows = (
-                await s.execute(select(SystemMetric.app_pools).where((SystemMetric.ts >= start) & (SystemMetric.ts < end)))
-            ).scalars().all()
+                await s.execute(select(SystemMetric.server_id, SystemMetric.app_pools).where((SystemMetric.ts >= start) & (SystemMetric.ts < end)))
+            ).all()
             latest = (await s.execute(select(SystemMetric).order_by(desc(SystemMetric.id)).limit(1))).scalar_one_or_none()
+            names = {sid: name for sid, name in (await s.execute(select(MonitoredServer.id, MonitoredServer.server_name))).all()}
+            srv_traffic = (
+                await s.execute(
+                    select(LogEntry.server_id, func.count(), func.sum(case((LogEntry.threat_tags != "", 1), else_=0)),
+                           func.sum(case((LogEntry.sc_status >= 500, 1), else_=0)))
+                    .where(rng).group_by(LogEntry.server_id)
+                )
+            ).all()
+            srv_threats = dict((
+                await s.execute(
+                    select(ActionableAlert.server_id, func.count())
+                    .where((ActionableAlert.ts >= start) & (ActionableAlert.ts < end) & ActionableAlert.category.in_(THREAT_CATEGORIES))
+                    .group_by(ActionableAlert.server_id)
+                )
+            ).all())
+            srv_health = {
+                sid: (avg_cpu, max_cpu, n, up)
+                for sid, avg_cpu, max_cpu, n, up in (
+                    await s.execute(
+                        select(SystemMetric.server_id, func.avg(SystemMetric.cpu_percent), func.max(SystemMetric.cpu_percent),
+                               func.count(), func.sum(case((SystemMetric.pools_all_started, 1), else_=0)))
+                        .where((SystemMetric.ts >= start) & (SystemMetric.ts < end)).group_by(SystemMetric.server_id)
+                    )
+                ).all()
+            }
+            srv_bans = dict((
+                await s.execute(
+                    select(BannedIP.server_id, func.count())
+                    .where((BannedIP.banned_at >= start) & (BannedIP.banned_at < end)).group_by(BannedIP.server_id)
+                )
+            ).all())
+
+        def name_of(sid: int | None) -> str:
+            if sid in names:
+                return names[sid]
+            return socket.gethostname().upper() if sid == LOCAL_SERVER_ID else f"SRV-{sid}"
+
+        fleet = []
+        traffic = {sid: (n, m, e5) for sid, n, m, e5 in srv_traffic}
+        for sid in sorted(set(traffic) | set(srv_threats) | set(srv_health) | set(srv_bans) | set(names), key=name_of):
+            n, m, e5 = traffic.get(sid, (0, 0, 0))
+            avg_cpu, max_cpu, samples_n, up = srv_health.get(sid, (None, None, 0, 0))
+            fleet.append({
+                "server": name_of(sid), "requests": int(n or 0), "malicious": int(m or 0), "errors_5xx": int(e5 or 0),
+                "threats": int(srv_threats.get(sid, 0)), "bans": int(srv_bans.get(sid, 0)),
+                "avg_cpu": float(avg_cpu) if avg_cpu is not None else None,
+                "max_cpu": float(max_cpu) if max_cpu is not None else None,
+                "pool_availability": (100.0 * int(up or 0) / samples_n) if samples_n else None,
+            })
 
         tag_counts: Counter[str] = Counter()
         for tags, n in tag_rows:
@@ -205,12 +257,13 @@ class Reporter:
 
         pool_up: Counter[str] = Counter()
         pool_total: Counter[str] = Counter()
-        for raw in pool_rows:
+        for sid, raw in pool_rows:
             try:
                 for name, state in json.loads(raw or "{}").items():
-                    pool_total[name] += 1
+                    key = f"{name_of(sid)} / {name}"
+                    pool_total[key] += 1
                     if state == "Started":
-                        pool_up[name] += 1
+                        pool_up[key] += 1
             except json.JSONDecodeError:
                 continue
 
@@ -220,7 +273,8 @@ class Reporter:
         return {
             "start": start,
             "end": end,
-            "hostname": socket.gethostname(),
+            "hostname": f"{len(fleet)} server(s): " + ", ".join(f["server"] for f in fleet) if fleet else socket.gethostname(),
+            "fleet": fleet,
             "total_requests": int(totals[0] or 0),
             "unique_ips": int(totals[1] or 0),
             "bandwidth": int(totals[2] or 0),
@@ -232,11 +286,12 @@ class Reporter:
             "top_uris": [{"uri": u, "requests": int(n), "avg_ms": float(t or 0)} for u, n, t in top_uris],
             "threat_count": len(threat_alerts),
             "active_threats": [
-                {"ts": a.ts, "ip": a.source_ip, "title": a.title, "severity": a.severity} for a in active[:25]
+                {"ts": a.ts, "ip": a.source_ip, "server": name_of(a.server_id), "title": a.title, "severity": a.severity}
+                for a in active[:25]
             ],
             "threat_ips": threat_ips.most_common(10),
             "alerts_by_severity": {sev: int(n) for sev, n in sev_rows},
-            "system_alerts": [{"ts": a.ts, "title": a.title, "severity": a.severity} for a in system_alerts],
+            "system_alerts": [{"ts": a.ts, "server": name_of(a.server_id), "title": a.title, "severity": a.severity} for a in system_alerts],
             "health": {
                 "samples": samples,
                 "avg_cpu": float(health[1] or 0),
@@ -313,13 +368,22 @@ class Reporter:
         ]
         top_uris = [[esc(r["uri"][:120]), f"{r['requests']:,}", f"{r['avg_ms']:.0f} ms"] for r in data["top_uris"]]
         threats = [
-            [f"{a['ts']:%Y-%m-%d %H:%M}", f'<span style="color:{red};">{esc(a["ip"] or "-")}</span>', esc(a["title"])]
+            [f"{a['ts']:%Y-%m-%d %H:%M}", esc(a.get("server", "")), f'<span style="color:{red};">{esc(a["ip"] or "-")}</span>', esc(a["title"])]
             for a in data["active_threats"]
+        ]
+        fleet = [
+            [f'<span style="color:{cyan};">{esc(f["server"])}</span>', f"{f['requests']:,}",
+             f'<span style="color:{red if f["malicious"] else muted};">{f["malicious"]:,}</span>',
+             f'<span style="color:{red if f["threats"] else muted};">{f["threats"]:,}</span>',
+             f'<span style="color:{green if f["bans"] else muted};">{f["bans"]:,}</span>',
+             "n/a" if f["avg_cpu"] is None else f"{f['avg_cpu']:.0f}% / {f['max_cpu']:.0f}%",
+             "n/a" if f["pool_availability"] is None else f"{f['pool_availability']:.1f}%"]
+            for f in data.get("fleet", [])
         ]
         attack_types = [[esc(k), f"{v:,}"] for k, v in data["attack_types"].items()]
         threat_ips = [[esc(ip or "-"), f"{n:,}"] for ip, n in data["threat_ips"]]
         sys_alerts = [
-            [f"{a['ts']:%Y-%m-%d %H:%M}", f'<span style="color:{red if a["severity"] == "CRITICAL" else amber};">{esc(a["severity"])}</span>', esc(a["title"])]
+            [f"{a['ts']:%Y-%m-%d %H:%M}", esc(a.get("server", "")), f'<span style="color:{red if a["severity"] == "CRITICAL" else amber};">{esc(a["severity"])}</span>', esc(a["title"])]
             for a in data["system_alerts"]
         ]
         pools = [
@@ -362,8 +426,10 @@ class Reporter:
 {kpi("5XX ERRORS", f"{status['5xx']:,}", red if status['5xx'] else green)}
 {kpi("THREATS", f"{data['threat_count']:,}", accent)}
 </tr></table></td></tr>
+{section("FLEET BREAKDOWN")}
+{table(["SERVER", "REQUESTS", "MALICIOUS", "THREATS", "BANS", "CPU AVG / PEAK", "POOLS UP"], fleet, "No servers reported in this period.")}
 {section("THREATS NEUTRALIZED")}
-{table(["FIRST FLAGGED", "SOURCE IP", "EVENT"], threats, "No active threats were flagged in this period.")}
+{table(["FIRST FLAGGED", "TARGET", "SOURCE IP", "EVENT"], threats, "No active threats were flagged in this period.")}
 {table(["ATTACK SIGNATURE", "REQUESTS"], attack_types, "No attack signatures matched.")}
 {table(["HOSTILE IP", "THREAT EVENTS"], threat_ips, "No hostile IPs.")}
 {section("TOP 10 CLIENT IPS")}
@@ -373,7 +439,7 @@ class Reporter:
 {section("SERVER HEALTH & UPTIME")}
 {table([], health_rows, "")}
 {table(["APP POOL", "AVAILABILITY"], pools, "No IIS application pool data collected.")}
-{table(["TIME", "SEVERITY", "SYSTEM EVENT"], sys_alerts, "No system incidents.")}
+{table(["TIME", "SERVER", "SEVERITY", "SYSTEM EVENT"], sys_alerts, "No system incidents.")}
 <tr><td style="padding:18px 24px;border-top:1px solid #15232b;color:#3d4f5c;font-size:11px;">
 Generated {utcnow():%Y-%m-%d %H:%M} UTC by IIS Sentinel. Alerts by severity: {esc(json.dumps(data['alerts_by_severity']))}
 </td></tr></table></td></tr></table></body></html>"""
