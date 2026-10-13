@@ -150,7 +150,7 @@ try {
         -Body (@{ username = $AdminUser; password = "wrong-password" } | ConvertTo-Json); "accepted" } catch { [int]$_.Exception.Response.StatusCode }
     if ($bad -ne 401) { Fail "wrong password returned $bad (expected 401)" }
     Pass "wrong password rejected with 401"
-    foreach ($asset in @("/", "/static/app.js")) {
+    foreach ($asset in @("/", "/static/js/app.js", "/static/css/style.css")) {
         $r = Invoke-WebRequest -UseBasicParsing "$Base$asset"
         if ($r.StatusCode -ne 200) { Fail "$asset returned $($r.StatusCode)" }
     }
