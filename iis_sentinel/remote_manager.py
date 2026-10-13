@@ -269,13 +269,26 @@ class _Guard:
         self._inflight: dict[tuple[int, str], tuple[asyncio.Future[Any], float]] = {}
 
     async def run(self, key: tuple[int, str], limit: float, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+        return await self._run(key, limit, False, fn, args, kwargs)
+
+    async def shared(self, key: tuple[int, str], limit: float, fn: Any, /, *args: Any, **kwargs: Any) -> Any:
+        """Like run(), but a caller arriving while an identical read is in flight awaits that call's result."""
+        return await self._run(key, limit, True, fn, args, kwargs)
+
+    async def _run(self, key: tuple[int, str], limit: float, join: bool, fn: Any, args: tuple[Any, ...],
+                   kwargs: dict[str, Any]) -> Any:
         current = self._inflight.get(key)
         if current is not None and not current[0].done():
-            raise RemoteError(f"previous {key[1]} call still running for {int(time.monotonic() - current[1])}s (server unresponsive)")
-        fut = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
-        self._inflight[key] = (fut, time.monotonic())
+            age = time.monotonic() - current[1]
+            if not join or age >= limit:
+                raise RemoteError(f"previous {key[1]} call still running for {int(age)}s (server unresponsive)")
+            fut, budget = current[0], limit - age
+        else:
+            budget = limit
+            fut = asyncio.ensure_future(asyncio.to_thread(fn, *args, **kwargs))
+            self._inflight[key] = (fut, time.monotonic())
         try:
-            return await asyncio.wait_for(asyncio.shield(fut), timeout=limit)
+            return await asyncio.wait_for(asyncio.shield(fut), timeout=budget)
         except asyncio.TimeoutError as exc:
             raise RemoteError(f"{key[1]} timed out after {int(limit)}s") from exc
         except (asyncio.CancelledError, ValueError):
@@ -311,10 +324,10 @@ class RemoteManager:
         if server.get("simulated"):
             return self._simulated_health(server)
         timeout = self._timeout()
-        sample = await self._guard.run(
+        sample = dict(await self._guard.shared(
             (server["id"], "health"), timeout + 10, get_remote_health,
             server["ip_address"], server["winrm_username"], server["winrm_password"], **self._opts(server, timeout),
-        )
+        ))
         sample["ts"] = iso(utcnow())
         return sample
 
