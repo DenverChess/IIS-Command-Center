@@ -262,6 +262,7 @@ try {
     Pass "service, program files, firewall rule and data removed"
 
     Write-Host "`nALL END-TO-END CHECKS PASSED" -ForegroundColor Green
+    exit 0
 }
 catch {
     Write-Host "`nE2E FAILED: $($_.Exception.Message)" -ForegroundColor Red
