@@ -1,0 +1,53 @@
+name: Windows installer
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "iis_sentinel/**"
+      - "installer/**"
+      - ".github/workflows/windows-installer.yml"
+  pull_request:
+    paths:
+      - "iis_sentinel/**"
+      - "installer/**"
+      - ".github/workflows/windows-installer.yml"
+  workflow_dispatch:
+
+jobs:
+  build-and-test:
+    runs-on: windows-2022
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache downloads
+        uses: actions/cache@v4
+        with:
+          path: installer/build/cache
+          key: installer-cache-${{ hashFiles('installer/build.ps1') }}
+
+      - name: Build installer
+        run: .\installer\build.ps1 -Version 2.0.0
+
+      - name: Upload installer
+        uses: actions/upload-artifact@v4
+        with:
+          name: IISSentinel-Setup
+          path: |
+            dist/IISSentinel-Setup-*.exe
+            dist/IISSentinel-Setup-*.exe.sha256
+
+      - name: End-to-end test (IIS + WinRM + SMB + install/upgrade/uninstall)
+        run: .\installer\tests\e2e.ps1 -Installer (Get-ChildItem dist\IISSentinel-Setup-*.exe | Select-Object -First 1).FullName -ArtifactDir "$env:RUNNER_TEMP\e2e"
+
+      - name: Upload test logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: ${{ runner.temp }}/e2e
+          if-no-files-found: ignore
