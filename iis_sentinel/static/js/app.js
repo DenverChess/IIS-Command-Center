@@ -34,6 +34,7 @@ async function api(path, opts = {}) {
 }
 
 const pad = (n) => String(n).padStart(2, "0");
+const SEV_RANK = { INFO: 0, WARNING: 1, HIGH: 2, CRITICAL: 3 };
 
 // Kept outside Alpine's reactive proxies: the feed is rendered imperatively for speed.
 const feed = { buffer: [] };
@@ -107,11 +108,19 @@ function dashboardApp() {
     displayName: "",
     demo: false,
 
+    // fleet
+    servers: [],
+    healthBy: {},
+    selected: "all",
+
     // data
-    health: {},
     threats: [],
     counts: {},
     alerts: [],
+    pending: [],
+    bans: [],
+    banBusy: {},
+    centerTab: "pending",
     toasts: [],
     baseline: { current: {}, global: {} },
     pipeline: {},
@@ -128,17 +137,21 @@ function dashboardApp() {
 
     // config drawer
     cfgOpen: false,
-    cfgTab: "watchers",
+    cfgTab: "servers",
     form: null,
     cfgMsg: { ok: true, text: "" },
     busy: false,
     watcherStatus: [],
     nextRuns: {},
     reports: [],
+    newServer: null,
+    srvBusy: {},
+    testResults: {},
 
     _k: 0,
 
     init() {
+      this.newServer = this.blankServer();
       this.connect();
       setInterval(() => this.updateClock(), 250);
       setInterval(() => this.watchdog(), 5000);
@@ -215,7 +228,9 @@ function dashboardApp() {
           this.user = msg.user;
           this.displayName = msg.display_name;
           this.demo = !!msg.demo;
-          if (msg.health && Object.keys(msg.health).length) this.health = msg.health;
+          this.setServers(msg.servers || []);
+          this.healthBy = {};
+          (msg.health || []).forEach((h) => { this.healthBy[h.server_id] = h; });
           this.threats = msg.threats || [];
           this.counts = msg.counts || {};
           this.alerts = (msg.alerts || []).map((a) => ({ ...a, _k: ++this._k }));
@@ -224,13 +239,41 @@ function dashboardApp() {
           feed.buffer = [];
           termEl().replaceChildren();
           this.addLogs(msg.logs || []);
+          this.loadPending();
+          this.loadBans();
+          this.loadAlertHistory();
+          break;
+        case "servers":
+          this.setServers(msg.data || []);
+          break;
+        case "server_status": {
+          const srv = this.serverById(msg.server_id);
+          if (srv) srv.status = { ...(srv.status || {}), [msg.component]: { ok: msg.ok, error: msg.error } };
+          break;
+        }
+        case "health_removed":
+          delete this.healthBy[msg.server_id];
+          break;
+        case "ban":
+          this.onBan(msg);
+          break;
+        case "alert_status":
+          this.setAlertStatus(msg.ids || [], msg.status);
+          break;
+        case "unban":
+          this.bans = this.bans.filter((b) => b.id !== msg.id);
           break;
         case "logs":
           this.addLogs(msg.data || []);
           break;
-        case "health":
-          this.health = msg.data || {};
+        case "health": {
+          this.healthBy[msg.server_id] = msg.data || {};
+          const srv = this.serverById(msg.server_id);
+          if (srv && msg.data) {
+            srv.status = { ...(srv.status || {}), health: { ok: msg.data.online !== false, error: msg.data.error || null } };
+          }
           break;
+        }
         case "threats":
           this.threats = msg.data || [];
           this.counts = msg.counts || this.counts;
@@ -243,13 +286,19 @@ function dashboardApp() {
           break;
         case "baseline":
           this.baseline = msg.data || this.baseline;
+          if (this.selId() != null) {
+            this.rpmHistory.push(this.cur().live_count || this.cur().rpm || 0);
+            if (this.rpmHistory.length > 90) this.rpmHistory.shift();
+          }
           break;
         case "tick":
           this.setServerTime(msg.server_time);
           this.pipeline = msg.pipeline || {};
           this.clients = msg.clients || 0;
-          this.rpmHistory.push(this.pipeline.lines_per_min || 0);
-          if (this.rpmHistory.length > 90) this.rpmHistory.shift();
+          if (this.selId() == null) {
+            this.rpmHistory.push(this.pipeline.lines_per_min || 0);
+            if (this.rpmHistory.length > 90) this.rpmHistory.shift();
+          }
           break;
         case "pong":
           this.setServerTime(msg.server_time);
@@ -269,6 +318,8 @@ function dashboardApp() {
 
     /* ------------------------------------------------------------ log feed */
     passes(l) {
+      const sel = this.selId();
+      if (sel != null && l.server_id !== sel) return false;
       if (this.feedMode === "errors") return l.status >= 400 || !!l.tags;
       if (this.feedMode === "threats") return l.level === "critical" || !!l.tags;
       return true;
@@ -285,13 +336,14 @@ function dashboardApp() {
       };
       const t = (l.ts || "").slice(11, 19);
       span("ts", t);
+      if (l.server) span("srv", `[${l.server}]`);
       span("ip", l.ip);
       span("m", l.method);
       span("st", String(l.status));
       div.appendChild(document.createTextNode(` ${l.uri}${l.query ? "?" + l.query : ""}`));
       span("tt", `${l.tt}ms`);
       if (l.tags) l.tags.split(",").filter(Boolean).forEach((tag) => span("tag", tag));
-      div.title = `${l.ts}  ${l.ip}  ${l.method} ${l.uri}${l.query ? "?" + l.query : ""}\nHTTP ${l.status}.${l.substatus}  ${l.tt}ms  ${l.bytes}B\n${l.ua}`;
+      div.title = `${l.server ? "[" + l.server + "]  " : ""}${l.ts}  ${l.ip}  ${l.method} ${l.uri}${l.query ? "?" + l.query : ""}\nHTTP ${l.status}.${l.substatus}  ${l.tt}ms  ${l.bytes}B\n${l.ua}`;
       return div;
     },
 
@@ -333,11 +385,188 @@ function dashboardApp() {
       if (!a) return;
       const item = { ...a, _k: ++this._k };
       this.alerts.unshift(item);
-      if (this.alerts.length > 120) this.alerts.length = 120;
-      if (a.severity === "CRITICAL" || a.severity === "HIGH") {
-        this.toasts.push(item);
-        if (this.toasts.length > 4) this.toasts.shift();
-        setTimeout(() => { this.toasts = this.toasts.filter((t) => t._k !== item._k); }, 7000);
+      if (this.alerts.length > 600) this.alerts.length = 600;
+      if (a.status === "Pending" && a.id && !this.pending.some((p) => p.id === a.id)) this.pending.unshift({ ...a });
+      if (a.severity === "CRITICAL" || a.severity === "HIGH") this.toast(item);
+    },
+
+    toast(t, ms = 7000) {
+      const item = { ...t, _k: ++this._k };
+      this.toasts.push(item);
+      if (this.toasts.length > 4) this.toasts.shift();
+      setTimeout(() => { this.toasts = this.toasts.filter((x) => x._k !== item._k); }, ms);
+    },
+
+    async loadAlertHistory(serverId = null) {
+      try {
+        const q = serverId == null ? "" : `&server_id=${serverId}`;
+        const r = await api(`/alerts?limit=200${q}`);
+        const known = new Set(this.alerts.map((a) => a.id));
+        const older = (r.alerts || []).filter((a) => !known.has(a.id)).map((a) => ({ ...a, _k: ++this._k }));
+        if (!older.length) return;
+        this.alerts = [...this.alerts, ...older].sort((x, y) => (y.id || 0) - (x.id || 0)).slice(0, 600);
+      } catch (e) { console.error(e); }
+    },
+
+    visibleAlerts() {
+      const sel = this.selId();
+      return (sel == null ? this.alerts : this.alerts.filter((a) => a.server_id === sel)).slice(0, 150);
+    },
+
+    setAlertStatus(ids, status) {
+      const set = new Set(ids);
+      this.alerts.forEach((a) => { if (set.has(a.id)) { a.status = status; a.acknowledged = true; } });
+      this.pending = this.pending.filter((p) => !set.has(p.id));
+    },
+
+    /* ------------------------------------------------------------ fleet / server scope */
+    setServers(list) {
+      this.servers = list;
+      if (this.selected !== "all" && !list.some((s) => String(s.id) === this.selected && s.enabled)) {
+        this.selected = "all";
+        this.onServerChange();
+      }
+    },
+    enabledServers() { return this.servers.filter((s) => s.enabled); },
+    serverById(id) { return this.servers.find((s) => s.id === id) || null; },
+    selId() { return this.selected === "all" ? null : Number(this.selected); },
+    selectedName() { const s = this.serverById(this.selId()); return s ? s.server_name : "—"; },
+    selectServer(id) {
+      this.selected = id === "all" ? "all" : String(id);
+      this.onServerChange();
+    },
+    onServerChange() {
+      this.rpmHistory = [];
+      this.rerenderFeed();
+      if (this.selId() != null) this.loadAlertHistory(this.selId());
+    },
+    serverState(s) {
+      if (!s) return "";
+      const st = s.status || {};
+      const h = st.health, l = st.logs;
+      if ((h && h.ok === false) || (l && l.ok === false)) return "down";
+      if (h && h.ok && (!s.log_unc_path && !s.local || (l && l.ok))) return "live";
+      return "wait";
+    },
+    serverStateText(s) {
+      const st = (s && s.status) || {};
+      const part = (name, c) => (c == null ? `${name}: pending` : c.ok ? `${name}: OK` : `${name}: ${c.error || "DOWN"}`);
+      return `${part("HEALTH", st.health)}  |  ${part("LOGS", st.logs)}`;
+    },
+    onlineCount() { return this.enabledServers().filter((s) => this.serverState(s) === "live").length; },
+    logFeedOk() { const s = this.serverById(this.selId()); const l = s && s.status && s.status.logs; return l ? l.ok : null; },
+    logFeedError() { const s = this.serverById(this.selId()); const l = s && s.status && s.status.logs; return (l && l.error) || ""; },
+    activeCount() {
+      const sel = this.selId();
+      return sel == null ? (this.counts.active_threats || 0) : this.threats.filter((t) => t.active && t.server_id === sel).length;
+    },
+
+    /* ------------------------------------------------------------ pending threats / active defense */
+    async loadPending() {
+      try {
+        const r = await api("/alerts?status=pending&limit=500");
+        this.pending = r.alerts || [];
+      } catch (e) { console.error(e); }
+    },
+
+    pendingGroups() {
+      const sel = this.selId();
+      const scores = {};
+      this.threats.forEach((t) => { scores[t.key] = t; });
+      const groups = new Map();
+      for (const a of this.pending) {
+        if (sel != null && a.server_id !== sel) continue;
+        const key = `${a.server_id}|${a.source_ip}`;
+        let g = groups.get(key);
+        if (!g) {
+          g = { key, server_id: a.server_id, server_name: a.server_name, ip: a.source_ip, alerts: [], top: a, cats: {}, last: a.ts };
+          groups.set(key, g);
+        }
+        g.alerts.push(a);
+        g.cats[a.category.toUpperCase()] = (g.cats[a.category.toUpperCase()] || 0) + 1;
+        if ((SEV_RANK[a.severity] || 0) > (SEV_RANK[g.top.severity] || 0)) g.top = a;
+        if (a.ts > g.last) g.last = a.ts;
+      }
+      const out = [...groups.values()].map((g) => {
+        const t = scores[g.key];
+        return { ...g, score: t ? t.score : null, active: !!(t && t.active), attacking: !!(t && t.attacking), geo: t ? t.geo : "" };
+      });
+      out.sort((a, b) => (b.active - a.active) || ((b.score || 0) - (a.score || 0)) || (b.last > a.last ? 1 : -1));
+      return out;
+    },
+
+    visibleThreats() {
+      const sel = this.selId();
+      return sel == null ? this.threats : this.threats.filter((t) => t.server_id === sel);
+    },
+
+    async approveBan(p) {
+      if (this.banBusy[p.key]) return;
+      const ok = window.confirm(
+        `APPROVE FIREWALL BAN\n\nBlock ${p.ip} on ${p.server_name}?\n\n` +
+        `netsh advfirewall firewall add rule name="SENTINEL BAN: ${p.ip}" dir=in action=block remoteip=${p.ip}`
+      );
+      if (!ok) return;
+      this.banBusy[p.key] = true;
+      try {
+        const r = await api("/defense/ban", { method: "POST", body: JSON.stringify({ alert_id: p.top.id }) });
+        this.onBan({ data: r.ban, alert_ids: r.alert_ids, status: "Approved" });
+      } catch (e) {
+        this.toast({ severity: "CRITICAL", category: "ban failed", server_name: p.server_name, title: e.message }, 10000);
+      } finally {
+        delete this.banBusy[p.key];
+      }
+    },
+
+    approveAlert(a) {
+      const g = this.pendingGroups().find((x) => x.key === `${a.server_id}|${a.source_ip}`);
+      this.approveBan(g ? { ...g, top: a } : { key: `${a.server_id}|${a.source_ip}`, ip: a.source_ip, server_name: a.server_name, top: a });
+    },
+
+    onBan(msg) {
+      const ban = msg.data;
+      this.setAlertStatus(msg.alert_ids || [], msg.status || "Approved");
+      if (!ban) return;
+      const key = `${ban.server_id}|${ban.ip_address}`;
+      this.pending = this.pending.filter((p) => `${p.server_id}|${p.source_ip}` !== key);
+      if (!this.bans.some((b) => b.id === ban.id)) {
+        this.bans.unshift(ban);
+        this.toast({ severity: "INFO", ok: true, category: "ban executed", server_name: ban.server_name, title: `${ban.ip_address} blocked by ${ban.rule_name}` });
+      }
+    },
+
+    async dismissGroup(p) {
+      this.banBusy[p.key] = true;
+      try {
+        for (const a of p.alerts) await api("/defense/dismiss", { method: "POST", body: JSON.stringify({ alert_id: a.id }) });
+        this.setAlertStatus(p.alerts.map((a) => a.id), "Dismissed");
+      } catch (e) {
+        this.toast({ severity: "WARNING", category: "dismiss", title: e.message });
+      } finally {
+        delete this.banBusy[p.key];
+      }
+    },
+
+    async loadBans() {
+      try {
+        const r = await api("/defense/bans");
+        this.bans = r.bans || [];
+      } catch (e) { console.error(e); }
+    },
+    visibleBans() {
+      const sel = this.selId();
+      return sel == null ? this.bans : this.bans.filter((b) => b.server_id === sel);
+    },
+    async liftBan(b) {
+      if (!window.confirm(`Lift ban on ${b.ip_address} (${b.server_name})?\nThe firewall rule "${b.rule_name}" will be deleted.`)) return;
+      this.banBusy["ban" + b.id] = true;
+      try {
+        await api(`/defense/bans/${b.id}`, { method: "DELETE" });
+        this.bans = this.bans.filter((x) => x.id !== b.id);
+      } catch (e) {
+        this.toast({ severity: "CRITICAL", category: "unban failed", server_name: b.server_name, title: e.message }, 10000);
+      } finally {
+        delete this.banBusy["ban" + b.id];
       }
     },
 
@@ -353,10 +582,36 @@ function dashboardApp() {
     scoreClass(t) { return t.active || t.score > t.threshold ? "red" : t.score >= t.threshold * 0.5 ? "amber" : ""; },
 
     /* ------------------------------------------------------------ health */
+    get health() {
+      const sel = this.selId();
+      return (sel != null && this.healthBy[sel]) || {};
+    },
+
+    fleetHealth() {
+      return this.enabledServers().map((s) => ({
+        app_pools: [],
+        ...(this.healthBy[s.id] || {}),
+        server_id: s.id, server_name: s.server_name, ip_address: s.ip_address,
+      }));
+    },
+    lvl(v, warn, crit) { return v == null ? "ok" : v >= crit ? "crit" : v >= warn ? "warn" : "ok"; },
+    cardBars(h) {
+      return [
+        { k: "CPU", v: h.cpu_percent || 0, level: this.lvl(h.cpu_percent, 75, 90) },
+        { k: "RAM", v: h.ram_percent || 0, level: this.lvl(h.ram_percent, 80, 92) },
+        { k: "DSK", v: h.disk_percent || 0, level: h.disk_free_percent < 5 ? "crit" : h.disk_free_percent < 15 ? "warn" : "ok" },
+      ];
+    },
+    poolsUp(h) { return (h.app_pools || []).filter((p) => p.running).length; },
+    poolsDown(h) { return (h.app_pools || []).some((p) => !p.running); },
+    cardAlarm(h) {
+      return h.online === false || this.poolsDown(h) || (h.disk_free_percent != null && h.disk_free_percent < 5) || h.cpu_percent > 90;
+    },
+
     gauges() {
       const h = this.health || {};
       const cpuThr = 90;
-      const lvl = (v, warn, crit) => (v == null ? "ok" : v >= crit ? "crit" : v >= warn ? "warn" : "ok");
+      const lvl = this.lvl;
       const diskFree = h.disk_free_percent;
       return [
         { key: "cpu", label: "CPU", value: h.cpu_percent, level: lvl(h.cpu_percent, 75, cpuThr), sub: h.cpu_count ? `${h.cpu_count} CORES` : "" },
@@ -371,7 +626,7 @@ function dashboardApp() {
 
     healthAlarm() {
       const h = this.health || {};
-      return (h.app_pools || []).some((p) => !p.running) || (h.disk_free_percent != null && h.disk_free_percent < 5) || h.cpu_percent > 90;
+      return h.online === false || (h.app_pools || []).some((p) => !p.running) || (h.disk_free_percent != null && h.disk_free_percent < 5) || h.cpu_percent > 90;
     },
 
     svcClass(s) {
@@ -382,8 +637,13 @@ function dashboardApp() {
     },
 
     /* ------------------------------------------------------------ baseline */
-    cur() { return (this.baseline && this.baseline.current) || {}; },
-    g(metric) { return (this.baseline && this.baseline.global && this.baseline.global[metric]) || { mean: 0, std: 0 }; },
+    scopeBaseline() {
+      const sel = this.selId();
+      if (sel == null || !this.baseline) return this.baseline || {};
+      return (this.baseline.per_server && this.baseline.per_server[sel]) || { current: {}, global: {} };
+    },
+    cur() { return this.scopeBaseline().current || {}; },
+    g(metric) { const b = this.scopeBaseline(); return (b.global && b.global[metric]) || { mean: 0, std: 0 }; },
     zmeters() {
       const c = this.cur();
       return [
@@ -438,10 +698,12 @@ function dashboardApp() {
     },
 
     /* ------------------------------------------------------------ config drawer */
-    async openConfig() {
+    async openConfig(tab) {
+      if (tab) this.cfgTab = tab;
       this.cfgOpen = true;
       this.cfgMsg = { ok: true, text: "" };
       await this.loadConfig();
+      this.refreshServers();
       this.loadReports();
     },
 
@@ -511,6 +773,81 @@ function dashboardApp() {
         this.cfgMsg = { ok: false, text: e.message };
       } finally {
         this.busy = false;
+      }
+    },
+
+    blankServer() {
+      return {
+        server_name: "", ip_address: "", winrm_username: "", winrm_password: "", log_unc_path: "",
+        winrm_transport: "ntlm", winrm_port: "", winrm_use_ssl: false, winrm_verify_ssl: true,
+      };
+    },
+
+    async refreshServers() {
+      try {
+        const r = await api("/servers");
+        this.setServers(r.servers || []);
+        this.watcherStatus = r.logs || this.watcherStatus;
+      } catch (e) { console.error(e); }
+    },
+
+    async addServer() {
+      this.busy = true;
+      this.cfgMsg = { ok: true, text: "" };
+      const body = { ...this.newServer };
+      body.winrm_port = body.winrm_port === "" || body.winrm_port == null ? null : Number(body.winrm_port);
+      try {
+        const r = await api("/servers", { method: "POST", body: JSON.stringify(body) });
+        this.newServer = this.blankServer();
+        await this.refreshServers();
+        this.cfgMsg = { ok: true, text: `${r.server.server_name} registered — monitoring started. Use TEST to verify WinRM and the log share.` };
+      } catch (e) {
+        this.cfgMsg = { ok: false, text: e.message };
+      } finally {
+        this.busy = false;
+      }
+    },
+
+    async testServer(s) {
+      this.srvBusy[s.id] = "test";
+      delete this.testResults[s.id];
+      try {
+        const r = await api(`/servers/${s.id}/test`, { method: "POST" });
+        const w = r.winrm || {}, l = r.logs || {};
+        const ok = !!(w.ok && l.ok);
+        const wTxt = w.ok ? `WinRM OK (${w.hostname || "?"}, ${w.app_pools} pools)` : `WinRM FAIL: ${w.error}`;
+        const lTxt = l.ok ? `logs OK (${l.files} file(s), newest ${l.newest || "—"})` : `logs FAIL: ${l.error}`;
+        this.testResults[s.id] = { ok, text: `${wTxt}  |  ${lTxt}` };
+      } catch (e) {
+        this.testResults[s.id] = { ok: false, text: e.message };
+      } finally {
+        delete this.srvBusy[s.id];
+      }
+    },
+
+    async toggleServer(s) {
+      this.srvBusy[s.id] = "toggle";
+      try {
+        await api(`/servers/${s.id}`, { method: "PUT", body: JSON.stringify({ enabled: !s.enabled }) });
+        await this.refreshServers();
+      } catch (e) {
+        this.cfgMsg = { ok: false, text: e.message };
+      } finally {
+        delete this.srvBusy[s.id];
+      }
+    },
+
+    async deleteServer(s) {
+      if (!window.confirm(`Remove ${s.server_name} (${s.ip_address}) from Sentinel?\nMonitoring stops immediately; historical logs and alerts are kept.`)) return;
+      this.srvBusy[s.id] = "delete";
+      try {
+        await api(`/servers/${s.id}`, { method: "DELETE" });
+        await this.refreshServers();
+        this.cfgMsg = { ok: true, text: `${s.server_name} removed.` };
+      } catch (e) {
+        this.cfgMsg = { ok: false, text: e.message };
+      } finally {
+        delete this.srvBusy[s.id];
       }
     },
 

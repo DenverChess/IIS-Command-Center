@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>IIS SENTINEL // COMMAND CENTER</title>
+  <title>IIS SENTINEL // SOC</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;700&display=swap">
@@ -22,12 +22,30 @@
     <header class="topbar">
       <div class="brand">
         <div class="glyph"></div>
-        <h1><span class="neon-cyan">IIS SENTINEL</span><span class="sep">//</span><span class="sub">COMMAND CENTER</span></h1>
+        <h1><span class="neon-cyan">IIS SENTINEL</span><span class="sep">//</span><span class="sub">SOC</span></h1>
+        <div class="server-select" :class="{ scoped: selected !== 'all' }">
+          <span class="lbl">SCOPE</span>
+          <select class="input" x-model="selected" @change="onServerChange()" aria-label="Server selector">
+            <option value="all" x-text="'ALL SERVERS (' + onlineCount() + '/' + enabledServers().length + ' ONLINE)'"></option>
+            <template x-for="s in enabledServers()" :key="s.id">
+              <option :value="String(s.id)" x-text="s.server_name + '  ·  ' + s.ip_address + (serverState(s) === 'down' ? '  [OFFLINE]' : '')"></option>
+            </template>
+          </select>
+          <span class="fleet-dots">
+            <template x-for="s in enabledServers()" :key="s.id">
+              <span class="dot" :class="serverState(s)" :title="s.server_name + ': ' + serverStateText(s)"></span>
+            </template>
+          </span>
+        </div>
         <span class="badge" x-show="demo" x-cloak>DEMO FEED</span>
       </div>
       <div class="top-right">
         <div class="top-stat">
-          <div class="v" :class="counts.active_threats ? 'neon-red' : 'neon-green'" x-text="counts.active_threats || 0"></div>
+          <div class="v" :class="pendingGroups().length ? 'neon-red' : 'neon-green'" x-text="pendingGroups().length"></div>
+          <div class="l">PENDING</div>
+        </div>
+        <div class="top-stat">
+          <div class="v" :class="activeCount() ? 'neon-red' : 'neon-green'" x-text="activeCount()"></div>
           <div class="l">ACTIVE THREATS</div>
         </div>
         <div class="top-stat">
@@ -59,7 +77,7 @@
       <section class="col left">
         <div class="panel" style="flex:1">
           <div class="panel-head">
-            <span class="title">Live Log Feed</span>
+            <span class="title" x-text="'Live Log Feed' + (selected === 'all' ? '' : ' :: ' + selectedName())"></span>
             <span class="meta">
               <span class="feed-filters">
                 <button class="chip" :class="{ on: feedMode === 'all' }" @click="setFeedMode('all')">ALL</button>
@@ -73,27 +91,68 @@
         </div>
       </section>
 
-      <!-- CENTER: threat matrix + alert stream -->
+      <!-- CENTER: pending threats / matrix / bans + alert stream -->
       <section class="col center">
-        <div class="panel matrix-wrap" :class="{ alarm: counts.active_threats > 0 }">
+        <div class="panel matrix-wrap" :class="{ alarm: pendingGroups().some((g) => g.active) }">
           <div class="panel-head">
-            <span class="title">Threat Matrix</span>
+            <span class="ptabs">
+              <button class="ptab" :class="{ on: centerTab === 'pending' }" @click="centerTab = 'pending'">PENDING THREATS <b :class="pendingGroups().length ? 'neon-red' : ''" x-text="pendingGroups().length"></b></button>
+              <button class="ptab" :class="{ on: centerTab === 'matrix' }" @click="centerTab = 'matrix'">THREAT MATRIX <b x-text="visibleThreats().length"></b></button>
+              <button class="ptab" :class="{ on: centerTab === 'bans' }" @click="centerTab = 'bans'; loadBans()">BANS <b x-text="visibleBans().length"></b></button>
+            </span>
             <span class="meta">
-              <span x-text="threats.length + ' TRACKED'"></span>
-              <span :class="counts.active_threats ? 'neon-red' : 'neon-green'" x-text="counts.active_threats ? 'HOSTILES ENGAGED' : 'PERIMETER SECURE'"></span>
+              <span :class="activeCount() ? 'neon-red' : 'neon-green'" x-text="activeCount() ? 'HOSTILES ENGAGED' : 'PERIMETER SECURE'"></span>
             </span>
           </div>
-          <div class="panel-body" style="padding:0">
+
+          <!-- PENDING THREATS: operator approval queue (one row per attacker per target server) -->
+          <div class="panel-body" style="padding:0" x-show="centerTab === 'pending'">
             <table class="matrix">
-              <colgroup><col style="width:24%"><col style="width:17%"><col style="width:26%"><col style="width:33%"></colgroup>
-              <thead><tr><th>IP ADDRESS</th><th>GEO</th><th>THREAT SCORE</th><th>LAST PAYLOAD</th></tr></thead>
+              <colgroup><col style="width:21%"><col style="width:16%"><col style="width:29%"><col style="width:12%"><col style="width:22%"></colgroup>
+              <thead><tr><th>SOURCE IP</th><th>TARGET SERVER</th><th>THREAT</th><th>SCORE</th><th style="text-align:right">ACTION</th></tr></thead>
               <tbody>
-                <template x-for="t in threats" :key="t.ip">
+                <template x-for="p in pendingGroups()" :key="p.key">
+                  <tr :class="{ 'active-threat': p.active, attacking: p.attacking }">
+                    <td class="ip-cell">
+                      <span x-text="p.ip"></span>
+                      <small x-text="(p.geo || '') + (p.geo ? ' · ' : '') + p.alerts.length + ' ALERT' + (p.alerts.length === 1 ? '' : 'S')"></small>
+                    </td>
+                    <td><span class="srv-tag" x-text="p.server_name"></span></td>
+                    <td>
+                      <div class="threat-title" :title="p.top.message" x-text="p.top.title"></div>
+                      <div class="tagline">
+                        <template x-for="(n, cat) in p.cats" :key="cat"><span x-text="cat + '×' + n"></span></template>
+                        <span class="sevtag" :class="p.top.severity" x-text="p.top.severity"></span>
+                      </div>
+                    </td>
+                    <td><span class="num" :class="p.active ? 'neon-red' : (p.score >= 25 ? 'neon-amber' : 'neon-cyan')" x-text="p.score == null ? '—' : Math.round(p.score)"></span></td>
+                    <td class="actions">
+                      <button class="btn small danger" @click="approveBan(p)" :disabled="!!banBusy[p.key]" x-text="banBusy[p.key] ? 'EXECUTING…' : 'APPROVE BAN'"></button>
+                      <button class="btn small ghost" @click="dismissGroup(p)" :disabled="!!banBusy[p.key]" title="Dismiss (no action)">✕</button>
+                    </td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+            <div class="empty" x-show="pendingGroups().length === 0">
+              <div class="big">ALL QUIET</div>
+              NO THREATS AWAITING APPROVAL
+            </div>
+          </div>
+
+          <!-- THREAT MATRIX: live per-(server, IP) scoring -->
+          <div class="panel-body" style="padding:0" x-show="centerTab === 'matrix'">
+            <table class="matrix">
+              <colgroup><col style="width:21%"><col style="width:15%"><col style="width:14%"><col style="width:24%"><col style="width:26%"></colgroup>
+              <thead><tr><th>IP ADDRESS</th><th>TARGET SERVER</th><th>GEO</th><th>THREAT SCORE</th><th>LAST PAYLOAD</th></tr></thead>
+              <tbody>
+                <template x-for="t in visibleThreats()" :key="t.key">
                   <tr :class="{ 'active-threat': t.active, attacking: t.attacking }">
                     <td class="ip-cell">
                       <span x-text="t.ip"></span>
                       <small x-text="t.status + ' · ' + fmtNum(t.requests) + ' REQ'"></small>
                     </td>
+                    <td><span class="srv-tag" x-text="t.server_name"></span></td>
                     <td class="muted" x-text="t.geo"></td>
                     <td>
                       <div class="score">
@@ -112,45 +171,114 @@
                 </template>
               </tbody>
             </table>
-            <div class="empty" x-show="threats.length === 0">
+            <div class="empty" x-show="visibleThreats().length === 0">
               <div class="big">ALL QUIET</div>
               NO HOSTILE ACTORS DETECTED
             </div>
+          </div>
+
+          <!-- BANS: firewall rules Sentinel has pushed -->
+          <div class="panel-body" style="padding:0" x-show="centerTab === 'bans'">
+            <table class="matrix">
+              <colgroup><col style="width:22%"><col style="width:17%"><col style="width:33%"><col style="width:14%"><col style="width:14%"></colgroup>
+              <thead><tr><th>BANNED IP</th><th>SERVER</th><th>FIREWALL RULE</th><th>BY</th><th style="text-align:right">ACTION</th></tr></thead>
+              <tbody>
+                <template x-for="b in visibleBans()" :key="b.id">
+                  <tr>
+                    <td class="ip-cell"><span class="neon-red" x-text="b.ip_address"></span><small x-text="fmtTime(b.banned_at)"></small></td>
+                    <td><span class="srv-tag" x-text="b.server_name"></span></td>
+                    <td class="payload" :title="b.rule_name" x-text="b.rule_name"></td>
+                    <td class="muted" x-text="b.banned_by"></td>
+                    <td class="actions"><button class="btn small ghost" @click="liftBan(b)" :disabled="!!banBusy['ban' + b.id]" x-text="banBusy['ban' + b.id] ? '…' : 'LIFT'"></button></td>
+                  </tr>
+                </template>
+              </tbody>
+            </table>
+            <div class="empty" x-show="visibleBans().length === 0">NO ACTIVE BANS</div>
           </div>
         </div>
 
         <div class="panel alerts-wrap">
           <div class="panel-head">
             <span class="title">Alert Stream</span>
-            <span class="meta" x-text="alerts.length + ' EVENTS'"></span>
+            <span class="meta" x-text="visibleAlerts().length + ' EVENTS'"></span>
           </div>
           <div class="panel-body">
-            <template x-for="a in alerts" :key="a._k">
-              <div class="alert-item" :class="{ acked: a.acknowledged }">
+            <template x-for="a in visibleAlerts()" :key="a._k">
+              <div class="alert-item" :class="{ acked: a.acknowledged && a.status !== 'Pending' }">
                 <span class="sev" :class="a.severity" x-text="a.severity"></span>
                 <div style="min-width:0">
-                  <div class="title" x-text="a.title"></div>
+                  <div class="title">
+                    <span class="srv-tag" x-show="a.server_name" x-text="a.server_name"></span>
+                    <span x-text="a.title"></span>
+                  </div>
                   <div class="msg" :title="a.message" x-text="a.message"></div>
                 </div>
                 <div style="text-align:right">
                   <div class="when" x-text="fmtTime(a.ts)"></div>
-                  <button class="chip" style="margin-top:3px" x-show="a.id && !a.acknowledged" @click="ack(a)">ACK</button>
+                  <span class="status-pill" :class="a.status" x-show="['Pending','Approved','Dismissed'].includes(a.status)" x-text="a.status.toUpperCase()"></span>
+                  <button class="chip red on" style="margin-top:3px" x-show="a.id && a.status === 'Pending'" @click="approveAlert(a)">BAN</button>
+                  <button class="chip" style="margin-top:3px" x-show="a.id && !a.acknowledged && a.status !== 'Pending'" @click="ack(a)">ACK</button>
                 </div>
               </div>
             </template>
-            <div class="empty" x-show="alerts.length === 0">NO ALERTS // SYSTEMS NOMINAL</div>
+            <div class="empty" x-show="visibleAlerts().length === 0">NO ALERTS // SYSTEMS NOMINAL</div>
           </div>
         </div>
       </section>
 
-      <!-- RIGHT: server health + traffic baseline -->
+      <!-- RIGHT: fleet health grid (all servers) or detailed gauges (one server) + traffic baseline -->
       <section class="col right">
-        <div class="panel" :class="{ alarm: healthAlarm() }">
+        <div class="panel" x-show="selected === 'all'" :class="{ alarm: fleetHealth().some((h) => cardAlarm(h)) }">
           <div class="panel-head">
-            <span class="title">Server Health</span>
-            <span class="meta" x-text="health.hostname || '—'"></span>
+            <span class="title">Fleet Health</span>
+            <span class="meta" x-text="onlineCount() + ' / ' + enabledServers().length + ' ONLINE'"></span>
           </div>
           <div class="panel-body">
+            <div class="fleet-grid">
+              <template x-for="h in fleetHealth()" :key="h.server_id">
+                <button type="button" class="hcard" :class="{ offline: h.online === false, alarm: cardAlarm(h) }" @click="selectServer(h.server_id)" :title="'Open ' + h.server_name">
+                  <div class="hc-head">
+                    <span class="dot" :class="serverState(serverById(h.server_id))"></span>
+                    <span class="name" x-text="h.server_name"></span>
+                    <span class="ip" x-text="h.ip_address"></span>
+                  </div>
+                  <template x-if="h.online !== false && h.cpu_percent != null">
+                    <div>
+                      <template x-for="b in cardBars(h)" :key="b.k">
+                        <div class="hbar">
+                          <span class="k" x-text="b.k"></span>
+                          <div class="track"><div class="fill" :class="b.level" :style="'width:' + Math.min(100, b.v) + '%'"></div></div>
+                          <span class="v" x-text="Math.round(b.v) + '%'"></span>
+                        </div>
+                      </template>
+                      <div class="hc-foot">
+                        <span :class="poolsDown(h) ? 'neon-red' : 'neon-green'" x-text="'POOLS ' + poolsUp(h) + '/' + (h.app_pools || []).length"></span>
+                        <span :class="svcClass(h.w3svc_state)" x-text="'W3SVC ' + (h.w3svc_state || '—')"></span>
+                      </div>
+                    </div>
+                  </template>
+                  <div class="hc-err" x-show="h.online === false" :title="h.error" x-text="'OFFLINE // ' + (h.error || 'unreachable').replace(/^RemoteError: /, '')"></div>
+                  <div class="hc-wait" x-show="h.online == null && h.cpu_percent == null">AWAITING TELEMETRY…</div>
+                </button>
+              </template>
+            </div>
+            <div class="empty" x-show="!enabledServers().length">
+              NO SERVERS REGISTERED<br><br><button class="btn small" @click="openConfig('servers')">ADD SERVER</button>
+            </div>
+          </div>
+        </div>
+
+        <div class="panel" x-show="selected !== 'all'" x-cloak :class="{ alarm: healthAlarm() }">
+          <div class="panel-head">
+            <span class="title" x-text="'Server Health :: ' + selectedName()"></span>
+            <span class="meta">
+              <span x-text="health.hostname || (serverById(selId()) || {}).ip_address || '—'"></span>
+              <button class="chip" @click="selectServer('all')">◂ FLEET</button>
+            </span>
+          </div>
+          <div class="panel-body">
+            <div class="notice err" x-show="health.online === false" x-text="'SERVER OFFLINE // ' + (health.error || 'unreachable') + (health.cpu_percent != null ? ' — showing last known telemetry' : '')"></div>
             <div class="gauges">
               <template x-for="g in gauges()" :key="g.key">
                 <div class="gauge">
@@ -158,7 +286,7 @@
                     <circle class="track" cx="60" cy="60" r="46" :stroke-dasharray="ARC + ' 400'" transform="rotate(135 60 60)"></circle>
                     <circle class="ticks" cx="60" cy="60" r="54" stroke-dasharray="1 8.42" transform="rotate(135 60 60)"></circle>
                     <circle class="val" :class="g.level" cx="60" cy="60" r="46"
-                            :stroke-dasharray="ARC + ' 400'" :stroke-dashoffset="ARC * (1 - Math.min(100, Math.max(0, g.value)) / 100)"
+                            :stroke-dasharray="ARC + ' 400'" :stroke-dashoffset="ARC * (1 - Math.min(100, Math.max(0, g.value || 0)) / 100)"
                             transform="rotate(135 60 60)"></circle>
                   </svg>
                   <div class="num" :class="'neon-' + (g.level === 'crit' ? 'red' : g.level === 'warn' ? 'amber' : 'cyan')">
@@ -179,7 +307,7 @@
                 </div>
               </template>
               <div class="muted" style="font-size:11px" x-show="!(health.app_pools || []).length"
-                   x-text="health.app_pool_error ? 'APP POOL QUERY UNAVAILABLE: ' + health.app_pool_error : 'AWAITING TELEMETRY…'"></div>
+                   x-text="health.app_pool_error ? 'APP POOL QUERY UNAVAILABLE: ' + health.app_pool_error : (health.online === false ? 'NO TELEMETRY' : 'AWAITING TELEMETRY…')"></div>
             </div>
 
             <div class="section-label"><span>HOST</span><span></span></div>
@@ -189,13 +317,14 @@
               <span class="k">UPTIME</span><span class="v neon-cyan" x-text="fmtDuration(health.uptime_seconds)"></span>
               <span class="k">LOG VOLUME FREE</span><span class="v" x-text="health.disk_free_gb != null ? health.disk_free_gb.toFixed(1) + ' GB (' + health.disk_path + ')' : '—'"></span>
               <span class="k">RAM</span><span class="v" x-text="health.ram_total_gb ? health.ram_used_gb + ' / ' + health.ram_total_gb + ' GB' : '—'"></span>
+              <span class="k">LOG FEED</span><span class="v" :class="logFeedOk() === false ? 'neon-red' : logFeedOk() ? 'neon-green' : 'muted'" :title="logFeedError()" x-text="logFeedOk() === false ? 'OFFLINE' : logFeedOk() ? 'STREAMING' : '—'"></span>
             </div>
           </div>
         </div>
 
         <div class="panel" style="flex:1">
           <div class="panel-head">
-            <span class="title">Traffic Baseline</span>
+            <span class="title" x-text="'Traffic Baseline' + (selected === 'all' ? ' :: Fleet' : '')"></span>
             <span class="meta" x-text="baseline.last_computed ? 'MODEL ' + fmtTime(baseline.last_computed) : 'LEARNING…'"></span>
           </div>
           <div class="panel-body">
@@ -237,20 +366,21 @@
     <!-- ============================================================ FOOTER -->
     <footer class="footer">
       <span>OPERATOR <b x-text="displayName || user"></b></span>
+      <span>SERVERS <b x-text="onlineCount() + '/' + enabledServers().length"></b></span>
       <span>PROCESSED <b x-text="fmtNum(pipeline.processed || 0)"></b></span>
       <span>QUEUE <b x-text="pipeline.queue_depth || 0"></b></span>
       <span>DB BUFFER <b x-text="pipeline.db_buffer || 0"></b></span>
       <span x-show="pipeline.dropped">DROPPED <b class="neon-red" x-text="pipeline.dropped"></b></span>
       <span>CONSOLES <b x-text="clients"></b></span>
       <span class="spacer"></span>
-      <span>IIS SENTINEL v1.0 // W3C DEFENSE GRID</span>
+      <span>IIS SENTINEL v2.0 // CENTRALIZED W3C DEFENSE GRID</span>
     </footer>
 
     <!-- ============================================================ TOASTS -->
     <div class="toast-stack">
       <template x-for="t in toasts" :key="t._k">
-        <div class="toast" :class="t.severity">
-          <div class="h" x-text="t.severity + ' // ' + (t.category || '').toUpperCase()"></div>
+        <div class="toast" :class="t.severity + (t.ok ? ' ok' : '')">
+          <div class="h" x-text="(t.server_name ? '[' + t.server_name + '] ' : '') + t.severity + ' // ' + (t.category || '').toUpperCase()"></div>
           <div x-text="t.title"></div>
         </div>
       </template>
@@ -264,13 +394,54 @@
           <button class="btn small ghost" @click="cfgOpen = false">CLOSE ✕</button>
         </div>
         <nav class="tabs">
-          <template x-for="t in ['ad','exchange','watchers','reports']" :key="t">
-            <button class="tab" :class="{ on: cfgTab === t }" @click="cfgTab = t" x-text="t.toUpperCase()"></button>
+          <template x-for="t in ['servers','ad','exchange','watchers','reports']" :key="t">
+            <button class="tab" :class="{ on: cfgTab === t }" @click="cfgTab = t; cfgMsg = { ok: true, text: '' }" x-text="t.toUpperCase()"></button>
           </template>
         </nav>
         <template x-if="form">
         <div class="drawer-body">
           <div class="notice" :class="cfgMsg.ok ? 'ok' : 'err'" x-show="cfgMsg.text" x-text="cfgMsg.text"></div>
+
+          <!-- SERVERS -->
+          <div x-show="cfgTab === 'servers'">
+            <div class="section-label" style="margin-top:0"><span>MONITORED IIS SERVERS</span><span x-text="servers.length"></span></div>
+            <template x-for="s in servers" :key="s.id">
+              <div class="srv-row" :class="{ disabled: !s.enabled }">
+                <div class="srv-main">
+                  <div><span class="dot" :class="s.enabled ? serverState(s) : ''"></span> <b x-text="s.server_name"></b>
+                    <span class="muted" x-text="' ' + s.ip_address + (s.local ? ' (local)' : ' · WinRM ' + (s.winrm_use_ssl ? 'HTTPS' : 'HTTP') + ':' + s.winrm_port + ' ' + (s.winrm_transport || '').toUpperCase())"></span></div>
+                  <div class="muted small" x-text="(s.winrm_username || '') + (s.log_unc_path ? '  ·  ' + s.log_unc_path : (s.local ? '  ·  ' + (s.log_dirs || []).join(', ') : '  ·  no log path'))"></div>
+                  <div class="small" :class="serverState(s) === 'down' ? 'neon-red' : 'muted'" x-show="s.enabled" x-text="serverStateText(s)"></div>
+                  <div class="small" x-show="testResults[s.id]" :class="testResults[s.id] && testResults[s.id].ok ? 'neon-green' : 'neon-red'" x-text="testResults[s.id] && testResults[s.id].text"></div>
+                </div>
+                <div class="srv-actions" x-show="!s.local">
+                  <button class="btn small" @click="testServer(s)" :disabled="!!srvBusy[s.id]" x-text="srvBusy[s.id] === 'test' ? 'TESTING…' : 'TEST'"></button>
+                  <button class="btn small ghost" @click="toggleServer(s)" :disabled="!!srvBusy[s.id]" x-text="s.enabled ? 'DISABLE' : 'ENABLE'"></button>
+                  <button class="btn small danger" @click="deleteServer(s)" :disabled="!!srvBusy[s.id]">DELETE</button>
+                </div>
+              </div>
+            </template>
+            <div class="muted" x-show="!servers.length" style="margin-bottom:12px">No servers registered yet.</div>
+
+            <div class="section-label"><span>ADD SERVER</span></div>
+            <div class="form-grid">
+              <div class="field"><label>Server name</label><input class="input" x-model="newServer.server_name" placeholder="IIS-01" maxlength="64"></div>
+              <div class="field"><label>IP address / hostname</label><input class="input" x-model="newServer.ip_address" placeholder="10.0.20.11"></div>
+              <div class="field"><label>WinRM username</label><input class="input" x-model="newServer.winrm_username" placeholder="CORP\svc_sentinel" autocomplete="off"></div>
+              <div class="field"><label>WinRM password</label><input class="input" type="password" x-model="newServer.winrm_password" autocomplete="new-password"></div>
+              <div class="field full"><label>IIS log UNC path</label><input class="input" x-model="newServer.log_unc_path" placeholder="\\10.0.20.11\c$\inetpub\logs\LogFiles\W3SVC1">
+                <div class="hint">The same account is used for the SMB share. Read access to the W3SVC folder is enough.</div></div>
+              <div class="field"><label>WinRM auth</label>
+                <select class="input" x-model="newServer.winrm_transport">
+                  <template x-for="t in ['ntlm','kerberos','credssp','basic']" :key="t"><option :value="t" x-text="t.toUpperCase()"></option></template>
+                </select>
+              </div>
+              <div class="field"><label>WinRM port (blank = 5985 / 5986)</label><input class="input" type="number" x-model.number="newServer.winrm_port" placeholder="5985"></div>
+            </div>
+            <label class="check"><input type="checkbox" x-model="newServer.winrm_use_ssl"> WinRM over HTTPS (5986)</label>
+            <label class="check" x-show="newServer.winrm_use_ssl"><input type="checkbox" x-model="newServer.winrm_verify_ssl"> Verify server certificate</label>
+            <button class="btn" @click="addServer()" :disabled="busy">REGISTER SERVER</button>
+          </div>
 
           <!-- AD -->
           <div x-show="cfgTab === 'ad'">
@@ -318,8 +489,10 @@
           <!-- WATCHERS -->
           <div x-show="cfgTab === 'watchers'">
             <div class="form-grid">
-              <div class="field full"><label>IIS log directories (one per line)</label><textarea class="input" x-model="form.watchers.log_dirs"></textarea>
-                <div class="hint">Enable sc-bytes / cs-bytes in IIS logging for bandwidth baselining.</div></div>
+              <div class="field full"><label>Local IIS log directories (only if Sentinel runs ON an IIS server)</label><textarea class="input" x-model="form.watchers.log_dirs"></textarea>
+                <div class="hint">Leave empty on an admin workstation; remote servers are added under SERVERS. Enable sc-bytes / cs-bytes in IIS logging for bandwidth baselining.</div></div>
+              <div class="field"><label>Local server display name</label><input class="input" x-model="form.watchers.local_server_name" placeholder="(hostname)"></div>
+              <div class="field"><label>Remote call timeout (s)</label><input class="input" type="number" x-model.number="form.watchers.remote_timeout"></div>
               <div class="field"><label>File pattern</label><input class="input" x-model="form.watchers.file_pattern"></div>
               <div class="field"><label>Poll interval (s)</label><input class="input" type="number" step="0.5" x-model.number="form.watchers.poll_interval"></div>
               <div class="field full"><label>App pools to monitor (blank = all)</label><textarea class="input" x-model="form.watchers.app_pools"></textarea></div>
@@ -338,9 +511,9 @@
             </div>
             <label class="check"><input type="checkbox" x-model="form.watchers.start_at_end"> Start at end of current log (skip history)</label>
             <div class="section-label"><span>WATCHER STATUS</span></div>
-            <template x-for="w in watcherStatus" :key="w.directory">
+            <template x-for="w in watcherStatus" :key="w.server_id + '|' + w.directory">
               <div class="kv" style="margin-bottom:8px">
-                <span class="k" x-text="w.directory"></span><span class="v" :class="w.status === 'tailing' ? 'neon-green' : 'neon-amber'" x-text="w.status.toUpperCase()"></span>
+                <span class="k"><span class="srv-tag" x-text="w.server_name"></span> <span x-text="w.directory || '—'"></span></span><span class="v" :class="w.status === 'tailing' ? 'neon-green' : 'neon-amber'" x-text="(w.status || '').toUpperCase()"></span>
                 <span class="k">file</span><span class="v" x-text="w.file ? w.file.split(/[\\/]/).pop() : '—'"></span>
                 <span class="k">lines / errors / rollovers</span><span class="v" x-text="fmtNum(w.lines_parsed) + ' / ' + w.parse_errors + ' / ' + w.rollovers"></span>
               </div>
@@ -391,8 +564,8 @@
         </div>
         </template>
         <div class="drawer-foot">
-          <span class="muted" style="margin-right:auto;font-size:10px">Secrets are stored DPAPI-encrypted on Windows.</span>
-          <button class="btn" @click="saveConfig()" :disabled="busy || !form">SAVE <span x-text="cfgTab.toUpperCase()"></span></button>
+          <span class="muted" style="margin-right:auto;font-size:10px">Secrets (incl. WinRM passwords) are stored DPAPI-encrypted on Windows.</span>
+          <button class="btn" x-show="cfgTab !== 'servers'" @click="saveConfig()" :disabled="busy || !form">SAVE <span x-text="cfgTab.toUpperCase()"></span></button>
         </div>
       </aside>
     </div>
