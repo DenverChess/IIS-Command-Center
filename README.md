@@ -25,7 +25,59 @@ iis_sentinel/
   static/            index.html (login), dashboard.html (SOC), css/style.css, js/app.js
 ```
 
-## Quick start (admin workstation)
+## Install (Windows installer)
+
+`IISSentinel-Setup-2.0.0.exe` is self-contained: it ships its own Python 3.12 runtime and every dependency, so the
+workstation needs nothing pre-installed (Windows 10/11 or Server 2016+, x64, administrator rights). Setup asks for:
+
+* **Console port** (default `8443`).
+* **Break-glass account** name and password. This local admin always works, even with AD down or not configured
+  yet. It is stored only as a salted PBKDF2 hash in `%ProgramData%\IIS Sentinel\local_admin.json`. On an upgrade,
+  leave the password empty to keep the current one.
+* **Network access**: local only (`127.0.0.1`, the default), or listen on all interfaces and open the port in
+  Windows Firewall (Domain + Private profiles) so other analysts can reach the console.
+
+It installs to `C:\Program Files\IIS Sentinel` and registers the **IIS Sentinel SOC** Windows service (automatic
+delayed start, restarts on failure). The installer waits for the console to answer, then offers to open it. The
+database, settings, reports and logs live in `%ProgramData%\IIS Sentinel`. That folder is restricted to SYSTEM and
+Administrators, because DPAPI-protected secrets are machine-scoped. Start menu entries: **IIS Sentinel Console**,
+**Reset Break-glass Password** (self-elevating), **Data and Logs** and **Uninstall**.
+
+Unattended install / upgrade:
+
+```powershell
+IISSentinel-Setup-2.0.0.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /ADMINPASSWORD="<pw>" [/ADMINUSER=soc-admin] [/PORT=8443] [/REMOTEACCESS=1] [/LOG=setup.log]
+```
+
+An upgrade stops the service, replaces the program files and restarts the service with your previous port,
+account and network choice. The data folder is never touched. Uninstalling removes the service and the console
+firewall rule. It then asks whether to delete the data folder; a silent uninstall keeps it unless you pass
+`/PURGEDATA`. Firewall bans already pushed to IIS servers are left in place.
+
+Reset the break-glass password at any time (elevated):
+
+```powershell
+& "C:\Program Files\IIS Sentinel\reset-password.cmd"            # prompts twice
+```
+
+### Building the installer
+
+On any Windows 10/11 machine with PowerShell 5.1+ and internet access:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File installer\build.ps1 -Version 2.0.0
+# -> dist\IISSentinel-Setup-2.0.0.exe (+ .sha256)
+```
+
+`build.ps1` downloads the CPython embeddable zip and WinSW, checking pinned SHA-256 hashes, then installs
+`requirements.txt` into the embedded runtime. It smoke-tests every import plus a DPAPI round trip and compiles
+`installer\IISSentinel.iss` with Inno Setup 6, installing it through winget or Chocolatey if missing. The
+**Windows installer** GitHub workflow builds the installer and runs `installer\tests\e2e.ps1` on a Windows Server
+runner. That test installs IIS and makes the runner its own monitored server over WinRM + an SMB log share. It
+attacks it, approves a firewall ban, then restarts, upgrades and uninstalls Sentinel. Never run `e2e.ps1` on a real
+machine: it reconfigures the host.
+
+## Quick start from source (admin workstation)
 
 ```powershell
 cd iis_sentinel
@@ -79,7 +131,7 @@ becomes `Approved` and the ban is broadcast to every console. Bans can be lifted
 | --- | --- |
 | `SENTINEL_HOST` / `SENTINEL_PORT` | Bind address (default `0.0.0.0:8443`) |
 | `SENTINEL_SSL_CERT` / `SENTINEL_SSL_KEY` | Serve HTTPS directly (then set `SENTINEL_COOKIE_SECURE=1`) |
-| `SENTINEL_LOCAL_ADMIN_USER` / `SENTINEL_LOCAL_ADMIN_PASSWORD` | Break-glass login when AD is down / unconfigured (disabled if no password) |
+| `SENTINEL_LOCAL_ADMIN_USER` / `SENTINEL_LOCAL_ADMIN_PASSWORD` | Plain-text break-glass login for development; overrides `local_admin.json` (set with `python sentinelctl.py set-admin-password`) |
 | `SENTINEL_LOG_DIRS` | Optional local IIS log directories (`;` separated) when Sentinel runs on an IIS server |
 | `SENTINEL_AD_SERVERS`, `SENTINEL_AD_DOMAIN`, `SENTINEL_AD_UPN_SUFFIX`, `SENTINEL_AD_BASE_DN`, `SENTINEL_AD_GROUP` | Initial AD settings |
 | `SENTINEL_DATA_DIR` | Where the SQLite DB and rotating `sentinel.log` live (default `./data`) |
