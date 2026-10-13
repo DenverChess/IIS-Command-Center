@@ -18,7 +18,7 @@ from apscheduler.triggers.cron import CronTrigger
 from sqlalchemy import case, desc, func, select
 
 from database import (
-    Alert,
+    ActionableAlert,
     ConfigStore,
     LogEntry,
     ScheduledReport,
@@ -160,21 +160,21 @@ class Reporter:
             ).all()
             threat_alerts = (
                 await s.execute(
-                    select(Alert)
-                    .where((Alert.ts >= start) & (Alert.ts < end) & Alert.category.in_(THREAT_CATEGORIES))
-                    .order_by(desc(Alert.ts)).limit(500)
+                    select(ActionableAlert)
+                    .where((ActionableAlert.ts >= start) & (ActionableAlert.ts < end) & ActionableAlert.category.in_(THREAT_CATEGORIES))
+                    .order_by(desc(ActionableAlert.ts)).limit(500)
                 )
             ).scalars().all()
             sev_rows = (
                 await s.execute(
-                    select(Alert.severity, func.count()).where((Alert.ts >= start) & (Alert.ts < end)).group_by(Alert.severity)
+                    select(ActionableAlert.severity, func.count()).where((ActionableAlert.ts >= start) & (ActionableAlert.ts < end)).group_by(ActionableAlert.severity)
                 )
             ).all()
             system_alerts = (
                 await s.execute(
-                    select(Alert)
-                    .where((Alert.ts >= start) & (Alert.ts < end) & (Alert.category == "system"))
-                    .order_by(desc(Alert.ts)).limit(25)
+                    select(ActionableAlert)
+                    .where((ActionableAlert.ts >= start) & (ActionableAlert.ts < end) & (ActionableAlert.category == "system"))
+                    .order_by(desc(ActionableAlert.ts)).limit(25)
                 )
             ).scalars().all()
             health = (

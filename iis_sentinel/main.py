@@ -17,7 +17,7 @@ import time
 from collections import defaultdict, deque
 from contextlib import asynccontextmanager
 from logging.handlers import RotatingFileHandler
-from typing import Any, AsyncIterator, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable, Literal
 from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
@@ -25,7 +25,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sqlalchemy import desc, insert, select, update
+from sqlalchemy import and_, desc, insert, select, update
 
 from ad_auth import ADAuthenticator
 from baseliner import Baseliner
@@ -33,10 +33,13 @@ from database import (
     BASE_DIR,
     DATA_DIR,
     DEMO_MODE,
-    Alert,
+    LOCAL_SERVER_ID,
+    ActionableAlert,
+    BannedIP,
     ConfigStore,
     LogEntry,
     ScheduledReport,
+    ServerRegistry,
     SessionLocal,
     SystemMetric,
     engine,
@@ -47,8 +50,9 @@ from database import (
     utcnow,
 )
 from events import AlertManager, Hub
-from log_tailer import DemoTrafficGenerator, LogTailer
+from log_tailer import LogTailer, run_demo_fleet
 from mailer import Mailer
+from remote_manager import RemoteError, RemoteManager, validate_ban_ip
 from reporter import Reporter
 from system_health import HealthMonitor
 from threat_rules import ThreatEngine
@@ -199,6 +203,8 @@ class Pipeline:
         return {
             "seq": seq,
             "ts": iso(entry["ts"]),
+            "server_id": entry.get("server_id", LOCAL_SERVER_ID),
+            "server": entry.get("server_name", ""),
             "site": entry.get("site", ""),
             "ip": entry.get("c_ip", ""),
             "method": entry.get("cs_method", ""),
@@ -218,20 +224,21 @@ class Pipeline:
         for ev in events:
             kind = ev["kind"]
             ip = ev.get("ip")
+            sid = int(ev.get("server_id") or LOCAL_SERVER_ID)
             if kind == "signature":
                 tags = "/".join(ev["tags"])
                 await self.alerts.raise_alert(
                     "WARNING", "attack", f"{tags} attempt from {ip}",
                     f"Request matched {tags} signature(s) (HTTP {ev.get('status')}).",
                     source_ip=ip, details={"payload": ev["payload"], "tags": ev["tags"]},
-                    dedup_key=f"sig:{ip}:{tags}", cooldown=600,
+                    dedup_key=f"sig:{sid}:{ip}:{tags}", cooldown=600, server_id=sid,
                 )
             elif kind == "spike":
                 await self.alerts.raise_alert(
                     "WARNING", "attack", f"HTTP {ev['spike']} spike from {ip}",
                     f"{ev['count']} {ev['spike']} responses within {int(ev['window'])}s.",
                     source_ip=ip, details={"count": ev["count"], "window_seconds": ev["window"]},
-                    dedup_key=f"spike:{ip}:{ev['spike']}", cooldown=300,
+                    dedup_key=f"spike:{sid}:{ip}:{ev['spike']}", cooldown=300, server_id=sid,
                 )
             elif kind == "active_threat":
                 st = ev["state"]
@@ -239,16 +246,16 @@ class Pipeline:
                     "HIGH", "threat", f"ACTIVE THREAT: {ip} (score {st['score']:.0f})",
                     f"Source {ip} ({st['geo']}) exceeded the threat threshold of {st['threshold']:.0f}. "
                     f"Signals: {', '.join(f'{k}x{v}' for k, v in st['tags'].items())}. "
-                    "Consider blocking this address (IIS IP Restrictions / firewall).",
+                    f"Approve the ban to block it on {ev.get('server_name') or 'the target server'}'s Windows Firewall.",
                     source_ip=ip,
                     details={"score": st["score"], "geo": st["geo"], "tags": st["tags"], "last_payload": st["last_payload"],
                              "requests": st["requests"]},
-                    dedup_key=f"active:{ip}", cooldown=1800,
+                    dedup_key=f"active:{sid}:{ip}", cooldown=1800, server_id=sid,
                 )
             elif kind == "threat_cleared":
                 await self.alerts.raise_alert(
                     "INFO", "recovery", f"Threat cleared: {ip}", "Threat score decayed below the threshold.",
-                    source_ip=ip, dedup_key=f"cleared:{ip}", cooldown=1800,
+                    details={"ip": ip}, dedup_key=f"cleared:{sid}:{ip}", cooldown=1800, server_id=sid,
                 )
 
     async def _handle_anomalies(self, anomalies: list[dict[str, Any]], entry: dict[str, Any] | None) -> None:
@@ -259,8 +266,9 @@ class Pipeline:
         }
         for a in anomalies:
             metric, ip = a["metric"], a.get("ip")
+            sid = int(a.get("server_id") or LOCAL_SERVER_ID)
             if ip and metric in ("rpm", "bpm"):
-                delta, events = self.threats.apply_anomaly(ip, metric, a["z"])
+                delta, events = self.threats.apply_anomaly(sid, ip, metric, a["z"])
                 if entry is not None:
                     entry["threat_score"] = int(entry.get("threat_score") or 0) + delta
                     tag = "ZSCORE"
@@ -271,7 +279,8 @@ class Pipeline:
                 "WARNING", "anomaly",
                 f"{labels.get(metric, metric)} anomaly{f' from {ip}' if ip else ''} (z={a['z']:+.1f})",
                 f"Observed {a['value']:,.0f} {unit} vs baseline mean {a['mean']:,.1f} (std {a['std']:,.1f}, basis: {a['basis']}).",
-                source_ip=ip, details=a, dedup_key=f"anomaly:{metric}:{ip or '*'}", cooldown=600,
+                source_ip=ip, details=a, dedup_key=f"anomaly:{sid}:{metric}:{ip or '*'}", cooldown=600, server_id=sid,
+                actionable=bool(ip) and metric in ("rpm", "bpm"),
             )
 
     async def _process(self, entry: dict[str, Any]) -> None:
@@ -366,6 +375,8 @@ _LOG_COLUMNS = [c.name for c in LogEntry.__table__.columns if c.name != "id"]
 # --------------------------------------------------------------------------------------
 class State:
     config: ConfigStore
+    registry: ServerRegistry
+    remote: RemoteManager
     hub: Hub
     mailer: Mailer
     alerts: AlertManager
@@ -379,6 +390,7 @@ class State:
     signer: SessionSigner
     throttle: LoginThrottle
     ip_throttle: LoginThrottle
+    ban_locks: defaultdict[tuple[int, str], asyncio.Lock]
     started_at: float
     tasks: list[asyncio.Task[Any]]
 
@@ -419,21 +431,69 @@ async def periodic_broadcast() -> None:
                 log.info("Pruned %d idle IP states", pruned)
 
 
+def _servers_payload() -> list[dict[str, Any]]:
+    return S.registry.list_public()
+
+
+def _on_servers_changed() -> None:
+    S.tailer.reload()
+    S.health.reload()
+    known = {srv["id"] for srv in S.registry.all(enabled_only=False)}
+    for srv in S.registry.all(enabled_only=False):
+        S.threats.rename_server(srv["id"], srv["server_name"])
+    _LOG_FEEDS_DOWN.intersection_update(known)
+    for sid in S.threats.server_ids() - known:
+        S.threats.forget_server(sid)
+        S.baseliner.forget_server(sid)
+    S.hub.broadcast({"type": "servers", "data": _servers_payload()})
+
+
+_LOG_FEEDS_DOWN: set[int] = set()
+
+
+async def _log_feed_status(server_id: int, component: str, ok: bool, error: str | None) -> None:
+    """Called by the log tailer when a server's log feed goes up or down (state changes only)."""
+    S.hub.broadcast({"type": "server_status", "server_id": server_id, "server_name": S.registry.name(server_id),
+                     "component": component, "ok": ok, "error": error})
+    was_down = server_id in _LOG_FEEDS_DOWN
+    if ok:
+        _LOG_FEEDS_DOWN.discard(server_id)
+    else:
+        _LOG_FEEDS_DOWN.add(server_id)
+    if ok and not was_down:
+        return
+    if ok:
+        await S.alerts.raise_alert("INFO", "recovery", "Log feed restored", "Sentinel is reading this server's IIS logs again.",
+                                   server_id=server_id, dedup_key=f"{server_id}:logs:up", cooldown=60)
+    else:
+        await S.alerts.raise_alert(
+            "HIGH", "system", "Log feed offline",
+            f"Cannot read IIS logs: {error}. Attacks against this server are not being detected until the feed "
+            "recovers. Monitoring of the other servers continues.",
+            details={"error": error}, server_id=server_id, dedup_key=f"{server_id}:logs:down", cooldown=1800,
+        )
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     S.started_at = time.time()
     await init_db()
     S.config = ConfigStore()
     await S.config.load()
+    S.registry = ServerRegistry(S.config)
+    await S.registry.load()
+    S.remote = RemoteManager(S.config, S.registry)
     S.hub = Hub()
     S.mailer = Mailer(S.config)
     S.alerts = AlertManager(S.hub, S.config, S.mailer)
+    S.alerts.server_name = S.registry.name
     S.auth = ADAuthenticator(S.config)
-    S.threats = ThreatEngine(S.config)
+    S.threats = ThreatEngine(S.config, S.registry.name)
     S.baseliner = Baseliner(S.config)
-    S.health = HealthMonitor(S.config, S.alerts, S.hub)
+    S.health = HealthMonitor(S.config, S.alerts, S.hub, S.registry, S.remote)
     queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=50000)
-    S.tailer = LogTailer(S.config, queue)
+    S.tailer = LogTailer(S.config, S.registry, S.remote, queue, on_status=_log_feed_status)
+    S.ban_locks = defaultdict(asyncio.Lock)
     S.pipeline = Pipeline(queue, S.threats, S.baseliner, S.alerts, S.hub)
     S.reporter = Reporter(S.config, S.mailer)
     S.signer = SessionSigner(await get_or_create_session_secret(), SESSION_TTL)
@@ -443,8 +503,12 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     def _on_config(section: str) -> None:
         if section == "reports":
             S.reporter.reschedule()
+        elif section == "watchers":
+            # log_dirs toggles the optional local server (id 0).
+            _on_servers_changed()
 
     S.config.on_change(_on_config)
+    S.registry.on_change(_on_servers_changed)
     try:
         S.reporter.start()
     except Exception:  # noqa: BLE001
@@ -458,10 +522,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         "broadcaster": periodic_broadcast,
     }
     if DEMO_MODE:
-        jobs["demo_traffic"] = DemoTrafficGenerator().run
+        jobs["demo_traffic"] = run_demo_fleet
     S.tasks = [asyncio.create_task(supervise(name, fn), name=name) for name, fn in jobs.items()]
-    log.info("IIS Sentinel online%s. Watching: %s", " [DEMO MODE]" if DEMO_MODE else "",
-             ", ".join(S.config.value("watchers", "log_dirs", [])))
+    log.info("IIS Sentinel SOC online%s. Monitoring %d server(s): %s", " [DEMO MODE]" if DEMO_MODE else "",
+             len(S.registry.all()), ", ".join(srv["server_name"] for srv in S.registry.all()) or "none (add one under CONFIG > SERVERS)")
     try:
         yield
     finally:
@@ -497,7 +561,8 @@ async def security_headers(request: Request, call_next: Callable[[Request], Awai
         "style-src 'self' 'unsafe-inline' https://fonts.googleapis.com; font-src 'self' https://fonts.gstatic.com; "
         "img-src 'self' data:; connect-src 'self' ws: wss:; frame-ancestors 'none'"
     )
-    if request.url.path.startswith(("/api", "/login", "/config", "/threats", "/system", "/alerts", "/reports", "/stats")):
+    if request.url.path.startswith(("/api", "/login", "/config", "/threats", "/system", "/alerts", "/reports", "/stats",
+                                    "/servers", "/defense")):
         response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -665,13 +730,13 @@ async def threats_live(limit: int = 100, _user: dict[str, Any] = Depends(current
         ).scalars().all()
         alerts = (
             await s.execute(
-                select(Alert).where(Alert.category.in_(("attack", "threat", "anomaly"))).order_by(desc(Alert.id)).limit(limit)
+                select(ActionableAlert).where(ActionableAlert.category.in_(("attack", "threat", "anomaly"))).order_by(desc(ActionableAlert.id)).limit(limit)
             )
         ).scalars().all()
     return {
         "events": [
             {
-                "ts": iso(r.ts), "ip": r.c_ip, "method": r.cs_method, "uri": r.cs_uri_stem, "query": r.cs_uri_query[:500],
+                "ts": iso(r.ts), "server_id": r.server_id, "server_name": S.registry.name(r.server_id), "ip": r.c_ip, "method": r.cs_method, "uri": r.cs_uri_stem, "query": r.cs_uri_query[:500],
                 "status": r.sc_status, "tags": r.threat_tags, "score": r.threat_score, "ua": r.user_agent[:200],
             }
             for r in rows
@@ -681,62 +746,80 @@ async def threats_live(limit: int = 100, _user: dict[str, Any] = Depends(current
 
 
 @app.get("/threats/active")
-async def threats_active(_user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    return {"threats": S.threats.active_threats(limit=200), "counts": S.threats.counts()}
+async def threats_active(server_id: int | None = None, _user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    return {"threats": S.threats.active_threats(limit=200, server_id=server_id), "counts": S.threats.counts()}
 
 
 @app.get("/threats/ip/{ip}")
-async def threat_ip(ip: str, _user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    detail = S.threats.ip_detail(ip)
+async def threat_ip(ip: str, server_id: int | None = None, _user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    detail = S.threats.ip_detail(ip, server_id)
+    q = select(LogEntry).where(LogEntry.c_ip == ip)
+    if server_id is not None:
+        q = q.where(LogEntry.server_id == server_id)
     async with SessionLocal() as s:
-        rows = (
-            await s.execute(select(LogEntry).where(LogEntry.c_ip == ip).order_by(desc(LogEntry.id)).limit(50))
-        ).scalars().all()
+        rows = (await s.execute(q.order_by(desc(LogEntry.id)).limit(50))).scalars().all()
     return {
         "state": detail,
-        "recent": [{"ts": iso(r.ts), "method": r.cs_method, "uri": r.cs_uri_stem, "query": r.cs_uri_query[:300],
+        "recent": [{"ts": iso(r.ts), "server_id": r.server_id, "server_name": S.registry.name(r.server_id),
+                    "method": r.cs_method, "uri": r.cs_uri_stem, "query": r.cs_uri_query[:300],
                     "status": r.sc_status, "tags": r.threat_tags} for r in rows],
     }
 
 
 @app.get("/system/health")
-async def system_health(_user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    if S.health.latest:
-        return S.health.latest
-    async with SessionLocal() as s:
-        row = (await s.execute(select(SystemMetric).order_by(desc(SystemMetric.id)).limit(1))).scalar_one_or_none()
-    if row is None:
-        return {"status": "pending", "detail": "First health sample not collected yet"}
-    pools = json.loads(row.app_pools or "{}")
-    return {
-        "ts": iso(row.ts), "cpu_percent": row.cpu_percent, "ram_percent": row.ram_percent, "disk_percent": row.disk_percent,
-        "disk_free_percent": row.disk_free_percent, "disk_free_gb": row.disk_free_gb, "disk_path": row.disk_path,
-        "app_pools": [{"name": k, "state": v, "running": v == "Started"} for k, v in pools.items()],
-        "w3svc_state": row.w3svc_state, "uptime_seconds": row.uptime_seconds, "stale": True,
-    }
+async def system_health(server_id: int | None = None, _user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    servers = S.health.snapshot()
+    if server_id is not None:
+        servers = [x for x in servers if x["server_id"] == server_id]
+        if not servers and S.registry.get(server_id) is None:
+            raise HTTPException(status_code=404, detail="Server not found")
+    for sample in servers:
+        if sample.get("cpu_percent") is not None:
+            continue
+        # Nothing collected since startup (or the server is offline): fall back to the last persisted sample.
+        async with SessionLocal() as s:
+            row = (await s.execute(
+                select(SystemMetric).where(SystemMetric.server_id == sample["server_id"]).order_by(desc(SystemMetric.id)).limit(1)
+            )).scalar_one_or_none()
+        if row is not None:
+            pools = json.loads(row.app_pools or "{}")
+            sample.update({
+                "ts": iso(row.ts), "cpu_percent": row.cpu_percent, "ram_percent": row.ram_percent,
+                "disk_percent": row.disk_percent, "disk_free_percent": row.disk_free_percent,
+                "disk_free_gb": row.disk_free_gb, "disk_path": row.disk_path,
+                "app_pools": [{"name": k, "state": v, "running": v == "Started"} for k, v in pools.items()],
+                "w3svc_state": row.w3svc_state, "uptime_seconds": row.uptime_seconds, "stale": True,
+            })
+    return {"servers": servers}
 
 
 @app.get("/stats/baseline")
-async def stats_baseline(_user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    return {"baseline": S.baseliner.snapshot(), "pipeline": S.pipeline.stats(), "watchers": S.tailer.status()}
+async def stats_baseline(server_id: int | None = None, _user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    return {"baseline": S.baseliner.snapshot(server_id), "pipeline": S.pipeline.stats(), "watchers": S.tailer.status()}
 
 
-def _alert_dict(a: Alert) -> dict[str, Any]:
+def _alert_dict(a: ActionableAlert) -> dict[str, Any]:
     try:
         details = json.loads(a.details or "{}")
     except json.JSONDecodeError:
         details = {}
     return {
-        "id": a.id, "ts": iso(a.ts), "severity": a.severity, "category": a.category, "title": a.title,
+        "id": a.id, "ts": iso(a.ts), "server_id": a.server_id, "server_name": S.registry.name(a.server_id),
+        "status": a.status, "severity": a.severity, "category": a.category, "title": a.title,
         "message": a.message, "source_ip": a.source_ip, "details": details, "acknowledged": a.acknowledged, "emailed": a.emailed,
     }
 
 
 @app.get("/alerts")
-async def list_alerts(limit: int = 100, severity: str | None = None, _user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
-    q = select(Alert).order_by(desc(Alert.id)).limit(max(1, min(limit, 1000)))
+async def list_alerts(limit: int = 100, severity: str | None = None, server_id: int | None = None,
+                      status: str | None = None, _user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    q = select(ActionableAlert).order_by(desc(ActionableAlert.id)).limit(max(1, min(limit, 1000)))
     if severity:
-        q = q.where(Alert.severity == severity.upper())
+        q = q.where(ActionableAlert.severity == severity.upper())
+    if server_id is not None:
+        q = q.where(ActionableAlert.server_id == server_id)
+    if status:
+        q = q.where(ActionableAlert.status == status.capitalize())
     async with SessionLocal() as s:
         rows = (await s.execute(q)).scalars().all()
     return {"alerts": [_alert_dict(a) for a in rows]}
@@ -745,12 +828,257 @@ async def list_alerts(limit: int = 100, severity: str | None = None, _user: dict
 @app.post("/alerts/{alert_id}/ack")
 async def ack_alert(alert_id: int, _user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     async def _op(s):  # type: ignore[no-untyped-def]
-        res = await s.execute(update(Alert).where(Alert.id == alert_id).values(acknowledged=True))
+        res = await s.execute(update(ActionableAlert).where(ActionableAlert.id == alert_id).values(acknowledged=True))
         return res.rowcount
 
     if not await run_db(_op):
         raise HTTPException(status_code=404, detail="Alert not found")
     S.hub.broadcast({"type": "alert_ack", "id": alert_id})
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------------------------
+# Monitored servers API
+# --------------------------------------------------------------------------------------
+def same_origin_guard(request: Request) -> None:
+    if not _same_origin(request.headers.get("origin"), request.headers.get("host")):
+        raise HTTPException(status_code=403, detail="Cross-origin request refused")
+
+
+class ServerBody(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    server_name: str = Field(min_length=1, max_length=64)
+    ip_address: str = Field(min_length=1, max_length=255)
+    winrm_username: str = Field(default="", max_length=256)
+    winrm_password: str = Field(default="", max_length=512)
+    log_unc_path: str = Field(default="", max_length=1024)
+    winrm_transport: Literal["ntlm", "kerberos", "credssp", "basic"] = "ntlm"
+    winrm_port: int | None = Field(default=None, ge=1, le=65535)
+    winrm_use_ssl: bool = False
+    winrm_verify_ssl: bool = True
+    enabled: bool = True
+
+
+class ServerPatch(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    server_name: str | None = Field(default=None, min_length=1, max_length=64)
+    ip_address: str | None = Field(default=None, min_length=1, max_length=255)
+    winrm_username: str | None = Field(default=None, max_length=256)
+    winrm_password: str | None = Field(default=None, max_length=512)
+    log_unc_path: str | None = Field(default=None, max_length=1024)
+    winrm_transport: Literal["ntlm", "kerberos", "credssp", "basic"] | None = None
+    winrm_port: int | None = Field(default=None, ge=1, le=65535)
+    winrm_use_ssl: bool | None = None
+    winrm_verify_ssl: bool | None = None
+    enabled: bool | None = None
+
+
+@app.get("/servers")
+async def list_servers(_user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    return {"servers": _servers_payload(), "health": S.health.snapshot(), "logs": S.tailer.status()}
+
+
+@app.post("/servers", status_code=201, dependencies=[Depends(same_origin_guard)])
+async def add_server(body: ServerBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    try:
+        server = await S.registry.add(body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    log.info("Server %s (%s) added by %s", server["server_name"], server["ip_address"], user["u"])
+    return {"server": server}
+
+
+@app.put("/servers/{server_id}", dependencies=[Depends(same_origin_guard)])
+async def update_server(server_id: int, body: ServerPatch, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    try:
+        server = await S.registry.update(server_id, body.model_dump(exclude_none=True))
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Server not found") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    log.info("Server %s updated by %s", server["server_name"], user["u"])
+    return {"server": server}
+
+
+@app.delete("/servers/{server_id}", dependencies=[Depends(same_origin_guard)])
+async def delete_server(server_id: int, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    if server_id == LOCAL_SERVER_ID:
+        raise HTTPException(status_code=400, detail="The local server is controlled by watchers.log_dirs")
+    name = S.registry.name(server_id)
+    try:
+        await S.registry.remove(server_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="Server not found") from exc
+    log.info("Server %s removed by %s", name, user["u"])
+    return {"ok": True}
+
+
+@app.post("/servers/{server_id}/test", dependencies=[Depends(same_origin_guard)])
+async def test_server(server_id: int, _user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    if S.registry.get(server_id) is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+    return await S.remote.test(server_id)
+
+
+# --------------------------------------------------------------------------------------
+# Active defense (manual, operator-approved firewall bans)
+# --------------------------------------------------------------------------------------
+class BanBody(BaseModel):
+    alert_id: int | None = Field(default=None, ge=1)
+    server_id: int | None = Field(default=None, ge=0)
+    ip: str | None = Field(default=None, max_length=64)
+
+
+class DismissBody(BaseModel):
+    alert_id: int = Field(ge=1)
+
+
+def _ban_dict(b: BannedIP) -> dict[str, Any]:
+    return {
+        "id": b.id, "server_id": b.server_id, "server_name": S.registry.name(b.server_id), "ip_address": b.ip_address,
+        "alert_id": b.alert_id, "rule_name": b.rule_name, "banned_by": b.banned_by, "banned_at": iso(b.banned_at),
+        "active": b.active,
+    }
+
+
+async def _set_alert_status(server_id: int, ip: str, status: str, primary_id: int | None) -> list[int]:
+    """Mark the approved alert, plus every other pending alert for the same attacker on the same server."""
+    async def _op(s):  # type: ignore[no-untyped-def]
+        cond = and_(ActionableAlert.server_id == server_id, ActionableAlert.source_ip == ip, ActionableAlert.status == "Pending")
+        if primary_id is not None:
+            cond = cond | (ActionableAlert.id == primary_id)
+        ids = (await s.execute(select(ActionableAlert.id).where(cond))).scalars().all()
+        if ids:
+            await s.execute(update(ActionableAlert).where(ActionableAlert.id.in_(ids)).values(status=status, acknowledged=True))
+        return list(ids)
+
+    ids = await run_db(_op)
+    for alert_id in ids:
+        S.alerts.update_recent(alert_id, status=status, acknowledged=True)
+    return ids
+
+
+@app.post("/defense/ban", dependencies=[Depends(same_origin_guard)])
+async def defense_ban(body: BanBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    alert: ActionableAlert | None = None
+    if body.alert_id is not None:
+        async with SessionLocal() as s:
+            alert = await s.get(ActionableAlert, body.alert_id)
+        if alert is None:
+            raise HTTPException(status_code=404, detail="Alert not found")
+        if not alert.source_ip:
+            raise HTTPException(status_code=400, detail="This alert has no source IP to ban")
+        if alert.status == "Approved":
+            raise HTTPException(status_code=409, detail="This alert has already been approved and the IP banned")
+        server_id, ip = alert.server_id, alert.source_ip
+    elif body.server_id is not None and body.ip:
+        server_id, ip = body.server_id, body.ip.strip()
+    else:
+        raise HTTPException(status_code=400, detail="Provide alert_id (or server_id + ip)")
+
+    try:
+        ip = validate_ban_ip(ip)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    server = S.registry.get(server_id)
+    if server is None:
+        raise HTTPException(status_code=409, detail=f"Target server {S.registry.name(server_id)} is no longer monitored")
+
+    async with S.ban_locks[(server_id, ip)]:
+        log.warning("BAN requested by %s: %s on %s (alert %s)", user["u"], ip, server["server_name"], body.alert_id)
+        try:
+            ok, output = await S.remote.ban(server_id, ip)
+        except asyncio.TimeoutError as exc:
+            raise HTTPException(status_code=504, detail=f"{server['server_name']} did not respond to WinRM in time") from exc
+        except (RemoteError, ValueError) as exc:
+            raise HTTPException(status_code=502, detail=f"Ban failed on {server['server_name']}: {exc}") from exc
+        except Exception as exc:  # noqa: BLE001
+            log.exception("Ban of %s on %s failed", ip, server["server_name"])
+            raise HTTPException(status_code=502, detail=f"Ban failed on {server['server_name']}: {type(exc).__name__}: {exc}") from exc
+        if not ok:
+            log.error("netsh on %s refused ban of %s: %s", server["server_name"], ip, output)
+            raise HTTPException(status_code=502, detail=f"netsh on {server['server_name']} failed: {output[:400]}")
+
+        rule = f"SENTINEL BAN: {ip}"
+
+        async def _op(s):  # type: ignore[no-untyped-def]
+            row = (await s.execute(select(BannedIP).where(
+                BannedIP.server_id == server_id, BannedIP.ip_address == ip, BannedIP.active.is_(True)
+            ))).scalars().first()
+            if row is None:
+                row = BannedIP(server_id=server_id, ip_address=ip, alert_id=body.alert_id, rule_name=rule,
+                               banned_by=user["u"], banned_at=utcnow(), active=True)
+                s.add(row)
+                await s.flush()
+            return _ban_dict(row)
+
+        ban = await run_db(_op)
+        alert_ids = await _set_alert_status(server_id, ip, "Approved", body.alert_id)
+    S.threats.clear(server_id, ip)
+    S.hub.broadcast({"type": "ban", "data": ban, "alert_ids": alert_ids, "status": "Approved", "output": output[:500]})
+    await S.alerts.raise_alert(
+        "INFO", "defense", f"Firewall ban executed: {ip}",
+        f"{user['u']} approved the ban. Windows Firewall rule '{rule}' is now blocking {ip} on {server['server_name']}.",
+        details={"ip": ip, "rule": rule, "alert_ids": alert_ids, "output": output[:500]}, server_id=server_id,
+    )
+    return {"ok": True, "ban": ban, "alert_ids": alert_ids, "output": output}
+
+
+@app.post("/defense/dismiss", dependencies=[Depends(same_origin_guard)])
+async def defense_dismiss(body: DismissBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    async def _op(s):  # type: ignore[no-untyped-def]
+        row = await s.get(ActionableAlert, body.alert_id)
+        if row is None:
+            return None
+        if row.status == "Pending":
+            row.status = "Dismissed"
+            row.acknowledged = True
+        return row.status
+
+    status = await run_db(_op)
+    if status is None:
+        raise HTTPException(status_code=404, detail="Alert not found")
+    S.alerts.update_recent(body.alert_id, status=status, acknowledged=True)
+    S.hub.broadcast({"type": "alert_status", "ids": [body.alert_id], "status": status})
+    log.info("Alert %s dismissed by %s", body.alert_id, user["u"])
+    return {"ok": True, "status": status}
+
+
+@app.get("/defense/bans")
+async def list_bans(active: bool = True, server_id: int | None = None, _user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    q = select(BannedIP).order_by(desc(BannedIP.id)).limit(500)
+    if active:
+        q = q.where(BannedIP.active.is_(True))
+    if server_id is not None:
+        q = q.where(BannedIP.server_id == server_id)
+    async with SessionLocal() as s:
+        rows = (await s.execute(q)).scalars().all()
+    return {"bans": [_ban_dict(b) for b in rows]}
+
+
+@app.delete("/defense/bans/{ban_id}", dependencies=[Depends(same_origin_guard)])
+async def lift_ban(ban_id: int, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    async with SessionLocal() as s:
+        ban = await s.get(BannedIP, ban_id)
+    if ban is None or not ban.active:
+        raise HTTPException(status_code=404, detail="Active ban not found")
+    name = S.registry.name(ban.server_id)
+    if S.registry.get(ban.server_id) is not None:
+        try:
+            ok, output = await S.remote.unban(ban.server_id, ban.ip_address)
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(status_code=502, detail=f"Unban failed on {name}: {type(exc).__name__}: {exc}") from exc
+        if not ok and "No rules match" not in output:
+            raise HTTPException(status_code=502, detail=f"netsh on {name} failed: {output[:400]}")
+
+    async def _op(s):  # type: ignore[no-untyped-def]
+        await s.execute(update(BannedIP).where(BannedIP.id == ban_id).values(active=False))
+
+    await run_db(_op)
+    log.warning("Ban %s (%s on %s) lifted by %s", ban_id, ban.ip_address, name, user["u"])
+    S.hub.broadcast({"type": "unban", "id": ban_id, "server_id": ban.server_id, "ip_address": ban.ip_address})
     return {"ok": True}
 
 
@@ -814,7 +1142,8 @@ async def ws_dashboard(ws: WebSocket) -> None:
         "display_name": user["d"],
         "demo": DEMO_MODE,
         "logs": list(S.pipeline.recent)[-200:],
-        "health": S.health.latest,
+        "servers": _servers_payload(),
+        "health": S.health.snapshot(),
         "threats": S.threats.active_threats(),
         "counts": S.threats.counts(),
         "alerts": S.alerts.recent(50),
