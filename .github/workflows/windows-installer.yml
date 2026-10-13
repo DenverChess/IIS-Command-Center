@@ -14,15 +14,32 @@ on:
       - ".github/workflows/windows-installer.yml"
   workflow_dispatch:
 
+env:
+  # Last release that registered the service from the install root; upgrades from it must keep working.
+  LEGACY_REF: f024152
+
 jobs:
   build-and-test:
-    runs-on: windows-2022
+    name: ${{ matrix.os }}${{ matrix.legacy && ' (upgrade from legacy layout)' || '' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-2022   # Windows 10 / Server 2022 code base
+            legacy: false
+          - os: windows-2025   # Windows 11 24H2 / Server 2025 code base
+            legacy: false
+          - os: windows-2025
+            legacy: true
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 45
     defaults:
       run:
         shell: powershell
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Cache downloads
         uses: actions/cache@v4
@@ -33,7 +50,15 @@ jobs:
       - name: Build installer
         run: .\installer\build.ps1 -Version 2.0.0
 
+      - name: Build legacy installer
+        if: matrix.legacy
+        run: |
+          git worktree add "$env:RUNNER_TEMP\legacy" $env:LEGACY_REF
+          & "$env:RUNNER_TEMP\legacy\installer\build.ps1" -Version 1.9.9 -OutputDir "$env:RUNNER_TEMP\legacy-dist"
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
+
       - name: Upload installer
+        if: ${{ !matrix.legacy && matrix.os == 'windows-2022' }}
         uses: actions/upload-artifact@v4
         with:
           name: IISSentinel-Setup
@@ -42,12 +67,20 @@ jobs:
             dist/IISSentinel-Setup-*.exe.sha256
 
       - name: End-to-end test (IIS + WinRM + SMB + install/upgrade/uninstall)
-        run: .\installer\tests\e2e.ps1 -Installer (Get-ChildItem dist\IISSentinel-Setup-*.exe | Select-Object -First 1).FullName -ArtifactDir "$env:RUNNER_TEMP\e2e"
+        run: |
+          $e2e = @{
+            Installer   = (Get-ChildItem dist\IISSentinel-Setup-*.exe | Select-Object -First 1).FullName
+            ArtifactDir = "$env:RUNNER_TEMP\e2e"
+          }
+          if ("${{ matrix.legacy }}" -eq "true") {
+            $e2e.LegacyInstaller = (Get-ChildItem "$env:RUNNER_TEMP\legacy-dist\IISSentinel-Setup-*.exe" | Select-Object -First 1).FullName
+          }
+          .\installer\tests\e2e.ps1 @e2e
 
       - name: Upload test logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: e2e-logs
+          name: e2e-logs-${{ matrix.os }}${{ matrix.legacy && '-legacy' || '' }}
           path: ${{ runner.temp }}/e2e
           if-no-files-found: ignore

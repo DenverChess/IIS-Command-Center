@@ -151,6 +151,24 @@ IISSentinel-Setup-2.0.0.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART `
 
 </details>
 
+<details>
+<summary><b>Troubleshooting</b></summary>
+
+> [!IMPORTANT]
+> The file to run is **`dist\IISSentinel-Setup-2.0.0.exe`** (`build.ps1` opens Explorer on it). It is a normal
+> windowed setup wizard. A console window that flashes and vanishes means a *helper* program was started instead,
+> such as the WinSW service wrapper (`service\IISSentinelService.exe`) or `python.exe`. Those programs are only
+> ever started by Windows or by setup, and nothing under `installer\build\` is meant to be run.
+
+| Symptom | Check |
+| --- | --- |
+| Wizard never appears | Run the setup `.exe` from `dist\` and accept the UAC prompt. Setup writes a log to `%TEMP%\Setup Log *.txt` |
+| Console doesn't answer | `Get-Service IISSentinel`, then `%ProgramData%\IIS Sentinel\sentinel.log` and `service-logs\` |
+| Need the full install log | Re-run the setup with `/LOG="%USERPROFILE%\Desktop\sentinel-setup.log"` |
+| Port already in use | Re-run the setup and pick another port, or `/PORT=<port>` |
+
+</details>
+
 ---
 
 ## `04` Preparing each IIS server
@@ -461,8 +479,10 @@ On any Windows 10/11 machine with PowerShell 5.1+ and internet access:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File installer\build.ps1 -Version 2.0.0
-# → dist\IISSentinel-Setup-2.0.0.exe  (+ .sha256)
+# → dist\IISSentinel-Setup-2.0.0.exe  (+ .sha256), selected in Explorer when the build finishes
 ```
+
+Run **`dist\IISSentinel-Setup-2.0.0.exe`** to install. `installer\build\` only holds intermediate files.
 
 `build.ps1` does the following:
 
@@ -471,8 +491,8 @@ powershell -ExecutionPolicy Bypass -File installer\build.ps1 -Version 2.0.0
 3. Smoke-tests every import plus a DPAPI round trip.
 4. Compiles `installer\IISSentinel.iss` with Inno Setup 6, installing it via winget or Chocolatey if missing.
 
-The **[Windows installer workflow](../../actions/workflows/windows-installer.yml)** builds the installer on a fresh
-Windows Server runner, then runs `installer\tests\e2e.ps1`. That test:
+The **[Windows installer workflow](../../actions/workflows/windows-installer.yml)** builds the installer on fresh
+Windows Server 2022 and 2025 runners (the Windows 10 and Windows 11 code bases), plus an upgrade from the previous install layout, then runs `installer\tests\e2e.ps1`. That test:
 
 ```text
 [PASS] install IIS 10 · lab WinRM account · SMB log share

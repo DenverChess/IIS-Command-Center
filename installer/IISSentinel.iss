@@ -52,7 +52,7 @@ UninstallDisplayIcon={app}\python\python.exe
 [Files]
 Source: "{#StageDir}\python\*"; DestDir: "{app}\python"; Flags: ignoreversion recursesubdirs createallsubdirs
 Source: "{#StageDir}\app\*"; DestDir: "{app}\app"; Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "{#StageDir}\IISSentinelService.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#StageDir}\service\IISSentinelService.exe"; DestDir: "{app}\service"; Flags: ignoreversion
 Source: "{#StageDir}\reset-password.cmd"; DestDir: "{app}"; Flags: ignoreversion
 
 [Dirs]
@@ -75,6 +75,7 @@ Name: "desktopicon"; Description: "Create a desktop shortcut to the console"; Fl
 Filename: "{code:ConsoleUrl}"; Description: "Open the IIS Sentinel console"; Flags: postinstall shellexec skipifsilent nowait
 
 [UninstallDelete]
+Type: filesandordirs; Name: "{app}\service"
 Type: files; Name: "{app}\IISSentinelService.xml"
 Type: files; Name: "{app}\IIS Sentinel Console.url"
 Type: filesandordirs; Name: "{app}\app"
@@ -125,6 +126,17 @@ begin
       Result := True;
       Exit;
     end;
+end;
+
+{ WinSW lives in a subfolder: double-clicking it only prints usage, so it must not look like the program. }
+function ServiceExe: string;
+begin
+  Result := ExpandConstant('{app}\service\IISSentinelService');
+end;
+
+function LegacyServiceExe: string;
+begin
+  Result := ExpandConstant('{app}\IISSentinelService');
 end;
 
 function DataDir: string;
@@ -314,6 +326,13 @@ begin
     Result := 'The IIS Sentinel service did not stop within 45 seconds. Stop it manually (services.msc) and run setup again.';
     Exit;
   end;
+  { Earlier builds registered the service from the install root; re-register it from service\. }
+  if FileExists(LegacyServiceExe + '.exe') then
+  begin
+    RunHidden(LegacyServiceExe + '.exe', 'uninstall');
+    DeleteFile(LegacyServiceExe + '.exe');
+    DeleteFile(LegacyServiceExe + '.xml');
+  end;
   { Start from a clean application tree so files removed in this version do not linger. }
   DelTree(ExpandConstant('{app}\app'), True, True, True);
 end;
@@ -359,8 +378,8 @@ begin
   Lines[21] := '  <delayedAutoStart>true</delayedAutoStart>';
   Lines[22] := '  <stoptimeout>20 sec</stoptimeout>';
   Lines[23] := '</service>';
-  if not SaveStringsToUTF8File(App + '\IISSentinelService.xml', Lines, False) then
-    RaiseException('Could not write ' + App + '\IISSentinelService.xml');
+  if not SaveStringsToUTF8File(ServiceExe + '.xml', Lines, False) then
+    RaiseException('Could not write ' + ServiceExe + '.xml');
 end;
 
 function SaveAdminAccount: Boolean;
@@ -398,7 +417,7 @@ function StartService: Boolean;
 var
   Winsw: string;
 begin
-  Winsw := ExpandConstant('{app}\IISSentinelService.exe');
+  Winsw := ServiceExe + '.exe';
   if not ServiceExists then
     if RunHidden(Winsw, 'install') <> 0 then
     begin
@@ -452,8 +471,10 @@ begin
   if CurUninstallStep = usUninstall then
   begin
     StopService;
-    if FileExists(ExpandConstant('{app}\IISSentinelService.exe')) then
-      RunHidden(ExpandConstant('{app}\IISSentinelService.exe'), 'uninstall')
+    if FileExists(ServiceExe + '.exe') then
+      RunHidden(ServiceExe + '.exe', 'uninstall')
+    else if FileExists(LegacyServiceExe + '.exe') then
+      RunHidden(LegacyServiceExe + '.exe', 'uninstall')
     else
       RunHidden(ExpandConstant('{sys}\sc.exe'), 'delete ' + ServiceId);
     RunHidden(ExpandConstant('{sys}\netsh.exe'), 'advfirewall firewall delete rule name="' + FirewallRule + '"');
