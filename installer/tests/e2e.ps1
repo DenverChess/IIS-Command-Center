@@ -138,7 +138,7 @@ try {
     foreach ($f in @((Join-Path $DataDir "local_admin.json"), (Join-Path $AppDir "IISSentinelService.xml"))) {
         if (Select-String -Path $f -SimpleMatch $AdminPassword -Quiet) { Fail "plaintext password found in $f" }
     }
-    if (-not (Select-String -Path (Join-Path $DataDir "local_admin.json") -Pattern "pbkdf2_sha256\$310000\$" -Quiet)) { Fail "local_admin.json is not a PBKDF2 hash" }
+    if (-not (Select-String -Path (Join-Path $DataDir "local_admin.json") -Pattern 'pbkdf2_sha256\$310000\$' -Quiet)) { Fail "local_admin.json is not a PBKDF2 hash" }
     Pass "break-glass password stored only as a PBKDF2 hash"
     $acl = (Get-Acl $DataDir).Access | ForEach-Object { $_.IdentityReference.Value }
     $unexpected = $acl | Where-Object { $_ -notmatch "SYSTEM$|Administrators$" }
