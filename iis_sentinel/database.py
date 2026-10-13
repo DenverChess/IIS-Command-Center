@@ -19,6 +19,7 @@ from sqlalchemy import (
     Boolean,
     DateTime,
     Float,
+    ForeignKey,
     Index,
     Integer,
     String,
@@ -40,7 +41,18 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 DB_PATH = Path(os.environ.get("SENTINEL_DB_PATH", str(DATA_DIR / "sentinel.db"))).resolve()
 DEMO_MODE = os.environ.get("SENTINEL_DEMO", "0").strip().lower() in ("1", "true", "yes", "on")
 IS_WINDOWS = sys.platform.startswith("win")
-DEMO_LOG_DIR = DATA_DIR / "demo_logs" / "W3SVC1"
+DEMO_LOG_ROOT = DATA_DIR / "demo_logs"
+# Demo fleet: servers on 127.x are simulated by remote_manager (no WinRM); IIS-04 is deliberately unreachable.
+DEMO_SERVERS = [
+    ("IIS-01", "127.0.0.11"),
+    ("IIS-02", "127.0.0.12"),
+    ("IIS-03", "127.0.0.13"),
+    ("IIS-04", "10.255.255.14"),
+]
+
+
+def is_simulated(ip_address: str) -> bool:
+    return DEMO_MODE and ip_address.startswith("127.")
 
 T = TypeVar("T")
 
@@ -61,10 +73,34 @@ class Base(DeclarativeBase):
     pass
 
 
+# server_id 0 is the workstation Sentinel itself runs on (local log dirs / local health). SQLite FK
+# enforcement is left off, so 0 can be stored without a matching monitored_servers row.
+LOCAL_SERVER_ID = 0
+
+
+class MonitoredServer(Base):
+    __tablename__ = "monitored_servers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    server_name: Mapped[str] = mapped_column(String(64), unique=True)
+    ip_address: Mapped[str] = mapped_column(String(255))
+    winrm_username: Mapped[str] = mapped_column(String(256), default="")
+    # Stored through protect_secret(): DPAPI-encrypted on Windows, base64 elsewhere.
+    winrm_password: Mapped[str] = mapped_column(Text, default="")
+    log_unc_path: Mapped[str] = mapped_column(String(1024), default="")
+    winrm_transport: Mapped[str] = mapped_column(String(16), default="ntlm")
+    winrm_port: Mapped[int] = mapped_column(Integer, default=5985)
+    winrm_use_ssl: Mapped[bool] = mapped_column(Boolean, default=False)
+    winrm_verify_ssl: Mapped[bool] = mapped_column(Boolean, default=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=lambda: utcnow())
+
+
 class LogEntry(Base):
     __tablename__ = "log_entries"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    server_id: Mapped[int] = mapped_column(Integer, ForeignKey("monitored_servers.id"), default=LOCAL_SERVER_ID, index=True)
     ts: Mapped[datetime] = mapped_column(DateTime, index=True)
     site: Mapped[str] = mapped_column(String(128), default="")
     s_ip: Mapped[str] = mapped_column(String(64), default="")
@@ -87,6 +123,7 @@ class LogEntry(Base):
     __table_args__ = (
         Index("ix_log_ip_ts", "c_ip", "ts"),
         Index("ix_log_status_ts", "sc_status", "ts"),
+        Index("ix_log_server_ts", "server_id", "ts"),
     )
 
 
@@ -94,6 +131,7 @@ class SystemMetric(Base):
     __tablename__ = "system_metrics"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    server_id: Mapped[int] = mapped_column(Integer, ForeignKey("monitored_servers.id"), default=LOCAL_SERVER_ID, index=True)
     ts: Mapped[datetime] = mapped_column(DateTime, index=True)
     cpu_percent: Mapped[float] = mapped_column(Float, default=0.0)
     ram_percent: Mapped[float] = mapped_column(Float, default=0.0)
@@ -122,10 +160,11 @@ class Baseline(Base):
     __table_args__ = (UniqueConstraint("scope", "key", "metric", name="uq_baseline"),)
 
 
-class Alert(Base):
+class ActionableAlert(Base):
     __tablename__ = "alerts"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    server_id: Mapped[int] = mapped_column(Integer, ForeignKey("monitored_servers.id"), default=LOCAL_SERVER_ID, index=True)
     ts: Mapped[datetime] = mapped_column(DateTime, index=True)
     severity: Mapped[str] = mapped_column(String(16), index=True)
     category: Mapped[str] = mapped_column(String(32), index=True)
@@ -133,8 +172,25 @@ class Alert(Base):
     message: Mapped[str] = mapped_column(Text, default="")
     source_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
     details: Mapped[str] = mapped_column(Text, default="{}")
+    # Pending -> Approved (ban executed) | Dismissed
+    status: Mapped[str] = mapped_column(String(16), default="Pending", index=True)
     acknowledged: Mapped[bool] = mapped_column(Boolean, default=False)
     emailed: Mapped[bool] = mapped_column(Boolean, default=False)
+
+
+class BannedIP(Base):
+    __tablename__ = "banned_ips"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    server_id: Mapped[int] = mapped_column(Integer, ForeignKey("monitored_servers.id"), default=LOCAL_SERVER_ID, index=True)
+    ip_address: Mapped[str] = mapped_column(String(64), index=True)
+    alert_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("alerts.id"), nullable=True)
+    rule_name: Mapped[str] = mapped_column(String(256), default="")
+    banned_by: Mapped[str] = mapped_column(String(256), default="")
+    banned_at: Mapped[datetime] = mapped_column(DateTime)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+
+    __table_args__ = (Index("ix_ban_server_ip", "server_id", "ip_address"),)
 
 
 class Config(Base):
@@ -183,9 +239,35 @@ def _sqlite_pragmas(dbapi_conn, _record) -> None:
 SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSession)
 
 
+# Columns added after the first schema; create_all() never alters existing tables.
+_ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
+    "log_entries": {"server_id": "INTEGER NOT NULL DEFAULT 0"},
+    "system_metrics": {"server_id": "INTEGER NOT NULL DEFAULT 0"},
+    "alerts": {"server_id": "INTEGER NOT NULL DEFAULT 0", "status": "VARCHAR(16) NOT NULL DEFAULT 'Pending'"},
+}
+
+
+def _migrate(sync_conn: Any) -> None:
+    for table, columns in _ADDITIVE_COLUMNS.items():
+        existing = {row[1] for row in sync_conn.exec_driver_sql(f"PRAGMA table_info({table})")}
+        for name, ddl in columns.items():
+            if existing and name not in existing:
+                sync_conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+                log.info("Migrated %s: added column %s", table, name)
+    for ddl in (
+        "CREATE INDEX IF NOT EXISTS ix_log_entries_server_id ON log_entries (server_id)",
+        "CREATE INDEX IF NOT EXISTS ix_log_server_ts ON log_entries (server_id, ts)",
+        "CREATE INDEX IF NOT EXISTS ix_system_metrics_server_id ON system_metrics (server_id)",
+        "CREATE INDEX IF NOT EXISTS ix_alerts_server_id ON alerts (server_id)",
+        "CREATE INDEX IF NOT EXISTS ix_alerts_status ON alerts (status)",
+    ):
+        sync_conn.exec_driver_sql(ddl)
+
+
 async def init_db() -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        await conn.run_sync(_migrate)
     log.info("Database ready at %s", DB_PATH)
 
 
@@ -214,7 +296,7 @@ async def purge_old_data(retention_days: int) -> dict[str, int]:
     async def _op(s: AsyncSession) -> dict[str, int]:
         r1 = await s.execute(delete(LogEntry).where(LogEntry.ts < cutoff))
         r2 = await s.execute(delete(SystemMetric).where(SystemMetric.ts < metric_cutoff))
-        r3 = await s.execute(delete(Alert).where(Alert.ts < metric_cutoff))
+        r3 = await s.execute(delete(ActionableAlert).where(ActionableAlert.ts < metric_cutoff))
         return {"logs": r1.rowcount or 0, "metrics": r2.rowcount or 0, "alerts": r3.rowcount or 0}
 
     return await run_db(_op)
@@ -302,7 +384,10 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "max_alerts_per_hour": 20,
     },
     "watchers": {
-        "log_dirs": [r"C:\inetpub\logs\LogFiles\W3SVC1"],
+        # Only set when Sentinel itself runs on an IIS box; remote servers live in monitored_servers.
+        "log_dirs": [],
+        "local_server_name": "",
+        "remote_timeout": 30,
         "file_pattern": "u_ex*.log",
         "start_at_end": True,
         "poll_interval": 2,
@@ -367,6 +452,7 @@ VALIDATORS: dict[tuple[str, str], Callable[[Any], None]] = {
     ("exchange", "alert_recipients"): _emails,
     ("watchers", "poll_interval"): _range(0.5, 60),
     ("watchers", "health_interval"): _range(5, 3600),
+    ("watchers", "remote_timeout"): _range(5, 300),
     ("watchers", "cpu_threshold"): _range(1, 100),
     ("watchers", "ram_threshold"): _range(1, 100),
     ("watchers", "disk_free_critical"): _range(0, 100),
@@ -434,7 +520,7 @@ def _env_seed() -> dict[str, dict[str, Any]]:
     if DEMO_MODE:
         seed.setdefault("watchers", {}).update(
             {
-                "log_dirs": [str(DEMO_LOG_DIR)],
+                "log_dirs": [],
                 "start_at_end": False,
                 "health_interval": 10,
                 "baseline_interval": 60,
@@ -566,3 +652,236 @@ async def get_or_create_session_secret() -> bytes:
         return new.encode("utf-8")
 
     return await run_db(_op)
+
+
+# --------------------------------------------------------------------------------------
+# Monitored server registry
+# --------------------------------------------------------------------------------------
+WINRM_TRANSPORTS = ("ntlm", "kerberos", "credssp", "basic")
+_SERVER_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
+_HOSTNAME_RE = re.compile(r"^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,62}[A-Za-z0-9])?)*$")
+
+
+def _valid_host(value: str) -> bool:
+    import ipaddress
+
+    try:
+        ipaddress.ip_address(value)
+        return True
+    except ValueError:
+        return bool(_HOSTNAME_RE.match(value))
+
+
+class ServerRegistry:
+    """Cached view of monitored_servers plus the optional local (id 0) server, with live connectivity status."""
+
+    def __init__(self, config: ConfigStore) -> None:
+        self.config = config
+        self._servers: dict[int, dict[str, Any]] = {}
+        self._listeners: list[Callable[[], Any]] = []
+        self.status: dict[int, dict[str, Any]] = {}
+
+    def on_change(self, callback: Callable[[], Any]) -> None:
+        self._listeners.append(callback)
+
+    async def _notify(self) -> None:
+        for cb in self._listeners:
+            try:
+                res = cb()
+                if asyncio.iscoroutine(res):
+                    await res
+            except Exception:  # noqa: BLE001
+                log.exception("Server registry listener failed")
+
+    @staticmethod
+    def _to_dict(row: MonitoredServer) -> dict[str, Any]:
+        return {
+            "id": row.id,
+            "server_name": row.server_name,
+            "ip_address": row.ip_address,
+            "winrm_username": row.winrm_username,
+            "winrm_password": unprotect_secret(row.winrm_password),
+            "log_unc_path": row.log_unc_path,
+            "winrm_transport": row.winrm_transport,
+            "winrm_port": row.winrm_port,
+            "winrm_use_ssl": row.winrm_use_ssl,
+            "winrm_verify_ssl": row.winrm_verify_ssl,
+            "enabled": row.enabled,
+            "local": False,
+            "simulated": is_simulated(row.ip_address),
+            "created_at": iso(row.created_at),
+        }
+
+    async def _seed_demo(self) -> None:
+        async def _op(s: AsyncSession) -> None:
+            if (await s.execute(select(MonitoredServer.id).limit(1))).first():
+                return
+            for name, ip in DEMO_SERVERS:
+                path = str(DEMO_LOG_ROOT / name / "W3SVC1") if ip.startswith("127.") else rf"\\{ip}\IISLogs\W3SVC1"
+                s.add(MonitoredServer(server_name=name, ip_address=ip, winrm_username="CORP\\svc_sentinel",
+                                      winrm_password=protect_secret("demo"), log_unc_path=path, created_at=utcnow()))
+
+        await run_db(_op)
+
+    async def load(self) -> None:
+        if DEMO_MODE:
+            await self._seed_demo()
+        async with SessionLocal() as s:
+            rows = (await s.execute(select(MonitoredServer).order_by(MonitoredServer.id))).scalars().all()
+        self._servers = {r.id: self._to_dict(r) for r in rows}
+        log.info("Monitoring %d remote server(s): %s", len(self._servers),
+                 ", ".join(f"{s['server_name']} ({s['ip_address']})" for s in self._servers.values()) or "none")
+
+    def local(self) -> dict[str, Any] | None:
+        dirs = self.config.value("watchers", "log_dirs", []) or []
+        if not dirs:
+            return None
+        import socket
+
+        return {
+            "id": LOCAL_SERVER_ID,
+            "server_name": self.config.value("watchers", "local_server_name") or socket.gethostname().upper(),
+            "ip_address": "127.0.0.1",
+            "log_dirs": list(dirs),
+            "log_unc_path": "",
+            "enabled": True,
+            "local": True,
+            "simulated": False,
+        }
+
+    def all(self, enabled_only: bool = True) -> list[dict[str, Any]]:
+        out: list[dict[str, Any]] = []
+        local = self.local()
+        if local:
+            out.append(local)
+        out.extend(copy.deepcopy(s) for s in self._servers.values() if s["enabled"] or not enabled_only)
+        return out
+
+    def get(self, server_id: int) -> dict[str, Any] | None:
+        if server_id == LOCAL_SERVER_ID:
+            return self.local()
+        s = self._servers.get(server_id)
+        return copy.deepcopy(s) if s else None
+
+    def name(self, server_id: int | None) -> str:
+        if server_id is None:
+            return ""
+        if server_id == LOCAL_SERVER_ID:
+            local = self.local()
+            return local["server_name"] if local else "LOCAL"
+        s = self._servers.get(server_id)
+        return s["server_name"] if s else f"SRV-{server_id}"
+
+    def set_status(self, server_id: int, component: str, ok: bool, error: str | None = None) -> bool:
+        """Record connectivity for a component ('health' / 'logs'); returns True when the state changed."""
+        st = self.status.setdefault(server_id, {})
+        prev = st.get(component, {}).get("ok")
+        st[component] = {"ok": ok, "error": error, "at": iso(utcnow())}
+        return prev is not ok
+
+    def public(self, s: dict[str, Any]) -> dict[str, Any]:
+        view = {k: v for k, v in s.items() if k != "winrm_password"}
+        view["winrm_password_set"] = bool(s.get("winrm_password"))
+        view["status"] = self.status.get(s["id"], {})
+        return view
+
+    def list_public(self, enabled_only: bool = False) -> list[dict[str, Any]]:
+        return [self.public(s) for s in self.all(enabled_only=enabled_only)]
+
+    def _validate(self, data: dict[str, Any], existing_id: int | None = None) -> dict[str, Any]:
+        def text(key: str, limit: int) -> str:
+            v = data.get(key)
+            v = "" if v is None else str(v).strip()
+            if len(v) > limit or any(ord(c) < 32 for c in v):
+                raise ValueError(f"{key} is invalid")
+            return v
+
+        name = text("server_name", 64)
+        if not _SERVER_NAME_RE.match(name):
+            raise ValueError("server_name must be 1-64 chars: letters, digits, '.', '_' or '-'")
+        if any(s["server_name"].lower() == name.lower() and s["id"] != existing_id for s in self._servers.values()):
+            raise ValueError(f"a server named '{name}' already exists")
+        ip = text("ip_address", 255)
+        if not _valid_host(ip):
+            raise ValueError("ip_address must be an IP address or DNS hostname")
+        username = text("winrm_username", 256)
+        password = data.get("winrm_password")
+        password = "" if password is None else str(password)
+        if len(password) > 512:
+            raise ValueError("winrm_password is too long")
+        if existing_id is None and (not username or not password):
+            raise ValueError("winrm_username and winrm_password are required")
+        unc = text("log_unc_path", 1024)
+        transport = (text("winrm_transport", 16) or "ntlm").lower()
+        if transport not in WINRM_TRANSPORTS:
+            raise ValueError(f"winrm_transport must be one of {', '.join(WINRM_TRANSPORTS)}")
+        use_ssl = _coerce(False, data.get("winrm_use_ssl", False), "winrm_use_ssl")
+        if transport == "basic" and not use_ssl:
+            raise ValueError("basic WinRM auth sends credentials in clear text; enable winrm_use_ssl")
+        try:
+            port = int(data.get("winrm_port") or (5986 if use_ssl else 5985))
+        except (TypeError, ValueError) as exc:
+            raise ValueError("winrm_port must be an integer") from exc
+        if not 1 <= port <= 65535:
+            raise ValueError("winrm_port must be between 1 and 65535")
+        return {
+            "server_name": name,
+            "ip_address": ip,
+            "winrm_username": username,
+            "winrm_password": password,
+            "log_unc_path": unc,
+            "winrm_transport": transport,
+            "winrm_port": port,
+            "winrm_use_ssl": use_ssl,
+            "winrm_verify_ssl": _coerce(True, data.get("winrm_verify_ssl", True), "winrm_verify_ssl"),
+            "enabled": _coerce(True, data.get("enabled", True), "enabled"),
+        }
+
+    async def add(self, data: dict[str, Any]) -> dict[str, Any]:
+        clean = self._validate(data)
+
+        async def _op(s: AsyncSession) -> int:
+            row = MonitoredServer(**{**clean, "winrm_password": protect_secret(clean["winrm_password"])}, created_at=utcnow())
+            s.add(row)
+            await s.flush()
+            return row.id
+
+        new_id = await run_db(_op)
+        await self.load()
+        await self._notify()
+        return self.public(self._servers[new_id])
+
+    async def update(self, server_id: int, data: dict[str, Any]) -> dict[str, Any]:
+        current = self._servers.get(server_id)
+        if current is None:
+            raise KeyError(server_id)
+        merged = {**current, **data}
+        if not data.get("winrm_password") or data.get("winrm_password") == SECRET_MASK:
+            merged["winrm_password"] = current["winrm_password"]
+        clean = self._validate(merged, existing_id=server_id)
+
+        async def _op(s: AsyncSession) -> None:
+            row = await s.get(MonitoredServer, server_id)
+            if row is None:
+                raise KeyError(server_id)
+            for k, v in clean.items():
+                setattr(row, k, protect_secret(v) if k == "winrm_password" else v)
+
+        await run_db(_op)
+        await self.load()
+        await self._notify()
+        return self.public(self._servers[server_id])
+
+    async def remove(self, server_id: int) -> None:
+        async def _op(s: AsyncSession) -> bool:
+            row = await s.get(MonitoredServer, server_id)
+            if row is None:
+                return False
+            await s.delete(row)
+            return True
+
+        if not await run_db(_op):
+            raise KeyError(server_id)
+        self.status.pop(server_id, None)
+        await self.load()
+        await self._notify()
