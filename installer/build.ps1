@@ -96,7 +96,8 @@ $robo = robocopy $AppSrc $AppDir /E /NFL /NDL /NJH /NJS /NP /XD data __pycache__
 if ($LASTEXITCODE -ge 8) { throw "robocopy failed ($LASTEXITCODE)" }
 $global:LASTEXITCODE = 0
 Copy-Item (Join-Path $PSScriptRoot "reset-password.cmd") $Stage
-Copy-Item (Get-Verified "winsw") (Join-Path $Stage "IISSentinelService.exe")
+New-Item -ItemType Directory -Force -Path (Join-Path $Stage "service") | Out-Null
+Copy-Item (Get-Verified "winsw") (Join-Path $Stage "service\IISSentinelService.exe")
 
 Step "Smoke-testing the bundled runtime"
 $env:SENTINEL_DATA_DIR = Join-Path $Work "smoke-data"
@@ -143,3 +144,10 @@ $setup = Join-Path $OutputDir "IISSentinel-Setup-$Version.exe"
 $hash = (Get-FileHash -Algorithm SHA256 $setup).Hash
 Set-Content -Path "$setup.sha256" -Value "$hash  $(Split-Path -Leaf $setup)" -Encoding ASCII
 Write-Host "Built $setup ($([math]::Round((Get-Item $setup).Length / 1MB, 1)) MB)  SHA-256 $hash" -ForegroundColor Green
+Write-Host ""
+Write-Host "  Run this file to install IIS Sentinel:" -ForegroundColor Cyan
+Write-Host "    $setup" -ForegroundColor Cyan
+Write-Host "  (installer\build\ only holds intermediate files; nothing in it is meant to be run.)" -ForegroundColor DarkGray
+if ([Environment]::UserInteractive -and -not $env:CI) {
+    Start-Process explorer.exe -ArgumentList "/select,`"$setup`""
+}

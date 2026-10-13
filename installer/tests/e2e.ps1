@@ -13,6 +13,8 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory)][string]$Installer,
+    # Optional older build: installed first so the main install runs as an upgrade over it.
+    [string]$LegacyInstaller,
     [string]$ArtifactDir = (Join-Path $PSScriptRoot "e2e-artifacts"),
     [int]$Port = 1337
 )
@@ -21,6 +23,7 @@ $ErrorActionPreference = "Stop"
 $ProgressPreference = "SilentlyContinue"
 
 $Installer = (Resolve-Path $Installer).Path
+if ($LegacyInstaller) { $LegacyInstaller = (Resolve-Path $LegacyInstaller).Path }
 $AppDir = Join-Path $env:ProgramFiles "IIS Sentinel"
 $DataDir = Join-Path $env:ProgramData "IIS Sentinel"
 $Base = "http://127.0.0.1:$Port"
@@ -45,9 +48,9 @@ function Wait-Until([scriptblock]$Condition, [int]$TimeoutSec, [string]$What, [i
     Fail "Timed out after ${TimeoutSec}s waiting for: $What $(if ($last) { "(last error: $last)" })"
 }
 
-function Invoke-Setup([string[]]$Arguments, [string]$LogName) {
+function Invoke-Setup([string[]]$Arguments, [string]$LogName, [string]$Exe = $Installer) {
     $log = Join-Path $ArtifactDir $LogName
-    $p = Start-Process -FilePath $Installer -ArgumentList ($Arguments + @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=`"$log`"")) -Wait -PassThru
+    $p = Start-Process -FilePath $Exe -ArgumentList ($Arguments + @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/LOG=`"$log`"")) -Wait -PassThru
     if ($p.ExitCode -ne 0) { Fail "Setup exited with $($p.ExitCode); see $log" }
     Pass "setup exited 0 ($LogName)"
 }
@@ -82,7 +85,7 @@ function Save-Diagnostics {
     }
     $svcLogs = Join-Path $DataDir "service-logs"
     if (Test-Path $svcLogs) { Copy-Item $svcLogs (Join-Path $ArtifactDir "service-logs") -Recurse -Force -ErrorAction SilentlyContinue }
-    $xml = Join-Path $AppDir "IISSentinelService.xml"
+    $xml = Join-Path $AppDir "service\IISSentinelService.xml"
     if (Test-Path $xml) { Copy-Item $xml $ArtifactDir -Force -ErrorAction SilentlyContinue }
 }
 
@@ -118,12 +121,22 @@ try {
     Pass "shared C:\inetpub\logs\LogFiles as \\127.0.0.1\IISLogs"
 
     # ------------------------------------------------------------------------------------------ install
-    Step "Silent install"
-    Invoke-Setup @("/ADMINUSER=$AdminUser", "/ADMINPASSWORD=$AdminPassword", "/PORT=$Port", "/REMOTEACCESS=1") "install.log"
+    $installArgs = @("/ADMINUSER=$AdminUser", "/ADMINPASSWORD=$AdminPassword", "/PORT=$Port", "/REMOTEACCESS=1")
+    if ($LegacyInstaller) {
+        Step "Legacy install ($(Split-Path -Leaf $LegacyInstaller)), to be upgraded in place"
+        Invoke-Setup $installArgs "legacy-install.log" $LegacyInstaller
+        if ((Get-Service IISSentinel).Status -ne "Running") { Fail "legacy build's service is not running" }
+        Pass "legacy service running from $((Get-CimInstance Win32_Service -Filter "Name='IISSentinel'").PathName)"
+    }
+
+    Step "Silent install$(if ($LegacyInstaller) { ' (upgrade over the legacy build)' })"
+    Invoke-Setup $installArgs "install.log"
     $svc = Get-Service IISSentinel -ErrorAction SilentlyContinue
     if (-not $svc -or $svc.Status -ne "Running") { Fail "IISSentinel service is not running" }
     $startType = (Get-CimInstance Win32_Service -Filter "Name='IISSentinel'")
     Pass "service running as $($startType.StartName), start mode $($startType.StartMode)"
+    if ($startType.PathName -notlike "*\service\IISSentinelService.exe*") { Fail "service registered from $($startType.PathName)" }
+    Pass "service registered from $($startType.PathName)"
     if (-not (& netsh advfirewall firewall show rule name="IIS Sentinel SOC" | Select-String "LocalPort:\s+$Port")) { Fail "console firewall rule missing" }
     Pass "firewall rule 'IIS Sentinel SOC' opens TCP $Port"
     foreach ($lnk in @("IIS Sentinel Console.url", "Reset Break-glass Password.lnk", "Data and Logs.lnk")) {
@@ -133,9 +146,12 @@ try {
         }
     }
     Pass "Start menu shortcuts created"
+    $rootExes = Get-ChildItem $AppDir -Filter *.exe | Where-Object { $_.Name -notlike "unins*.exe" }
+    if ($rootExes) { Fail "console executables at the install root invite double-clicking: $($rootExes.Name -join ', ')" }
+    Pass "install root has no console executables (service wrapper lives in service\)"
 
     Step "Verifying secrets at rest"
-    foreach ($f in @((Join-Path $DataDir "local_admin.json"), (Join-Path $AppDir "IISSentinelService.xml"))) {
+    foreach ($f in @((Join-Path $DataDir "local_admin.json"), (Join-Path $AppDir "service\IISSentinelService.xml"))) {
         if (Select-String -Path $f -SimpleMatch $AdminPassword -Quiet) { Fail "plaintext password found in $f" }
     }
     if (-not (Select-String -Path (Join-Path $DataDir "local_admin.json") -Pattern 'pbkdf2_sha256\$310000\$' -Quiet)) { Fail "local_admin.json is not a PBKDF2 hash" }
