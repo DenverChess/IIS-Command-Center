@@ -11,7 +11,7 @@ import logging
 import socket
 from collections import Counter
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -71,6 +71,7 @@ class Reporter:
     def __init__(self, config: ConfigStore, mailer: "Mailer") -> None:
         self.config = config
         self.mailer = mailer
+        self.on_failure: Callable[[str, str], Awaitable[None]] | None = None
         self.scheduler = AsyncIOScheduler(job_defaults={"coalesce": True, "max_instances": 1, "misfire_grace_time": 3600})
 
     # ------------------------------------------------------------------ scheduling
@@ -113,10 +114,19 @@ class Reporter:
         return out
 
     async def _scheduled(self, kind: str) -> None:
+        error = None
         try:
-            await self.run_report(kind, send=True)
-        except Exception:  # noqa: BLE001
+            result = await self.run_report(kind, send=True)
+            if result.get("status") == "failed":
+                error = result.get("error") or "delivery failed"
+        except Exception as exc:  # noqa: BLE001
             log.exception("Scheduled %s report failed", kind)
+            error = f"{type(exc).__name__}: {exc}"
+        if error and self.on_failure is not None:
+            try:
+                await self.on_failure(kind, error)
+            except Exception:  # noqa: BLE001
+                log.exception("Report failure callback failed")
 
     async def _maintenance(self) -> None:
         try:

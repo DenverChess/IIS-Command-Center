@@ -6,10 +6,12 @@ import json
 import logging
 import time
 from collections import deque
-from typing import TYPE_CHECKING, Any, Callable
+from datetime import datetime
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 
 from sqlalchemy import update
 
+from alert_catalog import EVENTS as ALERT_EVENTS
 from database import LOCAL_SERVER_ID, SEVERITIES, ActionableAlert, ConfigStore, iso, run_db, utcnow
 
 if TYPE_CHECKING:
@@ -94,6 +96,62 @@ class AlertManager:
             self._cooldowns = {k: v for k, v in self._cooldowns.items() if v > cutoff}
         return False
 
+    @staticmethod
+    def _in_quiet_hours(start: str, end: str, now: datetime | None = None) -> bool:
+        """Quiet hours use the Sentinel host's local clock; start > end spans midnight (22:00-07:00)."""
+        def mins(v: str) -> int:
+            h, m = v.split(":")
+            return int(h) * 60 + int(m)
+
+        now = now or datetime.now()
+        cur, lo, hi = now.hour * 60 + now.minute, mins(start), mins(end)
+        if lo == hi:
+            return False
+        return lo <= cur < hi if lo < hi else (cur >= lo or cur < hi)
+
+    def route(self, events: list[str], severity: str, server_id: int,
+              occurred_at: datetime | None = None) -> dict[str, Any] | None:
+        """Apply the ALERTS tab settings. Returns None when every event is disabled (nothing is recorded)."""
+        cfg = self.config.get("alerts")
+        settings = cfg.get("events") or {}
+        if events:
+            active = []
+            for eid in events:
+                s = settings.get(eid)
+                if s is None:
+                    ev = ALERT_EVENTS.get(eid)
+                    s = {"enabled": True, "desktop": bool(ev and ev["desktop"]), "email": bool(ev and ev["email"]),
+                         "severity": "default"}
+                if s.get("enabled", True):
+                    active.append(s)
+            if not active:
+                return None
+            overrides = [s["severity"] for s in active if s.get("severity") in SEVERITY_RANK]
+            if overrides:
+                severity = max(overrides, key=lambda v: SEVERITY_RANK[v])
+            desktop = any(s.get("desktop") for s in active)
+            email = any(s.get("email") for s in active)
+        else:
+            min_sev = self.config.value("exchange", "alert_min_severity", "HIGH")
+            desktop = SEVERITY_RANK[severity] >= SEVERITY_RANK["HIGH"]
+            email = SEVERITY_RANK[severity] >= SEVERITY_RANK.get(min_sev, 2)
+        suppressed = None
+        if occurred_at is not None and (utcnow() - occurred_at).total_seconds() > 60 * float(cfg.get("live_window_minutes") or 15):
+            suppressed = "historical log line"
+        elif self.server_name(server_id).lower() in {m.lower() for m in cfg.get("muted_servers") or []}:
+            suppressed = "server muted"
+        elif cfg.get("quiet_hours_enabled") and self._in_quiet_hours(cfg.get("quiet_start", "22:00"), cfg.get("quiet_end", "07:00")):
+            if not (severity == "CRITICAL" and cfg.get("quiet_bypass_critical", True)):
+                suppressed = "quiet hours"
+        if not cfg.get("desktop_notifications", True):
+            desktop = False
+        return {"severity": severity, "desktop": desktop and not suppressed, "email": email and not suppressed,
+                "sound": bool(cfg.get("sound", True)), "suppressed": suppressed}
+
+    def recipients(self) -> list[str]:
+        return list(self.config.value("alerts", "email_recipients", []) or []) or list(
+            self.config.value("exchange", "alert_recipients", []) or [])
+
     async def raise_alert(
         self,
         severity: str,
@@ -106,8 +164,20 @@ class AlertManager:
         cooldown: float = 0,
         server_id: int = LOCAL_SERVER_ID,
         actionable: bool | None = None,
+        event: str | Sequence[str] | None = None,
+        occurred_at: datetime | None = None,
+        notify: dict[str, bool] | None = None,
     ) -> dict[str, Any] | None:
+        """Persist -> broadcast -> notify. `event` names the ALERTS-tab event(s) this alert belongs to;
+        `occurred_at` is the log timestamp (old backfilled lines never notify); `notify` forces the routing."""
         severity = severity if severity in SEVERITY_RANK else "INFO"
+        events = [event] if isinstance(event, str) else list(event or [])
+        route = self.route(events, severity, server_id, occurred_at)
+        if route is None:
+            return None
+        if notify is not None:
+            route.update(notify, suppressed=None)
+        severity = route["severity"]
         if self._cooling(dedup_key, cooldown):
             return None
         ts = utcnow()
@@ -125,11 +195,14 @@ class AlertManager:
             "status": status,
             "severity": severity,
             "category": category,
+            "event": events[0] if events else "",
             "title": title[:256],
             "message": message,
             "source_ip": source_ip,
             "details": details,
             "acknowledged": False,
+            "notify": {"desktop": route["desktop"], "email": route["email"], "sound": route["sound"],
+                       "suppressed": route["suppressed"]},
         }
         try:
             payload = json.dumps(details, default=str)
@@ -141,6 +214,7 @@ class AlertManager:
                     ts=ts,
                     severity=severity,
                     category=category,
+                    event=record["event"],
                     title=title[:256],
                     message=message,
                     source_ip=source_ip,
@@ -166,8 +240,7 @@ class AlertManager:
         self._recent.appendleft(record)
         self.hub.broadcast({"type": "alert", "data": record})
 
-        min_sev = self.config.value("exchange", "alert_min_severity", "HIGH")
-        if self.config.value("exchange", "enabled", False) and SEVERITY_RANK[severity] >= SEVERITY_RANK.get(min_sev, 2):
+        if route["email"] and self.config.value("exchange", "enabled", False):
             task = asyncio.create_task(self._email(record))
             self._tasks.add(task)
             task.add_done_callback(self._tasks.discard)
@@ -175,7 +248,7 @@ class AlertManager:
 
     async def _email(self, record: dict[str, Any]) -> None:
         try:
-            ok = await self.mailer.send_alert(record)
+            ok = await self.mailer.send_alert(record, recipients=self.recipients())
             if ok and record.get("id"):
                 alert_id = record["id"]
 

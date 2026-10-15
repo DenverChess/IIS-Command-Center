@@ -155,7 +155,7 @@ class Mailer:
                       self._consecutive_failures, self.CIRCUIT_OPEN_SECONDS)
         return False, last_error
 
-    async def send_alert(self, record: dict[str, Any]) -> bool:
+    async def send_alert(self, record: dict[str, Any], recipients: list[str] | None = None) -> bool:
         cfg = self.config.get("exchange")
         limit = int(cfg.get("max_alerts_per_hour") or 20)
         now = time.monotonic()
@@ -167,7 +167,7 @@ class Mailer:
         self._alert_times.append(now)
         server = f"[{record['server_name']}] " if record.get("server_name") else ""
         subject = f"[IIS Sentinel][{record.get('severity')}] {server}{record.get('title')}"
-        ok, err = await self.send(subject, render_alert_html(record))
+        ok, err = await self.send(subject, render_alert_html(record), recipients=recipients)
         if not ok:
             log.warning("Alert mail not delivered: %s", err)
         return ok

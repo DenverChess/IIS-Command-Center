@@ -17,11 +17,12 @@ import random
 import re
 import subprocess
 import time
+from datetime import timedelta
 from pathlib import Path, PureWindowsPath
 from typing import Any
 
 from database import IS_WINDOWS, LOCAL_SERVER_ID, ConfigStore, ServerRegistry, iso, utcnow
-from log_tailer import DirectoryTailer
+from log_tailer import DEMO_SITES, SiteSetTailer, demo_site_ids, discover_sites
 
 log = logging.getLogger("sentinel.remote")
 
@@ -56,6 +57,54 @@ try {
         $poolSource = 'WebAdministration'
     } catch { $poolError = $_.Exception.Message }
 }
+function CertInfo($hash, $store, $binding, $site) {
+    if (-not $hash) { return $null }
+    if (-not $store) { $store = 'My' }
+    try {
+        $c = Get-Item -LiteralPath ('Cert:\LocalMachine\{0}\{1}' -f $store, $hash) -ErrorAction Stop
+        return [pscustomobject]@{ site = $site; binding = $binding; subject = $c.Subject; thumbprint = $c.Thumbprint
+                                  not_after = $c.NotAfter.ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ') }
+    } catch { return $null }
+}
+$sites = @()
+$certs = @()
+$siteSource = 'none'
+try {
+    Import-Module IISAdministration -ErrorAction Stop
+    foreach ($s in @(Get-IISSite)) {
+        $binds = @()
+        foreach ($b in @($s.Bindings)) {
+            $binds += ('{0}/{1}' -f $b.Protocol, $b.BindingInformation)
+            if ($b.Protocol -eq 'https' -and $b.CertificateHash) {
+                $h = ($b.CertificateHash | ForEach-Object { $_.ToString('X2') }) -join ''
+                $ci = CertInfo $h $b.CertificateStoreName $b.BindingInformation $s.Name
+                if ($ci) { $certs += $ci }
+            }
+        }
+        $state = 'Unknown'
+        try { $state = [string]$s.State } catch { }
+        $sites += [pscustomobject]@{ id = [int]$s.Id; name = $s.Name; state = $state; bindings = $binds }
+    }
+    $siteSource = 'IISAdministration'
+} catch {
+    $sites = @()
+    $certs = @()
+    try {
+        Import-Module WebAdministration -ErrorAction Stop
+        foreach ($w in @(Get-Website)) {
+            $binds = @()
+            foreach ($b in @($w.bindings.Collection)) {
+                $binds += ('{0}/{1}' -f $b.protocol, $b.bindingInformation)
+                if ($b.protocol -eq 'https' -and $b.certificateHash) {
+                    $ci = CertInfo $b.certificateHash $b.certificateStoreName $b.bindingInformation $w.name
+                    if ($ci) { $certs += $ci }
+                }
+            }
+            $sites += [pscustomobject]@{ id = [int]$w.id; name = $w.name; state = [string]$w.State; bindings = $binds }
+        }
+        $siteSource = 'WebAdministration'
+    } catch { }
+}
 function SvcState($n) { $s = Get-Service -Name $n -ErrorAction SilentlyContinue; if ($s) { [string]$s.Status } else { 'NOT_INSTALLED' } }
 [pscustomobject]@{
     hostname       = $env:COMPUTERNAME
@@ -69,10 +118,13 @@ function SvcState($n) { $s = Get-Service -Name $n -ErrorAction SilentlyContinue;
     pools          = $pools
     pool_source    = $poolSource
     pool_error     = $poolError
+    sites          = $sites
+    site_source    = $siteSource
+    certs          = $certs
     w3svc          = SvcState 'W3SVC'
     was            = SvcState 'WAS'
     uptime_seconds = [double]((Get-Date) - $os.LastBootUpTime).TotalSeconds
-} | ConvertTo-Json -Compress -Depth 4
+} | ConvertTo-Json -Compress -Depth 6
 """
 
 
@@ -129,10 +181,44 @@ def _gb(n: float) -> float:
     return round(n / 1024**3, 2)
 
 
+def _as_list(value: Any) -> list[Any]:
+    """PowerShell 5.1 unrolls single-element arrays (and may emit null for empty ones)."""
+    if value is None:
+        return []
+    return value if isinstance(value, list) else [value]
+
+
+def normalize_sites(raw_sites: Any) -> list[dict[str, Any]]:
+    out = []
+    for s in _as_list(raw_sites):
+        if not isinstance(s, dict) or s.get("id") is None:
+            continue
+        state = str(s.get("state") or "Unknown")
+        out.append({"id": int(s["id"]), "name": str(s.get("name") or f"W3SVC{s['id']}"), "state": state,
+                    "running": state == "Started", "log_folder": f"W3SVC{int(s['id'])}",
+                    "bindings": [str(b) for b in _as_list(s.get("bindings"))]})
+    return sorted(out, key=lambda x: x["id"])
+
+
+def normalize_certs(raw_certs: Any) -> list[dict[str, Any]]:
+    from datetime import datetime
+
+    out = []
+    for c in _as_list(raw_certs):
+        if not isinstance(c, dict) or not c.get("not_after"):
+            continue
+        try:
+            not_after = datetime.strptime(str(c["not_after"])[:19], "%Y-%m-%dT%H:%M:%S")
+        except ValueError:
+            continue
+        out.append({"site": str(c.get("site") or ""), "binding": str(c.get("binding") or ""),
+                    "subject": str(c.get("subject") or ""), "thumbprint": str(c.get("thumbprint") or ""),
+                    "not_after": iso(not_after), "days_left": round((not_after - utcnow()).total_seconds() / 86400, 1)})
+    return out
+
+
 def normalize_health(raw: dict[str, Any]) -> dict[str, Any]:
-    pools = raw.get("pools") or []
-    if isinstance(pools, dict):  # PowerShell 5.1 unrolls single-element arrays
-        pools = [pools]
+    pools = _as_list(raw.get("pools"))
     total_kb = float(raw.get("ram_total_kb") or 0)
     free_kb = float(raw.get("ram_free_kb") or 0)
     size = float(raw.get("disk_size") or 0)
@@ -156,6 +242,9 @@ def normalize_health(raw: dict[str, Any]) -> dict[str, Any]:
         ],
         "app_pool_source": f"winrm/{raw.get('pool_source') or 'none'}",
         "app_pool_error": raw.get("pool_error"),
+        "sites": normalize_sites(raw.get("sites")),
+        "site_source": f"winrm/{raw.get('site_source') or 'none'}",
+        "certs": normalize_certs(raw.get("certs")),
         "w3svc_state": str(raw.get("w3svc") or "UNKNOWN").upper(),
         "was_state": str(raw.get("was") or "UNKNOWN").upper(),
         "uptime_seconds": round(float(raw.get("uptime_seconds") or 0)),
@@ -302,7 +391,7 @@ class RemoteManager:
         self.config = config
         self.registry = registry
         self._guard = _Guard()
-        self._tailers: dict[int, tuple[tuple[Any, ...], DirectoryTailer]] = {}
+        self._tailers: dict[int, tuple[tuple[Any, ...], SiteSetTailer]] = {}
         self._unc_ok: dict[int, float] = {}
         self._sim: dict[int, dict[str, Any]] = {}
 
@@ -337,6 +426,10 @@ class RemoteManager:
             "cpu": random.uniform(10, 40), "ram": random.uniform(40, 70), "disk": random.uniform(30, 80),
             "pools": {"DefaultAppPool": "Started", "OrdersAPI": "Started", f"{server['server_name']}-Portal": "Started"},
             "boot": time.time() - random.uniform(86400, 86400 * 40),
+            "sites": {i: "Started" for i in demo_site_ids(server["server_name"])},
+            # IIS-02's portal certificate is about to expire, to exercise the cert_expiring alert.
+            "cert_days": {i: (12.0 if server["server_name"].endswith("02") and i == 2 else random.uniform(60, 380))
+                          for i in demo_site_ids(server["server_name"])},
         })
         st["cpu"] = min(99.0, max(1.0, st["cpu"] + random.uniform(-8, 8) + (35 if random.random() < 0.02 else 0)))
         st["ram"] = min(97.0, max(20.0, st["ram"] + random.uniform(-2, 2)))
@@ -345,6 +438,20 @@ class RemoteManager:
                 st["pools"][name] = "Stopped"
             elif state == "Stopped" and random.random() < 0.3:
                 st["pools"][name] = "Started"
+        for sid, state in st["sites"].items():
+            if state == "Started" and random.random() < 0.004:
+                st["sites"][sid] = "Stopped"
+            elif state == "Stopped" and random.random() < 0.4:
+                st["sites"][sid] = "Started"
+        sites = [{"id": i, "name": DEMO_SITES[i][0], "state": s, "running": s == "Started", "log_folder": f"W3SVC{i}",
+                  "bindings": [f"https/*:443:{DEMO_SITES[i][0].lower().replace(' ', '')}.corp.local"]}
+                 for i, s in sorted(st["sites"].items())]
+        now = utcnow()
+        certs = [{"site": DEMO_SITES[i][0], "binding": f"*:443:{DEMO_SITES[i][0].lower().replace(' ', '')}.corp.local",
+                  "subject": f"CN={DEMO_SITES[i][0].lower().replace(' ', '')}.corp.local",
+                  "thumbprint": f"{abs(hash((server['server_name'], i))):040X}"[:40],
+                  "not_after": iso(now + timedelta(days=d)), "days_left": round(d, 1)}
+                 for i, d in sorted(st["cert_days"].items())]
         total, used = 250.0, 250.0 * st["disk"] / 100
         return {
             "ts": iso(utcnow()), "hostname": server["server_name"], "cpu_percent": round(st["cpu"], 1), "cpu_count": 8,
@@ -352,26 +459,34 @@ class RemoteManager:
             "disk_path": "D:", "disk_percent": round(st["disk"], 1), "disk_free_percent": round(100 - st["disk"], 1),
             "disk_free_gb": round(total - used, 2), "disk_total_gb": total,
             "app_pools": [{"name": n, "state": s, "running": s == "Started"} for n, s in sorted(st["pools"].items())],
-            "app_pool_source": "simulated", "app_pool_error": None, "w3svc_state": "RUNNING", "was_state": "RUNNING",
+            "app_pool_source": "simulated", "app_pool_error": None, "sites": sites, "site_source": "simulated",
+            "certs": certs, "w3svc_state": "RUNNING", "was_state": "RUNNING",
             "uptime_seconds": round(time.time() - st["boot"]),
         }
 
     # ------------------------------------------------------------------ logs
-    def _tailer_for(self, server: dict[str, Any]) -> DirectoryTailer | None:
+    def _tailer_for(self, server: dict[str, Any]) -> SiteSetTailer | None:
         path = (server.get("log_unc_path") or "").strip()
         if not path:
             return None
-        cfg = self.config.get("watchers")
-        sig = (path, cfg.get("file_pattern"), cfg.get("start_at_end"))
+        pattern = self.config.value("watchers", "file_pattern", "u_ex*.log") or "*.log"
+        mode = (server.get("log_start_mode") or "end", int(server.get("log_tail_lines") or 1000))
+        sig = (path, pattern, mode)
         current = self._tailers.get(server["id"])
         if current is None or current[0] != sig:
-            tailer = DirectoryTailer(Path(path), cfg.get("file_pattern") or "*.log", bool(cfg.get("start_at_end", True)))
+            # A changed start mode is an explicit request to re-read; anything else resumes saved offsets.
+            resume = current is None or current[0][2] == mode
+            tailer = SiteSetTailer(Path(path), pattern, mode[0], mode[1], resume=resume)
             self._tailers[server["id"]] = (sig, tailer)
             self._unc_ok.pop(server["id"], None)
             return tailer
         return current[1]
 
-    def _poll_unc(self, server: dict[str, Any], tailer: DirectoryTailer) -> tuple[list[dict[str, Any]], bool]:
+    def take_discovered(self, server_id: int) -> list[str]:
+        current = self._tailers.get(server_id)
+        return current[1].take_discovered() if current else []
+
+    def _poll_unc(self, server: dict[str, Any], tailer: SiteSetTailer) -> tuple[list[dict[str, Any]], bool]:
         sid = server["id"]
         if not server.get("simulated") and time.monotonic() - self._unc_ok.get(sid, 0) > 600:
             _connect_unc(server["log_unc_path"], server.get("winrm_username", ""), server.get("winrm_password", ""))
@@ -440,7 +555,8 @@ class RemoteManager:
         result: dict[str, Any] = {"server_id": server_id, "server_name": server["server_name"]}
         try:
             sample = await self.health(server)
-            result["winrm"] = {"ok": True, "hostname": sample.get("hostname"), "app_pools": len(sample.get("app_pools", []))}
+            result["winrm"] = {"ok": True, "hostname": sample.get("hostname"), "app_pools": len(sample.get("app_pools", [])),
+                               "sites": [{"id": s["id"], "name": s["name"], "state": s["state"]} for s in sample.get("sites", [])]}
         except Exception as exc:  # noqa: BLE001
             result["winrm"] = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
         if not server.get("log_unc_path"):
@@ -460,5 +576,4 @@ class RemoteManager:
         if not path.is_dir():
             return {"ok": False, "error": f"{path} is not reachable or not a directory"}
         pattern = self.config.value("watchers", "file_pattern", "u_ex*.log") or "*.log"
-        files = sorted(path.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
-        return {"ok": True, "files": len(files), "newest": files[0].name if files else None}
+        return discover_sites(path, pattern)
