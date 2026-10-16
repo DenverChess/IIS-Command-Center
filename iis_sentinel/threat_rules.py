@@ -10,9 +10,7 @@ Score above `threat_score_threshold` (default 50) flags the IP as an ACTIVE THRE
 """
 from __future__ import annotations
 
-import hashlib
 import html
-import ipaddress
 import re
 import time
 from collections import Counter, deque
@@ -22,6 +20,7 @@ from typing import Any, Callable
 from urllib.parse import unquote_plus
 
 from database import LOCAL_SERVER_ID, ConfigStore
+from geoip import special_label
 
 SCORE_SQLI = 10
 SCORE_XSS = 10
@@ -92,32 +91,6 @@ SCANNER_UA = re.compile(
     r"feroxbuster|nuclei|zgrab|havij|w3af|arachni|burp|zap/|commix|whatweb|jaeles|xsstrike",
     re.IGNORECASE,
 )
-
-_GEO_POOL = [
-    ("US", "Ashburn"), ("US", "Dallas"), ("US", "San Jose"), ("CN", "Shanghai"), ("CN", "Beijing"),
-    ("RU", "Moscow"), ("RU", "St Petersburg"), ("DE", "Frankfurt"), ("NL", "Amsterdam"), ("GB", "London"),
-    ("FR", "Paris"), ("BR", "Sao Paulo"), ("IN", "Mumbai"), ("SG", "Singapore"), ("KR", "Seoul"),
-    ("JP", "Tokyo"), ("VN", "Hanoi"), ("IR", "Tehran"), ("UA", "Kyiv"), ("RO", "Bucharest"),
-    ("TR", "Istanbul"), ("ID", "Jakarta"), ("ZA", "Johannesburg"), ("CA", "Toronto"), ("AU", "Sydney"),
-]
-
-
-def simulate_geo(ip: str) -> str:
-    """Deterministic pseudo-geolocation (no external GeoIP DB). Private/reserved ranges are labelled as such."""
-    try:
-        addr = ipaddress.ip_address(ip.split("%", 1)[0])
-    except ValueError:
-        return "??"
-    if addr.is_loopback:
-        return "LOCALHOST"
-    if addr.is_private or addr.is_link_local:
-        return "LAN / INTERNAL"
-    if addr.is_reserved or addr.is_multicast or addr.is_unspecified:
-        return "RESERVED"
-    idx = int(hashlib.sha1(ip.encode()).hexdigest()[:8], 16) % len(_GEO_POOL)
-    cc, city = _GEO_POOL[idx]
-    return f"{cc} / {city}"
-
 
 def normalize_payload(*parts: str) -> str:
     """Decode the request the way an app would see it, defeating double URL / HTML-entity encoding tricks."""
@@ -191,9 +164,11 @@ class Inspection:
 class ThreatEngine:
     MAX_TRACKED = 50000
 
-    def __init__(self, config: ConfigStore, server_name: Callable[[int], str] | None = None) -> None:
+    def __init__(self, config: ConfigStore, server_name: Callable[[int], str] | None = None,
+                 geo: Callable[[str], str] | None = None) -> None:
         self.config = config
         self._server_name = server_name or (lambda sid: f"SRV-{sid}")
+        self._geo = geo or (lambda ip: special_label(ip) or "")
         self._ips: dict[tuple[int, str], IPState] = {}
         self.total_attacks = 0
 
@@ -207,7 +182,7 @@ class ThreatEngine:
         if st is None:
             if len(self._ips) >= self.MAX_TRACKED:
                 self.prune(force=True)
-            st = IPState(ip=ip, geo=simulate_geo(ip), server_id=server_id, server_name=self._server_name(server_id))
+            st = IPState(ip=ip, geo=self._geo(ip), server_id=server_id, server_name=self._server_name(server_id))
             self._ips[key] = st
         return st
 
@@ -351,6 +326,27 @@ class ThreatEngine:
         out = best.to_dict(threshold)
         out["servers"] = [s.to_dict(threshold) for s in sorted(matches, key=lambda s: s.score, reverse=True)]
         return out
+
+    def missing_geo(self, limit: int = 50) -> list[str]:
+        """IPs shown in the threat matrix whose location is still unknown, highest score first."""
+        out: list[str] = []
+        for st in sorted(self._ips.values(), key=lambda s: s.score, reverse=True):
+            if st.score <= 0 and not st.active:
+                break
+            if not st.geo and st.ip not in out:
+                out.append(st.ip)
+                if len(out) >= limit:
+                    break
+        return out
+
+    def set_geo(self, ip: str, geo: str) -> None:
+        for st in self._ips.values():
+            if st.ip == ip:
+                st.geo = geo
+
+    def refresh_geo(self) -> None:
+        for st in self._ips.values():
+            st.geo = self._geo(st.ip)
 
     def rename_server(self, server_id: int, name: str) -> None:
         for st in self._ips.values():
