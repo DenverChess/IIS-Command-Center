@@ -7,7 +7,31 @@ const LIST_FIELDS = {
   exchange: ["alert_recipients"],
   watchers: ["log_dirs", "app_pools"],
   reports: ["recipients"],
+  alerts: ["email_recipients", "http_error_codes", "watched_status_codes", "http_ignore_paths"],
 };
+
+const START_MODES = { end: "NEW LINES ONLY", full: "WHOLE FILE" };
+
+let audioCtx = null;
+function alertTone(severity) {
+  try {
+    audioCtx = audioCtx || new (window.AudioContext || window.webkitAudioContext)();
+    const notes = severity === "CRITICAL" ? [880, 660, 880] : severity === "HIGH" ? [740, 554] : [620];
+    notes.forEach((freq, i) => {
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      const t0 = audioCtx.currentTime + i * 0.17;
+      osc.type = "square";
+      osc.frequency.value = freq;
+      gain.gain.setValueAtTime(0.0001, t0);
+      gain.gain.exponentialRampToValueAtTime(0.06, t0 + 0.02);
+      gain.gain.exponentialRampToValueAtTime(0.0001, t0 + 0.15);
+      osc.connect(gain).connect(audioCtx.destination);
+      osc.start(t0);
+      osc.stop(t0 + 0.16);
+    });
+  } catch (_) { /* audio blocked until the operator interacts with the page */ }
+}
 
 async function api(path, opts = {}) {
   const res = await fetch(path, {
@@ -147,11 +171,21 @@ function dashboardApp() {
     newServer: null,
     srvBusy: {},
     testResults: {},
+    editingId: null,
+    alertCatalog: null,
+    notifPerm: "Notification" in window ? Notification.permission : "unsupported",
+
+    // WHOIS / IP intel modal
+    whois: null,
 
     _k: 0,
 
     init() {
       this.newServer = this.blankServer();
+      termEl().addEventListener("click", (ev) => {
+        const ip = ev.target.closest && ev.target.closest(".log-line .ip");
+        if (ip) this.openWhois(ip.textContent, ip.dataset.server === "" ? null : Number(ip.dataset.server));
+      });
       this.connect();
       setInterval(() => this.updateClock(), 250);
       setInterval(() => this.watchdog(), 5000);
@@ -337,13 +371,16 @@ function dashboardApp() {
       const t = (l.ts || "").slice(11, 19);
       span("ts", t);
       if (l.server) span("srv", `[${l.server}]`);
+      if (l.site_name || l.site) span("site", l.site_name || l.site);
       span("ip", l.ip);
+      div.lastChild.dataset.server = l.server_id == null ? "" : String(l.server_id);
+      div.lastChild.title = "WHOIS / IP intel";
       span("m", l.method);
       span("st", String(l.status));
       div.appendChild(document.createTextNode(` ${l.uri}${l.query ? "?" + l.query : ""}`));
       span("tt", `${l.tt}ms`);
       if (l.tags) l.tags.split(",").filter(Boolean).forEach((tag) => span("tag", tag));
-      div.title = `${l.server ? "[" + l.server + "]  " : ""}${l.ts}  ${l.ip}  ${l.method} ${l.uri}${l.query ? "?" + l.query : ""}\nHTTP ${l.status}.${l.substatus}  ${l.tt}ms  ${l.bytes}B\n${l.ua}`;
+      div.title = `${l.server ? "[" + l.server + "]  " : ""}${l.site_name || l.site ? (l.site_name || l.site) + "  " : ""}${l.ts}  ${l.ip}  ${l.method} ${l.uri}${l.query ? "?" + l.query : ""}\nHTTP ${l.status}.${l.substatus}  ${l.tt}ms  ${l.bytes}B\n${l.ua}`;
       return div;
     },
 
@@ -387,7 +424,61 @@ function dashboardApp() {
       this.alerts.unshift(item);
       if (this.alerts.length > 600) this.alerts.length = 600;
       if (a.status === "Pending" && a.id && !this.pending.some((p) => p.id === a.id)) this.pending.unshift({ ...a });
-      if (a.severity === "CRITICAL" || a.severity === "HIGH") this.toast(item);
+      const n = a.notify;
+      if (n ? (n.desktop && !n.suppressed) : (a.severity === "CRITICAL" || a.severity === "HIGH")) {
+        this.toast(item, a.severity === "CRITICAL" ? 12000 : 7000);
+        if (n) this.desktopNotify(a, n);
+      }
+    },
+
+    desktopNotify(a, n) {
+      if (n.sound) alertTone(a.severity);
+      if (!("Notification" in window) || Notification.permission !== "granted") return;
+      if (!document.hidden && document.hasFocus()) return;
+      try {
+        const pop = new Notification(`${a.severity} // ${a.server_name ? "[" + a.server_name + "] " : ""}${a.title}`, {
+          body: a.message || "", tag: `sentinel-${a.id || this._k}`, requireInteraction: a.severity === "CRITICAL",
+        });
+        pop.onclick = () => { window.focus(); pop.close(); };
+      } catch (e) { console.warn("desktop notification failed", e); }
+    },
+
+    notifStatusText() {
+      switch (this.notifPerm) {
+        case "granted": return "desktop pop-ups ALLOWED (shown while this tab is in the background)";
+        case "denied": return "desktop pop-ups BLOCKED in browser site settings; in-page toasts still work";
+        case "unsupported":
+          return window.isSecureContext ? "browser has no notification support" :
+            "desktop pop-ups need HTTPS or http://localhost; in-page toasts still work";
+        default: return "desktop pop-ups not yet allowed";
+      }
+    },
+
+    async requestNotifications() {
+      if (!("Notification" in window)) return;
+      try { this.notifPerm = await Notification.requestPermission(); } catch (_) { this.notifPerm = Notification.permission; }
+    },
+
+    async testAlert(desktop, email) {
+      this.busy = true;
+      this.cfgMsg = { ok: true, text: email ? "Sending test email via Exchange…" : "Raising test alert…" };
+      try {
+        if (desktop && this.notifPerm === "default") await this.requestNotifications();
+        const r = await api("/alerts/test", { method: "POST", body: JSON.stringify({ desktop, email, severity: "HIGH" }) });
+        if (desktop && this.notifPerm === "granted") {
+          try { new Notification("IIS SENTINEL // test notification", { body: "Desktop pop-ups are working.", tag: "sentinel-test" }); } catch (_) {}
+        }
+        if (email) {
+          const e = r.email || {};
+          this.cfgMsg = e.ok ? { ok: true, text: `Test email delivered to ${(e.recipients || []).join(", ")}.` } : { ok: false, text: `Email: ${e.error || "not sent"}` };
+        } else {
+          this.cfgMsg = { ok: true, text: "Test alert raised: it should appear as a toast and in the alert stream." };
+        }
+      } catch (e) {
+        this.cfgMsg = { ok: false, text: e.message };
+      } finally {
+        this.busy = false;
+      }
     },
 
     toast(t, ms = 7000) {
@@ -577,6 +668,72 @@ function dashboardApp() {
       } catch (e) { console.error(e); }
     },
 
+    /* ------------------------------------------------------------ WHOIS / IP intel */
+    async openWhois(ip, serverId = null, refresh = false) {
+      if (!ip) return;
+      const sid = serverId == null ? this.selId() : serverId;
+      const keep = this.whois && this.whois.ip === ip ? this.whois : null;
+      const first = this.enabledServers().find((s) => s.id === sid) || this.enabledServers()[0];
+      const state = {
+        ip, server_id: sid, loading: true, error: "", banBusy: false,
+        data: keep ? keep.data : null, intel: keep ? keep.intel : null,
+        banServer: keep ? keep.banServer : (first ? String(first.id) : ""),
+      };
+      this.whois = state;
+      const enc = encodeURIComponent(ip);
+      const [w, intel] = await Promise.allSettled([
+        api(`/threats/whois/${enc}${refresh ? "?refresh=true" : ""}`),
+        api(`/threats/ip/${enc}`),
+      ]);
+      if (this.whois !== state) return;
+      if (w.status === "fulfilled") state.data = w.value;
+      else state.error = `WHOIS: ${w.reason.message}`;
+      if (intel.status === "fulfilled") state.intel = intel.value;
+      state.loading = false;
+    },
+
+    closeWhois() { this.whois = null; },
+
+    W() { return (this.whois && this.whois.data && this.whois.data.whois) || {}; },
+
+    whoisBanned(sid) {
+      if (this.whois && this.whois.data && this.whois.data.bans.some((b) => b.server_id === sid)) return true;
+      return !!this.whois && this.bans.some((b) => b.server_id === sid && b.ip_address === this.whois.ip);
+    },
+
+    async whoisBan() {
+      const w = this.whois;
+      if (!w || !w.banServer || w.banBusy) return;
+      const srv = this.serverById(Number(w.banServer));
+      if (!srv) return;
+      if (!window.confirm(`APPROVE FIREWALL BAN\n\nBlock ${w.ip} on ${srv.server_name}?\n\n` +
+        `netsh advfirewall firewall add rule name="SENTINEL BAN: ${w.ip}" dir=in action=block remoteip=${w.ip}`)) return;
+      w.banBusy = true;
+      try {
+        const r = await api("/defense/ban", { method: "POST", body: JSON.stringify({ server_id: srv.id, ip: w.ip }) });
+        this.onBan({ data: r.ban, alert_ids: r.alert_ids, status: "Approved" });
+        if (w.data && r.ban && !w.data.bans.some((b) => b.id === r.ban.id)) w.data.bans.push(r.ban);
+      } catch (e) {
+        this.toast({ severity: "CRITICAL", category: "ban failed", server_name: srv.server_name, title: e.message }, 10000);
+      } finally {
+        w.banBusy = false;
+      }
+    },
+
+    async copyText(text) {
+      try {
+        await navigator.clipboard.writeText(text);
+      } catch (_) {
+        const ta = document.createElement("textarea");
+        ta.value = text;
+        document.body.appendChild(ta);
+        ta.select();
+        try { document.execCommand("copy"); } catch (__) {}
+        ta.remove();
+      }
+      this.toast({ severity: "INFO", ok: true, category: "clipboard", title: `${text} copied` }, 2500);
+    },
+
     /* ------------------------------------------------------------ threat matrix */
     scoreWidth(t) { return Math.min(100, (t.score / (t.threshold * 2)) * 100); },
     scoreClass(t) { return t.active || t.score > t.threshold ? "red" : t.score >= t.threshold * 0.5 ? "amber" : ""; },
@@ -690,6 +847,11 @@ function dashboardApp() {
       if (isNaN(d)) return iso;
       return `${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())}Z`;
     },
+    fmtDate(iso) {
+      if (!iso) return "—";
+      const d = new Date(iso);
+      return isNaN(d) ? String(iso) : `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())}`;
+    },
     fmtDuration(s) {
       if (s == null) return "—";
       s = Math.floor(s);
@@ -705,6 +867,40 @@ function dashboardApp() {
       await this.loadConfig();
       this.refreshServers();
       this.loadReports();
+      this.loadAlertCatalog();
+    },
+
+    switchTab(t) {
+      this.cfgTab = t;
+      this.cfgMsg = { ok: true, text: "" };
+      if (t === "alerts") this.loadAlertCatalog();
+      if (t === "watchers") this.refreshServers();
+    },
+
+    async loadAlertCatalog() {
+      try {
+        this.alertCatalog = await api("/alerts/catalog");
+      } catch (e) {
+        this.cfgMsg = { ok: false, text: `Failed to load alert catalog: ${e.message}` };
+      }
+    },
+
+    eventsIn(gid) {
+      if (!this.alertCatalog || !this.form || !this.form.alerts) return [];
+      return this.alertCatalog.events.filter((e) => e.group === gid && this.form.alerts.events[e.id]);
+    },
+
+    bulkEvents(gid, field, val) {
+      this.eventsIn(gid).forEach((e) => {
+        const st = this.form.alerts.events[e.id];
+        if (val && !st.enabled) st.enabled = true;
+        st[field] = val;
+      });
+    },
+
+    enabledEventCount() {
+      if (!this.form || !this.form.alerts) return 0;
+      return Object.values(this.form.alerts.events || {}).filter((e) => e.enabled).length;
     },
 
     async loadConfig() {
@@ -712,8 +908,9 @@ function dashboardApp() {
         const r = await api("/config");
         const form = JSON.parse(JSON.stringify(r.config));
         for (const [section, keys] of Object.entries(LIST_FIELDS)) {
-          keys.forEach((k) => { form[section][k] = (form[section][k] || []).join("\n"); });
+          if (form[section]) keys.forEach((k) => { form[section][k] = (form[section][k] || []).join("\n"); });
         }
+        if (form.alerts && !Array.isArray(form.alerts.muted_servers)) form.alerts.muted_servers = [];
         this.form = form;
         this.watcherStatus = r.watchers_status || [];
         this.nextRuns = r.report_next_runs || {};
@@ -739,6 +936,7 @@ function dashboardApp() {
         const payload = { [section]: { ...this.form[section] } };
         await api("/config", { method: "POST", body: JSON.stringify(payload) });
         await this.loadConfig();
+        if (section === "alerts" || section === "exchange") this.loadAlertCatalog();
         this.cfgMsg = { ok: true, text: `${section.toUpperCase()} configuration saved.` };
       } catch (e) {
         this.cfgMsg = { ok: false, text: e.message };
@@ -780,7 +978,73 @@ function dashboardApp() {
       return {
         server_name: "", ip_address: "", winrm_username: "", winrm_password: "", log_unc_path: "",
         winrm_transport: "ntlm", winrm_port: "", winrm_use_ssl: false, winrm_verify_ssl: true,
+        log_start_mode: "end", log_tail_lines: 1000, enabled: true,
       };
+    },
+
+    startModeLabel(mode, lines) {
+      if (mode === "tail") return `LAST ${this.fmtNum(lines || 1000)} LINES, THEN FOLLOW`;
+      return START_MODES[mode] || "NEW LINES ONLY";
+    },
+
+    sitesFor(sid) {
+      const w = this.watcherStatus.filter((x) => x.server_id === sid);
+      return w.flatMap((x) => x.sites || []);
+    },
+
+    siteLabel(sid, folder) {
+      const m = /^W3SVC(\d+)$/i.exec(folder || "");
+      const sites = (this.healthBy[sid] && this.healthBy[sid].sites) || [];
+      const hit = m && sites.find((s) => s.id === Number(m[1]));
+      return hit && hit.name ? `${hit.name} (${folder})` : folder || "—";
+    },
+
+    editServer(s) {
+      this.editingId = s.id;
+      this.cfgMsg = { ok: true, text: "" };
+      this.newServer = {
+        server_name: s.server_name, ip_address: s.ip_address, winrm_username: s.winrm_username || "", winrm_password: "",
+        log_unc_path: s.log_unc_path || "", winrm_transport: s.winrm_transport || "ntlm", winrm_port: s.winrm_port || "",
+        winrm_use_ssl: !!s.winrm_use_ssl, winrm_verify_ssl: s.winrm_verify_ssl !== false,
+        log_start_mode: s.log_start_mode || "end", log_tail_lines: s.log_tail_lines || 1000, enabled: !!s.enabled,
+      };
+      this.$nextTick(() => {
+        const el = document.getElementById("server-form");
+        if (el) el.scrollIntoView({ behavior: "smooth", block: "start" });
+      });
+    },
+
+    cancelEdit() {
+      this.editingId = null;
+      this.newServer = this.blankServer();
+    },
+
+    async saveServer() {
+      this.busy = true;
+      this.cfgMsg = { ok: true, text: "" };
+      const body = { ...this.newServer };
+      body.winrm_port = body.winrm_port === "" || body.winrm_port == null ? null : Number(body.winrm_port);
+      body.log_tail_lines = Number(body.log_tail_lines) || 1000;
+      try {
+        if (this.editingId == null) {
+          const r = await api("/servers", { method: "POST", body: JSON.stringify(body) });
+          this.cfgMsg = { ok: true, text: `${r.server.server_name} registered — monitoring started. Use TEST to verify WinRM and the log share.` };
+        } else {
+          if (!body.winrm_password) delete body.winrm_password;
+          if (body.winrm_port == null) delete body.winrm_port;
+          const id = this.editingId;
+          const r = await api(`/servers/${id}`, { method: "PUT", body: JSON.stringify(body) });
+          delete this.testResults[id];
+          this.cfgMsg = { ok: true, text: `${(r.server || body).server_name} updated — monitoring restarted with the new settings.` };
+        }
+        this.editingId = null;
+        this.newServer = this.blankServer();
+        await this.refreshServers();
+      } catch (e) {
+        this.cfgMsg = { ok: false, text: e.message };
+      } finally {
+        this.busy = false;
+      }
     },
 
     async refreshServers() {
@@ -791,23 +1055,6 @@ function dashboardApp() {
       } catch (e) { console.error(e); }
     },
 
-    async addServer() {
-      this.busy = true;
-      this.cfgMsg = { ok: true, text: "" };
-      const body = { ...this.newServer };
-      body.winrm_port = body.winrm_port === "" || body.winrm_port == null ? null : Number(body.winrm_port);
-      try {
-        const r = await api("/servers", { method: "POST", body: JSON.stringify(body) });
-        this.newServer = this.blankServer();
-        await this.refreshServers();
-        this.cfgMsg = { ok: true, text: `${r.server.server_name} registered — monitoring started. Use TEST to verify WinRM and the log share.` };
-      } catch (e) {
-        this.cfgMsg = { ok: false, text: e.message };
-      } finally {
-        this.busy = false;
-      }
-    },
-
     async testServer(s) {
       this.srvBusy[s.id] = "test";
       delete this.testResults[s.id];
@@ -815,8 +1062,16 @@ function dashboardApp() {
         const r = await api(`/servers/${s.id}/test`, { method: "POST" });
         const w = r.winrm || {}, l = r.logs || {};
         const ok = !!(w.ok && l.ok);
-        const wTxt = w.ok ? `WinRM OK (${w.hostname || "?"}, ${w.app_pools} pools)` : `WinRM FAIL: ${w.error}`;
-        const lTxt = l.ok ? `logs OK (${l.files} file(s), newest ${l.newest || "—"})` : `logs FAIL: ${l.error}`;
+        const names = {};
+        (w.sites || []).forEach((x) => { names[x.id] = x.name; });
+        const siteTxt = (l.sites || []).map((x) => {
+          const m = /^W3SVC(\d+)$/i.exec(x.site);
+          return m && names[Number(m[1])] ? `${names[Number(m[1])]} (${x.site})` : x.site;
+        }).join(", ");
+        const wTxt = w.ok ? `WinRM OK (${w.hostname || "?"}, ${w.app_pools} pools, ${(w.sites || []).length} sites)` : `WinRM FAIL: ${w.error}`;
+        const lTxt = l.ok
+          ? `logs OK: ${l.layout || ""} · ${(l.sites || []).length} site folder(s)${siteTxt ? " [" + siteTxt + "]" : ""}, ${l.files} file(s), newest ${l.newest || "—"}`
+          : `logs FAIL: ${l.error}`;
         this.testResults[s.id] = { ok, text: `${wTxt}  |  ${lTxt}` };
       } catch (e) {
         this.testResults[s.id] = { ok: false, text: e.message };
@@ -842,6 +1097,7 @@ function dashboardApp() {
       this.srvBusy[s.id] = "delete";
       try {
         await api(`/servers/${s.id}`, { method: "DELETE" });
+        if (this.editingId === s.id) this.cancelEdit();
         await this.refreshServers();
         this.cfgMsg = { ok: true, text: `${s.server_name} removed.` };
       } catch (e) {

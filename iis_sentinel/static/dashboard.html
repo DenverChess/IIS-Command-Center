@@ -114,7 +114,7 @@
                 <template x-for="p in pendingGroups()" :key="p.key">
                   <tr :class="{ 'active-threat': p.active, attacking: p.attacking }">
                     <td class="ip-cell">
-                      <span x-text="p.ip"></span>
+                      <span class="ip-link" title="WHOIS / IP intel" @click="openWhois(p.ip, p.server_id)" x-text="p.ip"></span>
                       <small x-text="(p.geo || '') + (p.geo ? ' · ' : '') + p.alerts.length + ' ALERT' + (p.alerts.length === 1 ? '' : 'S')"></small>
                     </td>
                     <td><span class="srv-tag" x-text="p.server_name"></span></td>
@@ -149,7 +149,7 @@
                 <template x-for="t in visibleThreats()" :key="t.key">
                   <tr :class="{ 'active-threat': t.active, attacking: t.attacking }">
                     <td class="ip-cell">
-                      <span x-text="t.ip"></span>
+                      <span class="ip-link" title="WHOIS / IP intel" @click="openWhois(t.ip, t.server_id)" x-text="t.ip"></span>
                       <small x-text="t.status + ' · ' + fmtNum(t.requests) + ' REQ'"></small>
                     </td>
                     <td><span class="srv-tag" x-text="t.server_name"></span></td>
@@ -185,7 +185,7 @@
               <tbody>
                 <template x-for="b in visibleBans()" :key="b.id">
                   <tr>
-                    <td class="ip-cell"><span class="neon-red" x-text="b.ip_address"></span><small x-text="fmtTime(b.banned_at)"></small></td>
+                    <td class="ip-cell"><span class="neon-red ip-link" title="WHOIS / IP intel" @click="openWhois(b.ip_address, b.server_id)" x-text="b.ip_address"></span><small x-text="fmtTime(b.banned_at)"></small></td>
                     <td><span class="srv-tag" x-text="b.server_name"></span></td>
                     <td class="payload" :title="b.rule_name" x-text="b.rule_name"></td>
                     <td class="muted" x-text="b.banned_by"></td>
@@ -210,6 +210,7 @@
                 <div style="min-width:0">
                   <div class="title">
                     <span class="srv-tag" x-show="a.server_name" x-text="a.server_name"></span>
+                    <span class="site-tag" x-show="a.details && a.details.site_name" x-text="a.details && a.details.site_name"></span>
                     <span x-text="a.title"></span>
                   </div>
                   <div class="msg" :title="a.message" x-text="a.message"></div>
@@ -219,6 +220,7 @@
                   <span class="status-pill" :class="a.status" x-show="['Pending','Approved','Dismissed'].includes(a.status)" x-text="a.status.toUpperCase()"></span>
                   <button class="chip red on" style="margin-top:3px" x-show="a.id && a.status === 'Pending'" @click="approveAlert(a)">BAN</button>
                   <button class="chip" style="margin-top:3px" x-show="a.id && !a.acknowledged && a.status !== 'Pending'" @click="ack(a)">ACK</button>
+                  <button class="chip" style="margin-top:3px" x-show="a.source_ip" @click="openWhois(a.source_ip, a.server_id)" title="WHOIS / IP intel">WHOIS</button>
                 </div>
               </div>
             </template>
@@ -373,7 +375,7 @@
       <span x-show="pipeline.dropped">DROPPED <b class="neon-red" x-text="pipeline.dropped"></b></span>
       <span>CONSOLES <b x-text="clients"></b></span>
       <span class="spacer"></span>
-      <span>IIS SENTINEL v2.0 // CENTRALIZED W3C DEFENSE GRID</span>
+      <span>IIS SENTINEL v2.1 // CENTRALIZED W3C DEFENSE GRID</span>
     </footer>
 
     <!-- ============================================================ TOASTS -->
@@ -382,6 +384,7 @@
         <div class="toast" :class="t.severity + (t.ok ? ' ok' : '')">
           <div class="h" x-text="(t.server_name ? '[' + t.server_name + '] ' : '') + t.severity + ' // ' + (t.category || '').toUpperCase()"></div>
           <div x-text="t.title"></div>
+          <div class="m" x-show="t.message" x-text="t.message"></div>
         </div>
       </template>
     </div>
@@ -394,8 +397,8 @@
           <button class="btn small ghost" @click="cfgOpen = false">CLOSE ✕</button>
         </div>
         <nav class="tabs">
-          <template x-for="t in ['servers','ad','exchange','watchers','reports']" :key="t">
-            <button class="tab" :class="{ on: cfgTab === t }" @click="cfgTab = t; cfgMsg = { ok: true, text: '' }" x-text="t.toUpperCase()"></button>
+          <template x-for="t in ['servers','alerts','ad','exchange','watchers','reports']" :key="t">
+            <button class="tab" :class="{ on: cfgTab === t }" @click="switchTab(t)" x-text="t.toUpperCase()"></button>
           </template>
         </nav>
         <template x-if="form">
@@ -409,28 +412,54 @@
               <div class="srv-row" :class="{ disabled: !s.enabled }">
                 <div class="srv-main">
                   <div><span class="dot" :class="s.enabled ? serverState(s) : ''"></span> <b x-text="s.server_name"></b>
-                    <span class="muted" x-text="' ' + s.ip_address + (s.local ? ' (local)' : ' · WinRM ' + (s.winrm_use_ssl ? 'HTTPS' : 'HTTP') + ':' + s.winrm_port + ' ' + (s.winrm_transport || '').toUpperCase())"></span></div>
+                    <span class="muted" x-text="' ' + s.ip_address + (s.local ? ' (local)' : ' · WinRM ' + (s.winrm_use_ssl ? 'HTTPS' : 'HTTP') + ':' + s.winrm_port + ' ' + (s.winrm_transport || '').toUpperCase())"></span>
+                    <span class="neon-amber small" x-show="editingId === s.id"> · EDITING</span></div>
                   <div class="muted small" x-text="(s.winrm_username || '') + (s.log_unc_path ? '  ·  ' + s.log_unc_path : (s.local ? '  ·  ' + (s.log_dirs || []).join(', ') : '  ·  no log path'))"></div>
+                  <div class="muted small" x-show="s.log_unc_path || s.local" x-text="'START: ' + startModeLabel(s.log_start_mode, s.log_tail_lines)"></div>
+                  <div class="sites-list" x-show="sitesFor(s.id).length">
+                    <template x-for="site in sitesFor(s.id)" :key="site.directory">
+                      <span class="site-tag" :title="site.directory + ' — ' + (site.status || '')" x-text="siteLabel(s.id, site.site) + ' · ' + fmtNum(site.lines_parsed)"></span>
+                    </template>
+                  </div>
                   <div class="small" :class="serverState(s) === 'down' ? 'neon-red' : 'muted'" x-show="s.enabled" x-text="serverStateText(s)"></div>
                   <div class="small" x-show="testResults[s.id]" :class="testResults[s.id] && testResults[s.id].ok ? 'neon-green' : 'neon-red'" x-text="testResults[s.id] && testResults[s.id].text"></div>
                 </div>
                 <div class="srv-actions" x-show="!s.local">
+                  <button class="btn small amber" @click="editServer(s)" :disabled="!!srvBusy[s.id]">EDIT</button>
                   <button class="btn small" @click="testServer(s)" :disabled="!!srvBusy[s.id]" x-text="srvBusy[s.id] === 'test' ? 'TESTING…' : 'TEST'"></button>
                   <button class="btn small ghost" @click="toggleServer(s)" :disabled="!!srvBusy[s.id]" x-text="s.enabled ? 'DISABLE' : 'ENABLE'"></button>
                   <button class="btn small danger" @click="deleteServer(s)" :disabled="!!srvBusy[s.id]">DELETE</button>
+                </div>
+                <div class="srv-actions" x-show="s.local">
+                  <button class="btn small amber" @click="switchTab('watchers')" title="The local server is configured under WATCHERS">EDIT</button>
                 </div>
               </div>
             </template>
             <div class="muted" x-show="!servers.length" style="margin-bottom:12px">No servers registered yet.</div>
 
-            <div class="section-label"><span>ADD SERVER</span></div>
+            <div id="server-form" class="section-label"><span x-text="editingId == null ? 'ADD SERVER' : 'EDIT SERVER :: ' + (serverById(editingId) || {}).server_name"></span></div>
+            <div class="edit-banner" x-show="editingId != null">
+              <span>Editing an existing server. Leave the password blank to keep the stored one.</span>
+              <button class="btn small ghost" @click="cancelEdit()">CANCEL</button>
+            </div>
             <div class="form-grid">
               <div class="field"><label>Server name</label><input class="input" x-model="newServer.server_name" placeholder="IIS-01" maxlength="64"></div>
               <div class="field"><label>IP address / hostname</label><input class="input" x-model="newServer.ip_address" placeholder="10.0.20.11"></div>
               <div class="field"><label>WinRM username</label><input class="input" x-model="newServer.winrm_username" placeholder="CORP\svc_sentinel" autocomplete="off"></div>
-              <div class="field"><label>WinRM password</label><input class="input" type="password" x-model="newServer.winrm_password" autocomplete="new-password"></div>
-              <div class="field full"><label>IIS log UNC path</label><input class="input" x-model="newServer.log_unc_path" placeholder="\\10.0.20.11\c$\inetpub\logs\LogFiles\W3SVC1">
-                <div class="hint">The same account is used for the SMB share. Read access to the W3SVC folder is enough.</div></div>
+              <div class="field"><label x-text="editingId == null ? 'WinRM password' : 'WinRM password (blank = keep)'"></label>
+                <input class="input" type="password" x-model="newServer.winrm_password" autocomplete="new-password" :placeholder="editingId == null ? '' : '••••••••  (unchanged)'"></div>
+              <div class="field full"><label>IIS log folder (UNC): a site folder OR the parent of all W3SVC folders</label>
+                <input class="input" x-model="newServer.log_unc_path" placeholder="\\10.0.20.11\c$\inetpub\logs\LogFiles">
+                <div class="hint">Point at <b>LogFiles</b> to watch every site on the server (W3SVC1, W3SVC2, …; new sites are picked up automatically), or at one W3SVC folder for a single site. The WinRM account is used for the SMB share; read access is enough.</div></div>
+              <div class="field"><label>On first read of each log file</label>
+                <select class="input" x-model="newServer.log_start_mode">
+                  <option value="end">New lines only</option>
+                  <option value="tail">Last N lines, then follow</option>
+                  <option value="full">Whole file, then follow</option>
+                </select>
+              </div>
+              <div class="field"><label>Lines to tail (N)</label><input class="input" type="number" min="1" max="1000000" x-model.number="newServer.log_tail_lines" :disabled="newServer.log_start_mode !== 'tail'"></div>
+              <div class="field full" style="margin-top:-8px"><div class="hint">Applies per site to today's log the first time Sentinel sees it. Afterwards Sentinel resumes exactly where it stopped (even across restarts). Changing this setting re-reads using the new mode. Notifications are only sent for lines newer than the live window in ALERTS.</div></div>
               <div class="field"><label>WinRM auth</label>
                 <select class="input" x-model="newServer.winrm_transport">
                   <template x-for="t in ['ntlm','kerberos','credssp','basic']" :key="t"><option :value="t" x-text="t.toUpperCase()"></option></template>
@@ -440,7 +469,111 @@
             </div>
             <label class="check"><input type="checkbox" x-model="newServer.winrm_use_ssl"> WinRM over HTTPS (5986)</label>
             <label class="check" x-show="newServer.winrm_use_ssl"><input type="checkbox" x-model="newServer.winrm_verify_ssl"> Verify server certificate</label>
-            <button class="btn" @click="addServer()" :disabled="busy">REGISTER SERVER</button>
+            <label class="check" x-show="editingId != null"><input type="checkbox" x-model="newServer.enabled"> Monitoring enabled</label>
+            <div style="display:flex;gap:8px">
+              <button class="btn" @click="saveServer()" :disabled="busy" x-text="editingId == null ? 'REGISTER SERVER' : 'SAVE CHANGES'"></button>
+              <button class="btn ghost" x-show="editingId != null" @click="cancelEdit()" :disabled="busy">CANCEL</button>
+            </div>
+          </div>
+
+          <!-- ALERTS -->
+          <div x-show="cfgTab === 'alerts'">
+            <template x-if="form.alerts && alertCatalog">
+            <div>
+              <div class="notice" :class="alertCatalog.exchange.enabled && alertCatalog.exchange.recipients.length ? 'ok' : 'err'">
+                <span x-show="alertCatalog.exchange.enabled && alertCatalog.exchange.recipients.length"
+                      x-text="'EMAIL via Exchange → ' + alertCatalog.exchange.recipients.join(', ') + (alertCatalog.exchange.mailer.circuit_open ? '  (paused after repeated failures)' : '')"></span>
+                <span x-show="!(alertCatalog.exchange.enabled && alertCatalog.exchange.recipients.length)">
+                  EMAIL IS OFF: <span x-text="alertCatalog.exchange.enabled ? 'no recipients configured.' : 'Exchange delivery is disabled.'"></span>
+                  Ticked EMAIL boxes take effect once <a href="#" style="color:inherit" @click.prevent="switchTab('exchange')">EXCHANGE</a> is configured.
+                </span>
+              </div>
+
+              <div class="section-label" style="margin-top:0"><span>DELIVERY</span><span></span></div>
+              <label class="check"><input type="checkbox" x-model="form.alerts.desktop_notifications"> Dashboard toasts + desktop pop-ups for events ticked DESKTOP</label>
+              <div class="small muted" style="margin:-8px 0 10px 23px">
+                <span x-text="'This browser: ' + notifStatusText()"></span>
+                <button class="chip" style="margin-left:6px" x-show="notifPerm === 'default'" @click="requestNotifications()">ALLOW DESKTOP POP-UPS</button>
+              </div>
+              <label class="check"><input type="checkbox" x-model="form.alerts.sound"> Play an alert tone with desktop notifications</label>
+              <div class="form-grid">
+                <div class="field full"><label>Email recipients for alerts (one per line; blank = Exchange alert recipients)</label><textarea class="input" x-model="form.alerts.email_recipients" placeholder="soc@corp.local"></textarea></div>
+              </div>
+              <div style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:6px">
+                <button class="btn small" @click="testAlert(true, false)" :disabled="busy">TEST DESKTOP</button>
+                <button class="btn small" @click="testAlert(false, true)" :disabled="busy">TEST EMAIL</button>
+              </div>
+
+              <div class="section-label"><span>EVENTS</span><span x-text="enabledEventCount() + ' / ' + alertCatalog.events.length + ' ON'"></span></div>
+              <table class="ev-table">
+                <thead><tr><th>EVENT</th><th>ON</th><th>DESKTOP</th><th>EMAIL</th><th>SEVERITY</th></tr></thead>
+                <template x-for="g in alertCatalog.groups" :key="g.id">
+                  <tbody>
+                    <tr class="grp"><td colspan="5">
+                      <span x-text="g.label"></span>
+                      <span class="bulk">
+                        <button class="chip" @click="bulkEvents(g.id, 'desktop', true)" title="Desktop on for the whole group">DESKTOP ALL</button>
+                        <button class="chip" @click="bulkEvents(g.id, 'email', true)" title="Email on for the whole group">EMAIL ALL</button>
+                        <button class="chip" @click="bulkEvents(g.id, 'email', false); bulkEvents(g.id, 'desktop', false)" title="Desktop and email off for the whole group">NONE</button>
+                      </span>
+                    </td></tr>
+                    <template x-for="e in eventsIn(g.id)" :key="e.id">
+                      <tr :class="{ off: !form.alerts.events[e.id].enabled }">
+                        <td><div class="lbl" x-text="e.label"></div><div class="desc" x-text="e.description"></div></td>
+                        <td class="c"><input type="checkbox" x-model="form.alerts.events[e.id].enabled" :disabled="e.core" :title="e.core ? 'Required: feeds the ban approval queue' : 'Record this event in the alert stream'">
+                          <span class="lock" x-show="e.core">REQUIRED</span></td>
+                        <td class="c"><input type="checkbox" x-model="form.alerts.events[e.id].desktop" :disabled="!form.alerts.events[e.id].enabled"></td>
+                        <td class="c"><input type="checkbox" x-model="form.alerts.events[e.id].email" :disabled="!form.alerts.events[e.id].enabled"></td>
+                        <td class="sevc">
+                          <select class="input" x-model="form.alerts.events[e.id].severity" :disabled="!form.alerts.events[e.id].enabled">
+                            <option value="default" x-text="'DEFAULT (' + e.severity + ')'"></option>
+                            <template x-for="sv in ['INFO','WARNING','HIGH','CRITICAL']" :key="sv"><option :value="sv" x-text="sv"></option></template>
+                          </select>
+                        </td>
+                      </tr>
+                    </template>
+                  </tbody>
+                </template>
+              </table>
+
+              <div class="section-label"><span>HTTP ERROR DETECTION</span><span></span></div>
+              <div class="form-grid">
+                <div class="field"><label>Server error codes</label><textarea class="input" rows="2" x-model="form.alerts.http_error_codes" placeholder="500-599"></textarea>
+                  <div class="hint">One per line: 500, 500-599 or 5xx.</div></div>
+                <div class="field"><label>Extra watched codes</label><textarea class="input" rows="2" x-model="form.alerts.watched_status_codes" placeholder="413&#10;429"></textarea>
+                  <div class="hint">Fires "Watched status code" (enable it above).</div></div>
+                <div class="field"><label>Roll up repeats of one URL for (min)</label><input class="input" type="number" min="0" x-model.number="form.alerts.http_error_cooldown_minutes"></div>
+                <div class="field"><label>Watched code cooldown (min)</label><input class="input" type="number" min="0" x-model.number="form.alerts.watched_status_cooldown_minutes"></div>
+                <div class="field"><label>Error burst: errors per site</label><input class="input" type="number" min="2" x-model.number="form.alerts.http_error_burst_threshold"></div>
+                <div class="field"><label>Error burst window (min)</label><input class="input" type="number" min="1" x-model.number="form.alerts.http_error_burst_window_minutes"></div>
+                <div class="field"><label>Slow response threshold (ms)</label><input class="input" type="number" min="100" x-model.number="form.alerts.slow_response_ms"></div>
+                <div class="field"><label>Slow requests per site / window (min)</label>
+                  <div class="inline-fields"><input class="input" type="number" min="1" x-model.number="form.alerts.slow_response_threshold"><span class="muted">in</span><input class="input" type="number" min="1" x-model.number="form.alerts.slow_response_window_minutes"></div></div>
+                <div class="field full"><label>Ignore these URL prefixes (one per line)</label><textarea class="input" rows="2" x-model="form.alerts.http_ignore_paths" placeholder="/api/health&#10;/signalr/"></textarea>
+                  <div class="hint">Health checks, long-polling endpoints, etc. never raise HTTP error or slow-response alerts.</div></div>
+                <div class="field"><label>Certificate warning (days before expiry)</label><input class="input" type="number" min="1" max="365" x-model.number="form.alerts.cert_warning_days"></div>
+                <div class="field"><label>Live window (min)</label><input class="input" type="number" min="1" x-model.number="form.alerts.live_window_minutes">
+                  <div class="hint">Older log lines (backfill) are recorded but never notify.</div></div>
+              </div>
+
+              <div class="section-label"><span>QUIET HOURS &amp; MUTING</span><span></span></div>
+              <label class="check"><input type="checkbox" x-model="form.alerts.quiet_hours_enabled"> Quiet hours: no desktop pop-ups or email (alerts are still recorded)</label>
+              <div class="inline-fields" style="margin:-6px 0 10px 23px" x-show="form.alerts.quiet_hours_enabled">
+                <input class="input" type="time" x-model="form.alerts.quiet_start"><span class="muted">to</span><input class="input" type="time" x-model="form.alerts.quiet_end">
+                <span class="muted small">(Sentinel host's local time)</span>
+              </div>
+              <label class="check" x-show="form.alerts.quiet_hours_enabled" style="margin-left:23px"><input type="checkbox" x-model="form.alerts.quiet_bypass_critical"> CRITICAL alerts still notify during quiet hours</label>
+              <div class="field"><label>Muted servers (recorded, never notify; e.g. during maintenance)</label>
+                <div class="server-checks">
+                  <template x-for="s in servers" :key="s.id">
+                    <label class="check"><input type="checkbox" :value="s.server_name" x-model="form.alerts.muted_servers"> <span x-text="s.server_name"></span></label>
+                  </template>
+                  <span class="muted small" x-show="!servers.length">No servers registered.</span>
+                </div>
+              </div>
+            </div>
+            </template>
+            <div class="spinner-line" x-show="!alertCatalog">LOADING EVENT CATALOG…</div>
           </div>
 
           <!-- AD -->
@@ -474,10 +607,8 @@
               <div class="field"><label>Password</label><input class="input" type="password" x-model="form.exchange.password" autocomplete="new-password"></div>
               <div class="field"><label>Timeout (s)</label><input class="input" type="number" x-model.number="form.exchange.timeout"></div>
               <div class="field full"><label>Alert recipients (one per line)</label><textarea class="input" x-model="form.exchange.alert_recipients"></textarea></div>
-              <div class="field"><label>Email alerts at severity ≥</label>
-                <select class="input" x-model="form.exchange.alert_min_severity">
-                  <template x-for="s in ['INFO','WARNING','HIGH','CRITICAL']" :key="s"><option :value="s" x-text="s"></option></template>
-                </select>
+              <div class="field"><label>Which events are emailed</label>
+                <div class="hint" style="margin-top:6px">Chosen per event under <a href="#" style="color:var(--cyan)" @click.prevent="switchTab('alerts')">ALERTS</a> (EMAIL column). Recipients there override this list.</div>
               </div>
               <div class="field"><label>Max alert mails / hour</label><input class="input" type="number" x-model.number="form.exchange.max_alerts_per_hour"></div>
             </div>
@@ -489,8 +620,16 @@
           <!-- WATCHERS -->
           <div x-show="cfgTab === 'watchers'">
             <div class="form-grid">
-              <div class="field full"><label>Local IIS log directories (only if Sentinel runs ON an IIS server)</label><textarea class="input" x-model="form.watchers.log_dirs"></textarea>
-                <div class="hint">Leave empty on an admin workstation; remote servers are added under SERVERS. Enable sc-bytes / cs-bytes in IIS logging for bandwidth baselining.</div></div>
+              <div class="field full"><label>Local IIS log directories (only if Sentinel runs ON an IIS server)</label><textarea class="input" x-model="form.watchers.log_dirs" placeholder="C:\inetpub\logs\LogFiles"></textarea>
+                <div class="hint">One per line. A parent folder (LogFiles) watches every W3SVC site folder below it, including sites added later. Leave empty on an admin workstation; remote servers are added under SERVERS. Enable sc-bytes / cs-bytes in IIS logging for bandwidth baselining.</div></div>
+              <div class="field"><label>On first read of each local log file</label>
+                <select class="input" x-model="form.watchers.log_start_mode">
+                  <option value="end">New lines only</option>
+                  <option value="tail">Last N lines, then follow</option>
+                  <option value="full">Whole file, then follow</option>
+                </select>
+              </div>
+              <div class="field"><label>Lines to tail (N)</label><input class="input" type="number" min="1" max="1000000" x-model.number="form.watchers.log_tail_lines" :disabled="form.watchers.log_start_mode !== 'tail'"></div>
               <div class="field"><label>Local server display name</label><input class="input" x-model="form.watchers.local_server_name" placeholder="(hostname)"></div>
               <div class="field"><label>Remote call timeout (s)</label><input class="input" type="number" x-model.number="form.watchers.remote_timeout"></div>
               <div class="field"><label>File pattern</label><input class="input" x-model="form.watchers.file_pattern"></div>
@@ -509,13 +648,18 @@
               <div class="field"><label>Score half-life (min)</label><input class="input" type="number" x-model.number="form.watchers.threat_half_life_minutes"></div>
               <div class="field"><label>Retention (days)</label><input class="input" type="number" x-model.number="form.watchers.retention_days"></div>
             </div>
-            <label class="check"><input type="checkbox" x-model="form.watchers.start_at_end"> Start at end of current log (skip history)</label>
             <div class="section-label"><span>WATCHER STATUS</span></div>
             <template x-for="w in watcherStatus" :key="w.server_id + '|' + w.directory">
-              <div class="kv" style="margin-bottom:8px">
+              <div class="kv" style="margin-bottom:10px">
                 <span class="k"><span class="srv-tag" x-text="w.server_name"></span> <span x-text="w.directory || '—'"></span></span><span class="v" :class="w.status === 'tailing' ? 'neon-green' : 'neon-amber'" x-text="(w.status || '').toUpperCase()"></span>
-                <span class="k">file</span><span class="v" x-text="w.file ? w.file.split(/[\\/]/).pop() : '—'"></span>
-                <span class="k">lines / errors / rollovers</span><span class="v" x-text="fmtNum(w.lines_parsed) + ' / ' + w.parse_errors + ' / ' + w.rollovers"></span>
+                <span class="k">layout / start</span><span class="v" x-text="(w.layout === 'multi-site' ? w.site_count + ' SITE FOLDER' + (w.site_count === 1 ? '' : 'S') : w.layout === 'single site' ? 'SINGLE SITE' : '—') + ' · ' + startModeLabel(w.start_mode, w.server_id === 0 ? form.watchers.log_tail_lines : (serverById(w.server_id) || {}).log_tail_lines)"></span>
+                <span class="k">lines / errors / rollovers</span><span class="v" x-text="fmtNum(w.lines_parsed) + ' / ' + (w.parse_errors || 0) + ' / ' + (w.rollovers || 0)"></span>
+                <template x-for="site in (w.sites || [])" :key="site.directory">
+                  <div style="display:contents">
+                    <span class="k" style="padding-left:14px"><span class="site-tag" x-text="siteLabel(w.server_id, site.site)"></span> <span x-text="site.file ? site.file.split(/[\\/]/).pop() : '—'"></span></span>
+                    <span class="v" :class="site.status === 'tailing' ? 'neon-green' : 'neon-amber'" x-text="fmtNum(site.lines_parsed) + ' · ' + (site.status || '').toUpperCase()"></span>
+                  </div>
+                </template>
               </div>
             </template>
           </div>
@@ -568,6 +712,118 @@
           <button class="btn" x-show="cfgTab !== 'servers'" @click="saveConfig()" :disabled="busy || !form">SAVE <span x-text="cfgTab.toUpperCase()"></span></button>
         </div>
       </aside>
+    </div>
+
+    <!-- ============================================================ WHOIS / IP INTEL -->
+    <div class="overlay center" x-show="whois" x-cloak @click.self="closeWhois()" @keydown.escape.window="closeWhois()">
+      <template x-if="whois">
+      <div class="modal" role="dialog" aria-label="IP intelligence">
+        <div class="modal-head">
+          <div>
+            <div class="ip" x-text="whois.ip"></div>
+            <div class="sub" x-text="'IP INTEL // WHOIS (RDAP)' + (whois.data && whois.data.whois.cached ? ' · CACHED' : '')"></div>
+          </div>
+          <span class="grow"></span>
+          <button class="btn small ghost" @click="copyText(whois.ip)">COPY</button>
+          <button class="btn small" @click="openWhois(whois.ip, whois.server_id, true)" :disabled="whois.loading">REFRESH</button>
+          <button class="btn small ghost" @click="closeWhois()">CLOSE ✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="spinner-line" x-show="whois.loading">QUERYING REGIONAL INTERNET REGISTRY…</div>
+          <div class="notice err" x-show="whois.error" x-text="whois.error"></div>
+
+          <template x-if="whois.data">
+          <div>
+            <div class="whois-summary">
+              <b x-text="W().organization || W().network_name || (W().scope === 'private' ? 'Internal address' : 'Unknown owner')"></b>
+              <span x-show="W().country" x-text="' · ' + W().country"></span>
+              <span x-show="W().registry" x-text="' · ' + W().registry"></span>
+              <div class="small muted" x-show="W().summary && W().scope === 'private'" x-text="W().summary"></div>
+            </div>
+            <div class="notice err" x-show="W().error" x-text="W().error"></div>
+            <div class="whois-grid">
+              <div class="kv wrap">
+                <span class="k">REVERSE DNS</span><span class="v" x-text="W().reverse_dns || '—'"></span>
+                <span class="k">NETWORK</span><span class="v" x-text="W().network_name || '—'"></span>
+                <span class="k">CIDR</span><span class="v neon-cyan" x-text="(W().cidr || []).join(', ') || '—'"></span>
+                <span class="k">RANGE</span><span class="v" x-text="W().start_address ? W().start_address + ' – ' + W().end_address : '—'"></span>
+                <span class="k">ORIGIN AS</span><span class="v" x-text="(W().origin_as || []).join(', ') || '—'"></span>
+                <span class="k">HANDLE</span><span class="v" x-text="W().handle || '—'"></span>
+              </div>
+              <div class="kv wrap">
+                <span class="k">ABUSE EMAIL</span><span class="v"><a x-show="W().abuse_email" :href="'mailto:' + W().abuse_email" style="color:var(--cyan)" x-text="W().abuse_email"></a><span x-show="!W().abuse_email">—</span></span>
+                <span class="k">ABUSE PHONE</span><span class="v" x-text="W().abuse_phone || '—'"></span>
+                <span class="k">REGISTERED</span><span class="v" x-text="fmtDate(W().registered)"></span>
+                <span class="k">LAST CHANGED</span><span class="v" x-text="fmtDate(W().last_changed)"></span>
+                <span class="k">TYPE / STATUS</span><span class="v" x-text="[W().type, (W().status || []).join(', ')].filter(Boolean).join(' · ') || '—'"></span>
+                <span class="k">ADDRESS</span><span class="v" x-text="W().registrant_address || '—'"></span>
+              </div>
+            </div>
+            <template x-if="(W().remarks || []).length">
+              <div><div class="section-label"><span>REMARKS</span><span></span></div>
+                <div class="remarks"><template x-for="(r, i) in W().remarks" :key="i"><div x-text="r"></div></template></div></div>
+            </template>
+            <template x-if="(W().entities || []).length">
+              <div>
+                <div class="section-label"><span>CONTACTS</span><span x-text="W().entities.length"></span></div>
+                <table class="mini">
+                  <colgroup><col style="width:30%"><col style="width:22%"><col style="width:48%"></colgroup>
+                  <thead><tr><th>NAME</th><th>ROLE</th><th>CONTACT</th></tr></thead>
+                  <tbody><template x-for="(e, i) in W().entities" :key="i">
+                    <tr><td :title="e.name" x-text="e.name || e.handle || '—'"></td><td x-text="(e.roles || []).join(', ')"></td>
+                        <td :title="[e.email, e.phone, e.address].filter(Boolean).join(' · ')" x-text="[e.email, e.phone].filter(Boolean).join(' · ') || e.address || '—'"></td></tr>
+                  </template></tbody>
+                </table>
+              </div>
+            </template>
+          </div>
+          </template>
+
+          <div class="section-label"><span>SENTINEL HISTORY</span>
+            <span x-text="(whois.data ? whois.data.alert_count + ' ALERT' + (whois.data.alert_count === 1 ? '' : 'S') : '') + (whois.intel ? ' · ' + whois.intel.recent.length + ' RECENT REQ' : '')"></span></div>
+          <template x-if="whois.intel && whois.intel.state">
+            <div class="kv" style="margin-bottom:10px">
+              <span class="k">THREAT STATE</span><span class="v" :class="whois.intel.state.active ? 'neon-red' : whois.intel.state.score >= 10 ? 'neon-amber' : 'neon-green'"
+                x-text="whois.intel.state.status + ' · SCORE ' + Math.round(whois.intel.state.score) + ' (PEAK ' + Math.round(whois.intel.state.peak_score) + ')'"></span>
+              <span class="k">TARGET</span><span class="v" x-text="whois.intel.state.server_name + ' · ' + fmtNum(whois.intel.state.requests) + ' REQ · ' + whois.intel.state.attack_hits + ' ATTACK HITS'"></span>
+              <span class="k">SIGNATURES</span><span class="v" x-text="Object.entries(whois.intel.state.tags || {}).map(([k, n]) => k + '×' + n).join('  ') || '—'"></span>
+            </div>
+          </template>
+          <template x-if="whois.intel && whois.intel.recent.length">
+            <table class="mini">
+              <colgroup><col style="width:13%"><col style="width:15%"><col style="width:13%"><col style="width:7%"><col style="width:7%"><col style="width:45%"></colgroup>
+              <thead><tr><th>TIME</th><th>SERVER</th><th>SITE</th><th>VERB</th><th>CODE</th><th>REQUEST</th></tr></thead>
+              <tbody><template x-for="(r, i) in whois.intel.recent" :key="i">
+                <tr><td x-text="fmtTime(r.ts)"></td><td x-text="r.server_name"></td><td :title="r.site" x-text="r.site_name || r.site || '—'"></td><td x-text="r.method"></td>
+                    <td :class="r.status >= 500 ? 'bad' : r.status >= 400 ? 'warn' : ''" x-text="r.status"></td>
+                    <td :class="r.tags ? 'bad' : ''" :title="r.uri + (r.query ? '?' + r.query : '') + '\n' + (r.ua || '')" x-text="r.uri + (r.query ? '?' + r.query : '') + (r.tags ? '  [' + r.tags + ']' : '')"></td></tr>
+              </template></tbody>
+            </table>
+          </template>
+          <div class="muted small" x-show="whois.intel && !whois.intel.recent.length && !whois.intel.state">No requests from this address in the log database.</div>
+
+          <template x-if="whois.data && whois.data.bans.length">
+            <div>
+              <div class="section-label"><span>ACTIVE BANS</span><span x-text="whois.data.bans.length"></span></div>
+              <template x-for="b in whois.data.bans" :key="b.id">
+                <div class="small"><span class="srv-tag" x-text="b.server_name"></span> <span class="neon-red" x-text="b.rule_name"></span> <span class="muted" x-text="' · ' + fmtTime(b.banned_at) + ' by ' + b.banned_by"></span></div>
+              </template>
+            </div>
+          </template>
+        </div>
+        <div class="modal-foot">
+          <a :href="'https://www.abuseipdb.com/check/' + encodeURIComponent(whois.ip)" target="_blank" rel="noopener noreferrer">ABUSEIPDB ↗</a>
+          <a :href="'https://bgp.he.net/ip/' + encodeURIComponent(whois.ip)" target="_blank" rel="noopener noreferrer">BGP.HE.NET ↗</a>
+          <a :href="'https://search.arin.net/rdap/?query=' + encodeURIComponent(whois.ip)" target="_blank" rel="noopener noreferrer">ARIN ↗</a>
+          <span class="grow" style="flex:1"></span>
+          <select class="input" style="width:auto" x-model="whois.banServer" aria-label="Server to ban on">
+            <template x-for="s in enabledServers()" :key="s.id"><option :value="String(s.id)" x-text="s.server_name" :disabled="whoisBanned(s.id)"></option></template>
+          </select>
+          <button class="btn small danger" @click="whoisBan()" :disabled="whois.banBusy || !whois.banServer || whoisBanned(Number(whois.banServer))"
+                  x-text="whois.banBusy ? 'EXECUTING…' : (whoisBanned(Number(whois.banServer)) ? 'ALREADY BANNED' : 'BAN ON SERVER')"></button>
+        </div>
+      </div>
+      </template>
     </div>
   </div>
 </body>
