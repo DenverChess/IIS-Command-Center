@@ -101,6 +101,7 @@
               <button class="ptab" :class="{ on: centerTab === 'bans' }" @click="centerTab = 'bans'; loadBans()">BANS <b x-text="visibleBans().length"></b></button>
             </span>
             <span class="meta">
+              <span class="muted" style="margin-right:10px" :title="firewall.error || firewall.target" x-text="'BANS → ' + (firewall.label || '').toUpperCase()"></span>
               <span :class="activeCount() ? 'neon-red' : 'neon-green'" x-text="activeCount() ? 'HOSTILES ENGAGED' : 'PERIMETER SECURE'"></span>
             </span>
           </div>
@@ -153,7 +154,7 @@
                       <small x-text="t.status + ' · ' + fmtNum(t.requests) + ' REQ'"></small>
                     </td>
                     <td><span class="srv-tag" x-text="t.server_name"></span></td>
-                    <td class="muted" x-text="t.geo"></td>
+                    <td class="muted" :title="t.geo ? '' : 'Locating…'" x-text="t.geo || '—'"></td>
                     <td>
                       <div class="score">
                         <div class="bar">
@@ -186,8 +187,8 @@
                 <template x-for="b in visibleBans()" :key="b.id">
                   <tr>
                     <td class="ip-cell"><span class="neon-red ip-link" title="WHOIS / IP intel" @click="openWhois(b.ip_address, b.server_id)" x-text="b.ip_address"></span><small x-text="fmtTime(b.banned_at)"></small></td>
-                    <td><span class="srv-tag" x-text="b.server_name"></span></td>
-                    <td class="payload" :title="b.rule_name" x-text="b.rule_name"></td>
+                    <td><span class="srv-tag" x-text="b.provider && b.provider !== 'windows' ? 'ALL · PERIMETER' : b.server_name"></span></td>
+                    <td class="payload" :title="(b.provider_label || '') + ' — ' + b.rule_name" x-text="b.rule_name"></td>
                     <td class="muted" x-text="b.banned_by"></td>
                     <td class="actions"><button class="btn small ghost" @click="liftBan(b)" :disabled="!!banBusy['ban' + b.id]" x-text="banBusy['ban' + b.id] ? '…' : 'LIFT'"></button></td>
                   </tr>
@@ -397,7 +398,7 @@
           <button class="btn small ghost" @click="cfgOpen = false">CLOSE ✕</button>
         </div>
         <nav class="tabs">
-          <template x-for="t in ['servers','alerts','ad','exchange','watchers','reports']" :key="t">
+          <template x-for="t in ['servers','alerts','firewall','ad','exchange','watchers','reports']" :key="t">
             <button class="tab" :class="{ on: cfgTab === t }" @click="switchTab(t)" x-text="t.toUpperCase()"></button>
           </template>
         </nav>
@@ -576,6 +577,89 @@
             <div class="spinner-line" x-show="!alertCatalog">LOADING EVENT CATALOG…</div>
           </div>
 
+          <!-- FIREWALL -->
+          <div x-show="cfgTab === 'firewall'">
+            <template x-if="form.firewall">
+            <div>
+              <div class="section-label" style="margin-top:0"><span>WHERE "APPROVE BAN" BLOCKS THE ATTACKER</span><span></span></div>
+              <div class="fw-options">
+                <template x-for="p in FIREWALLS" :key="p.id">
+                  <label class="fw-opt" :class="{ on: form.firewall.provider === p.id }">
+                    <input type="radio" name="fw-provider" :value="p.id" x-model="form.firewall.provider">
+                    <div><b x-text="p.label"></b><div class="small muted" x-text="p.desc"></div></div>
+                  </label>
+                </template>
+              </div>
+              <div class="notice" :class="form.firewall.provider === firewall.provider ? 'ok' : 'err'"
+                   x-text="form.firewall.provider === firewall.provider ? 'ACTIVE: ' + firewall.label + (firewall.target ? ' — ' + firewall.target : '') + (firewall.error ? '  (' + firewall.error + ')' : '') : 'Not saved yet: bans still go to ' + firewall.label + ' until you SAVE FIREWALL.'"></div>
+
+              <div x-show="form.firewall.provider === 'windows'">
+                <div class="hint">Each approved ban runs <code>netsh advfirewall firewall add rule name="SENTINEL BAN: &lt;ip&gt;" dir=in action=block</code>
+                  on the attacked IIS server over its WinRM connection (configured under SERVERS). Bans are per server.</div>
+              </div>
+
+              <div x-show="form.firewall.provider === 'pfsense'">
+                <div class="form-grid">
+                  <div class="field"><label>Platform</label>
+                    <select class="input" x-model="form.firewall.pfsense_platform">
+                      <option value="opnsense">OPNsense (built-in API)</option>
+                      <option value="pfsense">pfSense (REST API package v2)</option>
+                    </select></div>
+                  <div class="field"><label>Management URL</label><input class="input" x-model="form.firewall.pfsense_url" placeholder="https://10.0.0.1"></div>
+                  <div class="field"><label x-text="form.firewall.pfsense_platform === 'opnsense' ? 'API key' : 'REST API key'"></label><input class="input" type="password" autocomplete="new-password" x-model="form.firewall.pfsense_api_key"></div>
+                  <div class="field" x-show="form.firewall.pfsense_platform === 'opnsense'"><label>API secret</label><input class="input" type="password" autocomplete="new-password" x-model="form.firewall.pfsense_api_secret"></div>
+                  <div class="field"><label>Alias (Host type)</label><input class="input" x-model="form.firewall.pfsense_alias" placeholder="SENTINEL_BANS"></div>
+                </div>
+                <label class="check"><input type="checkbox" x-model="form.firewall.pfsense_verify_ssl"> Verify the firewall's HTTPS certificate</label>
+                <div class="hint" x-show="form.firewall.pfsense_platform === 'opnsense'"><b>One-time setup:</b> Firewall › Aliases: add a <b>Host(s)</b> alias named as above (it may start empty).
+                  Firewall › Rules › WAN: add a <b>Block</b> rule with that alias as source, at the top. System › Access › Users: create an API key for a user
+                  with the "Firewall: Alias: Edit" and "Firewall: Aliases" privileges.</div>
+                <div class="hint" x-show="form.firewall.pfsense_platform === 'pfsense'"><b>One-time setup:</b> install the <b>pfSense-pkg-RESTAPI</b> package (v2) and create an API key
+                  (System › REST API › Keys). Firewall › Aliases: add a <b>Host(s)</b> alias named as above. Firewall › Rules › WAN: add a <b>Block</b> rule with that alias as source, at the top.
+                  Sentinel adds the IP to the alias and applies the change.</div>
+              </div>
+
+              <div x-show="form.firewall.provider === 'sonicwall'">
+                <div class="form-grid">
+                  <div class="field"><label>Management URL</label><input class="input" x-model="form.firewall.sonicwall_url" placeholder="https://10.0.0.1"></div>
+                  <div class="field"><label>Address group</label><input class="input" x-model="form.firewall.sonicwall_group" placeholder="SENTINEL_BANS"></div>
+                  <div class="field"><label>Admin username</label><input class="input" x-model="form.firewall.sonicwall_username" autocomplete="off"></div>
+                  <div class="field"><label>Admin password</label><input class="input" type="password" autocomplete="new-password" x-model="form.firewall.sonicwall_password"></div>
+                  <div class="field"><label>Zone for ban objects</label><input class="input" x-model="form.firewall.sonicwall_zone" placeholder="WAN"></div>
+                </div>
+                <label class="check"><input type="checkbox" x-model="form.firewall.sonicwall_verify_ssl"> Verify the firewall's HTTPS certificate</label>
+                <div class="hint"><b>One-time setup (SonicOS 7):</b> Device › Settings › Administration: enable the <b>SonicOS API</b> and
+                  <b>RFC-2617 HTTP Basic Access authentication</b>. Object › Address Groups: create the group above. Policy › Rules › Access Rules:
+                  add a <b>Deny</b> rule WAN → any with that group as source. Each ban creates an address object <code>SENTINEL_&lt;ip&gt;</code>, adds it to the group and commits.</div>
+              </div>
+
+              <div x-show="form.firewall.provider === 'paloalto'">
+                <div class="form-grid">
+                  <div class="field"><label>Management URL</label><input class="input" x-model="form.firewall.paloalto_url" placeholder="https://10.0.0.1"></div>
+                  <div class="field"><label>API key (or use username + password)</label><input class="input" type="password" autocomplete="new-password" x-model="form.firewall.paloalto_api_key"></div>
+                  <div class="field"><label>Username (if no API key)</label><input class="input" x-model="form.firewall.paloalto_username" autocomplete="off"></div>
+                  <div class="field"><label>Password</label><input class="input" type="password" autocomplete="new-password" x-model="form.firewall.paloalto_password"></div>
+                  <div class="field"><label>Tag</label><input class="input" x-model="form.firewall.paloalto_tag" placeholder="sentinel-ban"></div>
+                  <div class="field"><label>Virtual system</label><input class="input" x-model="form.firewall.paloalto_vsys" placeholder="vsys1"></div>
+                  <div class="field"><label>Auto-expire bans after (min, 0 = never)</label><input class="input" type="number" min="0" x-model.number="form.firewall.paloalto_timeout_minutes"></div>
+                </div>
+                <label class="check"><input type="checkbox" x-model="form.firewall.paloalto_verify_ssl"> Verify the firewall's HTTPS certificate</label>
+                <div class="hint"><b>One-time setup:</b> Objects › Tags: create the tag. Objects › Address Groups: add a <b>Dynamic</b> group whose match is
+                  <code>'sentinel-ban'</code> (your tag). Policies › Security: add a <b>Deny</b> rule from the untrust zone with that group as source, then commit once.
+                  Sentinel registers banned IPs with the tag through the User-ID XML API, so bans apply within seconds with no further commits.
+                  The admin role needs XML API › User-ID Agent (and Operational Requests for TEST).</div>
+              </div>
+
+              <div class="form-grid" x-show="form.firewall.provider !== 'windows'" style="margin-top:10px">
+                <div class="field"><label>API timeout (s)</label><input class="input" type="number" min="3" max="120" x-model.number="form.firewall.timeout"></div>
+              </div>
+              <div class="hint" x-show="form.firewall.provider !== 'windows'">Perimeter bans block the address for every server, so one approval clears that attacker's pending threats on all servers.
+                Sentinel only adds and removes addresses; it never edits your rules. LIFT on the BANS tab removes the address again.</div>
+              <button class="btn small" style="margin-top:10px" @click="testFirewall()" :disabled="busy" x-text="form.firewall.provider === 'windows' ? 'SAVE' : 'SAVE & TEST CONNECTION'"></button>
+            </div>
+            </template>
+          </div>
+
           <!-- AD -->
           <div x-show="cfgTab === 'ad'">
             <div class="form-grid">
@@ -647,6 +731,12 @@
               <div class="field"><label>Active threat score</label><input class="input" type="number" x-model.number="form.watchers.threat_score_threshold"></div>
               <div class="field"><label>Score half-life (min)</label><input class="input" type="number" x-model.number="form.watchers.threat_half_life_minutes"></div>
               <div class="field"><label>Retention (days)</label><input class="input" type="number" x-model.number="form.watchers.retention_days"></div>
+            </div>
+            <label class="check"><input type="checkbox" x-model="form.watchers.geoip_auto_download"> Download the free DB-IP City Lite GeoIP database and refresh it monthly (threat matrix locations)</label>
+            <div class="small muted" style="margin:-8px 0 12px 23px" x-show="geoStatus">
+              <span x-text="geoStatusText()"></span>
+              <div class="neon-amber" x-show="geoStatus && geoStatus.error" x-text="geoStatus && geoStatus.error"></div>
+              <div>Or drop a MaxMind GeoLite2-City.mmdb into the <code>geoip</code> folder of the data directory; it takes precedence. IP geolocation by <a href="https://db-ip.com" target="_blank" rel="noopener" style="color:inherit">DB-IP</a> (CC BY 4.0).</div>
             </div>
             <div class="section-label"><span>WATCHER STATUS</span></div>
             <template x-for="w in watcherStatus" :key="w.server_id + '|' + w.directory">
@@ -816,11 +906,11 @@
           <a :href="'https://bgp.he.net/ip/' + encodeURIComponent(whois.ip)" target="_blank" rel="noopener noreferrer">BGP.HE.NET ↗</a>
           <a :href="'https://search.arin.net/rdap/?query=' + encodeURIComponent(whois.ip)" target="_blank" rel="noopener noreferrer">ARIN ↗</a>
           <span class="grow" style="flex:1"></span>
-          <select class="input" style="width:auto" x-model="whois.banServer" aria-label="Server to ban on">
+          <select class="input" style="width:auto" x-model="whois.banServer" x-show="!firewall.perimeter" aria-label="Server to ban on">
             <template x-for="s in enabledServers()" :key="s.id"><option :value="String(s.id)" x-text="s.server_name" :disabled="whoisBanned(s.id)"></option></template>
           </select>
           <button class="btn small danger" @click="whoisBan()" :disabled="whois.banBusy || !whois.banServer || whoisBanned(Number(whois.banServer))"
-                  x-text="whois.banBusy ? 'EXECUTING…' : (whoisBanned(Number(whois.banServer)) ? 'ALREADY BANNED' : 'BAN ON SERVER')"></button>
+                  x-text="whois.banBusy ? 'EXECUTING…' : (whoisBanned(Number(whois.banServer)) ? 'ALREADY BANNED' : (firewall.perimeter ? 'BLOCK ON ' + firewall.label.toUpperCase() : 'BAN ON SERVER'))"></button>
         </div>
       </div>
       </template>
