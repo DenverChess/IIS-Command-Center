@@ -289,14 +289,24 @@ class SonicWall:
                 members = self._members(group)
                 if name not in members:
                     self._write_members(s, group, members + [name], "add to group")
-                after = self._members(self._group(self._check_group(s)))
-                if name not in after:
-                    raise FirewallError(f"{name} was created but the SonicWall did not keep it in group {self.group}")
-                lost = [m for m in members if m not in after]
-                if lost:
-                    log.error("SonicWall group %s lost members while adding %s: %s", self.group, name, lost)
+                # Reads return the committed config, so verify only after the commit; a mismatch is reported,
+                # never allowed to discard the pending change.
                 self._call(s, "POST", "/config/pending", "commit")
-                return f"address object {name} added to SonicWall group {self.group} ({len(after)} member(s)) and committed"
+                note = ""
+                try:
+                    after = self._members(self._group(self._check_group(s)))
+                except FirewallError as exc:
+                    after, note = [], f" (could not re-read the group to verify: {exc})"
+                if after:
+                    lost = [m for m in members if m not in after]
+                    if name not in after:
+                        note = f" — WARNING: the committed group does not list {name}; check {self.group} on the SonicWall"
+                        log.error("SonicWall group %s does not list %s after commit", self.group, name)
+                    elif lost:
+                        note = f" — WARNING: {len(lost)} earlier member(s) missing from {self.group}: {', '.join(lost[:5])}"
+                        log.error("SonicWall group %s lost members while adding %s: %s", self.group, name, lost)
+                count = f" ({len(after)} member(s))" if after else ""
+                return f"address object {name} added to SonicWall group {self.group}{count} and committed{note}"
 
         return self._run(op)
 
