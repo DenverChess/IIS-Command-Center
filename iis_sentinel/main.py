@@ -25,9 +25,11 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
-from sqlalchemy import and_, desc, insert, select, update
+from sqlalchemy import and_, desc, func, insert, select, update
 
 from ad_auth import ADAuthenticator
+from alert_catalog import ANOMALY_EVENTS, SIGNATURE_EVENTS
+from alert_catalog import catalog as alert_catalog
 from baseliner import Baseliner
 from database import (
     BASE_DIR,
@@ -50,8 +52,10 @@ from database import (
     utcnow,
 )
 from events import AlertManager, Hub
+from http_monitor import HttpMonitor
 from log_tailer import LogTailer, run_demo_fleet
-from mailer import Mailer
+from whois_lookup import WhoisClient
+from mailer import Mailer, render_alert_html
 from remote_manager import RemoteError, RemoteManager, validate_ban_ip
 from reporter import Reporter
 from system_health import HealthMonitor
@@ -166,12 +170,15 @@ class Pipeline:
     MAX_BUFFER = 50000
 
     def __init__(self, queue: asyncio.Queue[dict[str, Any]], threats: ThreatEngine, baseliner: Baseliner,
-                 alerts: AlertManager, hub: Hub) -> None:
+                 alerts: AlertManager, hub: Hub, http: HttpMonitor,
+                 site_name: Callable[[int, str], str] = lambda _sid, _site: "") -> None:
         self.queue = queue
         self.threats = threats
         self.baseliner = baseliner
         self.alerts = alerts
         self.hub = hub
+        self.http = http
+        self.site_name = site_name
         self.recent: deque[dict[str, Any]] = deque(maxlen=300)
         self._db_buffer: list[dict[str, Any]] = []
         self._ws_buffer: list[dict[str, Any]] = []
@@ -206,6 +213,7 @@ class Pipeline:
             "server_id": entry.get("server_id", LOCAL_SERVER_ID),
             "server": entry.get("server_name", ""),
             "site": entry.get("site", ""),
+            "site_name": entry.get("site_name", ""),
             "ip": entry.get("c_ip", ""),
             "method": entry.get("cs_method", ""),
             "uri": entry.get("cs_uri_stem", ""),
@@ -220,7 +228,7 @@ class Pipeline:
             "level": level,
         }
 
-    async def _handle_events(self, events: list[dict[str, Any]]) -> None:
+    async def _handle_events(self, events: list[dict[str, Any]], occurred_at: Any = None) -> None:
         for ev in events:
             kind = ev["kind"]
             ip = ev.get("ip")
@@ -232,6 +240,7 @@ class Pipeline:
                     f"Request matched {tags} signature(s) (HTTP {ev.get('status')}).",
                     source_ip=ip, details={"payload": ev["payload"], "tags": ev["tags"]},
                     dedup_key=f"sig:{sid}:{ip}:{tags}", cooldown=600, server_id=sid,
+                    event=[SIGNATURE_EVENTS[t] for t in ev["tags"] if t in SIGNATURE_EVENTS], occurred_at=occurred_at,
                 )
             elif kind == "spike":
                 await self.alerts.raise_alert(
@@ -239,6 +248,7 @@ class Pipeline:
                     f"{ev['count']} {ev['spike']} responses within {int(ev['window'])}s.",
                     source_ip=ip, details={"count": ev["count"], "window_seconds": ev["window"]},
                     dedup_key=f"spike:{sid}:{ip}:{ev['spike']}", cooldown=300, server_id=sid,
+                    event="spike_404" if ev["spike"] == "404" else "spike_auth", occurred_at=occurred_at,
                 )
             elif kind == "active_threat":
                 st = ev["state"]
@@ -250,13 +260,58 @@ class Pipeline:
                     source_ip=ip,
                     details={"score": st["score"], "geo": st["geo"], "tags": st["tags"], "last_payload": st["last_payload"],
                              "requests": st["requests"]},
-                    dedup_key=f"active:{sid}:{ip}", cooldown=1800, server_id=sid,
+                    dedup_key=f"active:{sid}:{ip}", cooldown=1800, server_id=sid, event="active_threat",
+                    occurred_at=occurred_at,
                 )
             elif kind == "threat_cleared":
                 await self.alerts.raise_alert(
                     "INFO", "recovery", f"Threat cleared: {ip}", "Threat score decayed below the threshold.",
                     details={"ip": ip}, dedup_key=f"cleared:{sid}:{ip}", cooldown=1800, server_id=sid,
+                    event="threat_cleared",
                 )
+
+    async def _handle_http(self, ev: dict[str, Any]) -> None:
+        sid = ev["server_id"]
+        where = f"{ev['site_name']} ({ev['site']})" if ev["site_name"] else (ev["site"] or "site")
+        kind = ev["kind"]
+        common = {"site": ev["site"], "site_name": ev["site_name"], "log_time": iso(ev["ts"]) if ev["ts"] else None}
+        if kind == "http_error":
+            repeats = f" {ev['repeats']} more since the last alert." if ev["repeats"] else ""
+            await self.alerts.raise_alert(
+                "WARNING", "http", f"HTTP {ev['status']} on {where}: {ev['uri'][:120]}",
+                f"{ev['method']} {ev['uri']}{('?' + ev['query']) if ev['query'] else ''} returned {ev['status']}."
+                f"{ev['substatus']} (win32 {ev['win32']}) to {ev['ip']} in {ev['time_taken']} ms.{repeats} "
+                f"Further {ev['status']}s on this URL are rolled up for {ev['cooldown_minutes']:.0f} min.",
+                details={**common, "status": ev["status"], "substatus": ev["substatus"], "win32_status": ev["win32"],
+                         "uri": ev["uri"], "client_ip": ev["ip"], "time_taken_ms": ev["time_taken"], "repeats": ev["repeats"]},
+                server_id=sid, event="http_5xx", occurred_at=ev["ts"],
+            )
+        elif kind == "http_error_burst":
+            codes = ", ".join(f"{k}x{v}" for k, v in ev["statuses"].items())
+            await self.alerts.raise_alert(
+                "HIGH", "http", f"Server error burst on {where}: {ev['count']} errors in {ev['window_minutes']:.0f} min",
+                f"{ev['count']} error responses ({codes}) within {ev['window_minutes']:.0f} minutes. "
+                f"Most affected: {', '.join(ev['top_uris'])}.",
+                details={**common, "count": ev["count"], "statuses": ev["statuses"], "top_uris": ev["top_uris"]},
+                server_id=sid, event="http_5xx_burst", occurred_at=ev["ts"],
+            )
+        elif kind == "status_watch":
+            repeats = f" {ev['repeats']} more since the last alert." if ev["repeats"] else ""
+            await self.alerts.raise_alert(
+                "WARNING", "http", f"HTTP {ev['status']} on {where}: {ev['uri'][:120]}",
+                f"{ev['method']} {ev['uri']} returned watched status {ev['status']}.{ev['substatus']} to {ev['ip']}.{repeats}",
+                details={**common, "status": ev["status"], "uri": ev["uri"], "client_ip": ev["ip"], "repeats": ev["repeats"]},
+                server_id=sid, event="http_status_watch", occurred_at=ev["ts"],
+            )
+        elif kind == "slow":
+            worst = ", ".join(f"{w['uri']} ({w['ms'] / 1000:.1f}s)" for w in ev["worst"][:3])
+            await self.alerts.raise_alert(
+                "WARNING", "http", f"Slow responses on {where}: {ev['count']} over {ev['threshold_ms'] / 1000:.1f}s",
+                f"{ev['count']} requests took longer than {ev['threshold_ms']} ms within {ev['window_minutes']:.0f} minutes "
+                f"(average {ev['avg_ms']} ms). Slowest: {worst}.",
+                details={**common, "count": ev["count"], "avg_ms": ev["avg_ms"], "worst": ev["worst"]},
+                server_id=sid, event="slow_response", occurred_at=ev["ts"],
+            )
 
     async def _handle_anomalies(self, anomalies: list[dict[str, Any]], entry: dict[str, Any] | None) -> None:
         labels = {
@@ -264,6 +319,7 @@ class Pipeline:
             "global_rpm": "Server-wide request volume", "global_bpm": "Server-wide bandwidth",
             "global_rpm_drop": "Server-wide traffic DROP",
         }
+        occurred_at = entry.get("ts") if entry is not None else None
         for a in anomalies:
             metric, ip = a["metric"], a.get("ip")
             sid = int(a.get("server_id") or LOCAL_SERVER_ID)
@@ -273,20 +329,25 @@ class Pipeline:
                     entry["threat_score"] = int(entry.get("threat_score") or 0) + delta
                     tag = "ZSCORE"
                     entry["threat_tags"] = ",".join(t for t in (entry.get("threat_tags") or "").split(",") + [tag] if t)
-                await self._handle_events(events)
+                await self._handle_events(events, occurred_at)
             unit = {"rpm": "req/min", "bpm": "bytes/min", "time_taken": "ms"}.get(metric.replace("global_", "").replace("_drop", ""), "")
             await self.alerts.raise_alert(
                 "WARNING", "anomaly",
                 f"{labels.get(metric, metric)} anomaly{f' from {ip}' if ip else ''} (z={a['z']:+.1f})",
                 f"Observed {a['value']:,.0f} {unit} vs baseline mean {a['mean']:,.1f} (std {a['std']:,.1f}, basis: {a['basis']}).",
                 source_ip=ip, details=a, dedup_key=f"anomaly:{sid}:{metric}:{ip or '*'}", cooldown=600, server_id=sid,
+                event=ANOMALY_EVENTS.get(metric, "anomaly_server"), occurred_at=occurred_at,
             )
 
     async def _process(self, entry: dict[str, Any]) -> None:
+        sid = int(entry.get("server_id") or LOCAL_SERVER_ID)
+        entry["site_name"] = self.site_name(sid, entry.get("site") or "")
         result = self.threats.inspect(entry)
         entry["threat_tags"] = ",".join(result.tags)
         entry["threat_score"] = result.delta
-        await self._handle_events(result.events)
+        await self._handle_events(result.events, entry.get("ts"))
+        for ev in self.http.observe(entry):
+            await self._handle_http(ev)
         await self._handle_anomalies(self.baseliner.observe(entry), entry)
         self._seq += 1
         view = self._view(entry, self._seq)
@@ -385,6 +446,8 @@ class State:
     health: HealthMonitor
     tailer: LogTailer
     pipeline: Pipeline
+    http: HttpMonitor
+    whois: WhoisClient
     reporter: Reporter
     signer: SessionSigner
     throttle: LoginThrottle
@@ -444,6 +507,7 @@ def _on_servers_changed() -> None:
     for sid in S.threats.server_ids() - known:
         S.threats.forget_server(sid)
         S.baseliner.forget_server(sid)
+        S.http.forget_server(sid)
     S.hub.broadcast({"type": "servers", "data": _servers_payload()})
 
 
@@ -463,14 +527,29 @@ async def _log_feed_status(server_id: int, component: str, ok: bool, error: str 
         return
     if ok:
         await S.alerts.raise_alert("INFO", "recovery", "Log feed restored", "Sentinel is reading this server's IIS logs again.",
-                                   server_id=server_id, dedup_key=f"{server_id}:logs:up", cooldown=60)
+                                   server_id=server_id, dedup_key=f"{server_id}:logs:up", cooldown=60, event="log_feed_restored")
     else:
         await S.alerts.raise_alert(
             "HIGH", "system", "Log feed offline",
             f"Cannot read IIS logs: {error}. Attacks against this server are not being detected until the feed "
             "recovers. Monitoring of the other servers continues.",
             details={"error": error}, server_id=server_id, dedup_key=f"{server_id}:logs:down", cooldown=1800,
+            event="log_feed_offline",
         )
+
+
+async def _sites_discovered(server_id: int, folders: list[str]) -> None:
+    names = [f"{n} ({f})" if (n := S.health.site_name(server_id, f)) else f for f in folders]
+    await S.alerts.raise_alert(
+        "INFO", "system", f"Now tailing {len(folders)} new site log folder(s)",
+        f"New IIS site log folder(s) appeared and are now monitored: {', '.join(names)}.",
+        details={"folders": folders}, server_id=server_id, event="site_discovered",
+    )
+
+
+async def _report_failed(kind: str, error: str) -> None:
+    await S.alerts.raise_alert("WARNING", "system", f"Scheduled {kind} report failed", error,
+                               details={"kind": kind, "error": error}, event="report_failed")
 
 
 @asynccontextmanager
@@ -491,10 +570,13 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     S.baseliner = Baseliner(S.config)
     S.health = HealthMonitor(S.config, S.alerts, S.hub, S.registry, S.remote)
     queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=50000)
-    S.tailer = LogTailer(S.config, S.registry, S.remote, queue, on_status=_log_feed_status)
+    S.tailer = LogTailer(S.config, S.registry, S.remote, queue, on_status=_log_feed_status, on_sites=_sites_discovered)
     S.ban_locks = defaultdict(asyncio.Lock)
-    S.pipeline = Pipeline(queue, S.threats, S.baseliner, S.alerts, S.hub)
+    S.http = HttpMonitor(S.config)
+    S.whois = WhoisClient()
+    S.pipeline = Pipeline(queue, S.threats, S.baseliner, S.alerts, S.hub, S.http, S.health.site_name)
     S.reporter = Reporter(S.config, S.mailer)
+    S.reporter.on_failure = _report_failed
     S.signer = SessionSigner(await get_or_create_session_secret(), SESSION_TTL)
     S.throttle = LoginThrottle(max_failures=5, window=300)
     S.ip_throttle = LoginThrottle(max_failures=20, window=300)
@@ -525,6 +607,14 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     S.tasks = [asyncio.create_task(supervise(name, fn), name=name) for name, fn in jobs.items()]
     log.info("IIS Sentinel SOC online%s. Monitoring %d server(s): %s", " [DEMO MODE]" if DEMO_MODE else "",
              len(S.registry.all()), ", ".join(srv["server_name"] for srv in S.registry.all()) or "none (add one under CONFIG > SERVERS)")
+    try:
+        await S.alerts.raise_alert(
+            "INFO", "system", "IIS Sentinel started",
+            f"Sentinel {app.version} started and is monitoring {len(S.registry.all())} server(s).",
+            details={"servers": [srv["server_name"] for srv in S.registry.all()]}, event="sentinel_started",
+        )
+    except Exception:  # noqa: BLE001
+        log.exception("Startup alert failed")
     try:
         yield
     finally:
@@ -599,6 +689,11 @@ def _same_origin(origin: str | None, host: str | None) -> bool:
         return False
 
 
+def same_origin_guard(request: Request) -> None:
+    if not _same_origin(request.headers.get("origin"), request.headers.get("host")):
+        raise HTTPException(status_code=403, detail="Cross-origin request refused")
+
+
 class LoginBody(BaseModel):
     username: str = Field(min_length=1, max_length=256)
     password: str = Field(min_length=1, max_length=512)
@@ -647,11 +742,26 @@ async def login(body: LoginBody, request: Request) -> Response:
     wait = max(S.throttle.blocked(key), S.ip_throttle.blocked(ip_key))
     if wait:
         raise HTTPException(status_code=429, detail=f"Too many failed attempts. Retry in {wait}s")
+    user_label = body.username.strip()[:64]
     result = await S.auth.authenticate(body.username, body.password)
     if not result.ok:
         S.throttle.fail(key)
         S.ip_throttle.fail(ip_key)
         log.warning("Failed login for '%s' from %s: %s", body.username, _client_ip(request), result.error)
+        await S.alerts.raise_alert(
+            "INFO", "access", f"Failed sign-in for '{user_label}' from {ip_key}", result.error or "Authentication failed",
+            details={"username": user_label, "client_ip": ip_key}, event="login_failed",
+            dedup_key=f"loginfail:{key}", cooldown=60, actionable=False,
+        )
+        locked = max(S.throttle.blocked(key), S.ip_throttle.blocked(ip_key))
+        if locked:
+            await S.alerts.raise_alert(
+                "WARNING", "access", f"Sign-in lockout: '{user_label}' from {ip_key}",
+                f"Too many failed sign-ins; further attempts from {ip_key} are refused for {locked}s. "
+                "If this was not an operator, someone may be guessing dashboard passwords.",
+                details={"username": user_label, "client_ip": ip_key, "lockout_seconds": locked},
+                event="login_lockout", dedup_key=f"lockout:{key}", cooldown=300, actionable=False,
+            )
         await asyncio.sleep(0.5)
         status = 503 if "unreachable" in result.error.lower() or "not configured" in result.error.lower() else 401
         raise HTTPException(status_code=status, detail=result.error or "Authentication failed")
@@ -660,6 +770,18 @@ async def login(body: LoginBody, request: Request) -> Response:
     resp = JSONResponse({"ok": True, "user": result.username, "display_name": result.display_name, "source": result.source})
     resp.set_cookie(COOKIE_NAME, token, max_age=SESSION_TTL, httponly=True, secure=COOKIE_SECURE, samesite="strict", path="/")
     log.info("Login: %s (%s) from %s", result.username, result.source, _client_ip(request))
+    if result.source == "local":
+        await S.alerts.raise_alert(
+            "HIGH", "access", f"Break-glass login by '{result.username}' from {ip_key}",
+            "The local emergency account was used to sign in. This is expected only while Active Directory is "
+            "unreachable or not yet configured.", details={"username": result.username, "client_ip": ip_key},
+            event="breakglass_login", actionable=False,
+        )
+    else:
+        await S.alerts.raise_alert(
+            "INFO", "access", f"{result.username} signed in from {ip_key}", f"Signed in as {result.display_name} ({result.source}).",
+            details={"username": result.username, "client_ip": ip_key}, event="login_success", actionable=False,
+        )
     return resp
 
 
@@ -698,16 +820,25 @@ async def post_config(request: Request, user: dict[str, Any] = Depends(current_u
     except (json.JSONDecodeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="Body must be JSON") from exc
     if not isinstance(payload, dict) or not payload:
-        raise HTTPException(status_code=400, detail="Expected an object keyed by section (ad, exchange, watchers, reports)")
+        raise HTTPException(status_code=400, detail="Expected an object keyed by section (ad, exchange, watchers, reports, alerts)")
     errors: dict[str, str] = {}
+    changed: dict[str, list[str]] = {}
     for section, values in payload.items():
         try:
-            await S.config.update(section, values)
+            before = S.config.public_view().get(section, {})
+            after = await S.config.update(section, values)
+            keys = [k for k in after if after.get(k) != before.get(k)]
+            if keys:
+                changed[section] = keys
         except ValueError as exc:
             errors[section] = str(exc)
     if errors:
         raise HTTPException(status_code=400, detail=errors)
     log.info("Config updated by %s: %s", user["u"], ", ".join(payload))
+    if changed:
+        summary = "; ".join(f"{sec}: {', '.join(keys[:8])}{' ...' if len(keys) > 8 else ''}" for sec, keys in changed.items())
+        await S.alerts.raise_alert("INFO", "config", f"Configuration changed by {user['u']}", summary,
+                                   details={"changed": changed, "user": user["u"]}, event="config_changed")
     return await get_config(user)
 
 
@@ -760,9 +891,23 @@ async def threat_ip(ip: str, server_id: int | None = None, _user: dict[str, Any]
     return {
         "state": detail,
         "recent": [{"ts": iso(r.ts), "server_id": r.server_id, "server_name": S.registry.name(r.server_id),
+                    "site": r.site, "site_name": S.health.site_name(r.server_id, r.site),
                     "method": r.cs_method, "uri": r.cs_uri_stem, "query": r.cs_uri_query[:300],
-                    "status": r.sc_status, "tags": r.threat_tags} for r in rows],
+                    "status": r.sc_status, "tags": r.threat_tags, "ua": r.user_agent[:200]} for r in rows],
     }
+
+
+@app.get("/threats/whois/{ip}")
+async def threat_whois(ip: str, refresh: bool = False, _user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    try:
+        result = await S.whois.lookup(ip, refresh=refresh)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"'{ip[:64]}' is not a valid IP address") from exc
+    async with SessionLocal() as s:
+        bans = (await s.execute(select(BannedIP).where(BannedIP.ip_address == result["ip"], BannedIP.active.is_(True)))).scalars().all()
+        alert_count = (await s.execute(
+            select(func.count(ActionableAlert.id)).where(ActionableAlert.source_ip == result["ip"]))).scalar_one()
+    return {"whois": result, "bans": [_ban_dict(b) for b in bans], "alert_count": alert_count}
 
 
 @app.get("/system/health")
@@ -804,7 +949,7 @@ def _alert_dict(a: ActionableAlert) -> dict[str, Any]:
         details = {}
     return {
         "id": a.id, "ts": iso(a.ts), "server_id": a.server_id, "server_name": S.registry.name(a.server_id),
-        "status": a.status, "severity": a.severity, "category": a.category, "title": a.title,
+        "status": a.status, "severity": a.severity, "category": a.category, "event": a.event or "", "title": a.title,
         "message": a.message, "source_ip": a.source_ip, "details": details, "acknowledged": a.acknowledged, "emailed": a.emailed,
     }
 
@@ -824,6 +969,41 @@ async def list_alerts(limit: int = 100, severity: str | None = None, server_id: 
     return {"alerts": [_alert_dict(a) for a in rows]}
 
 
+class AlertTestBody(BaseModel):
+    desktop: bool = True
+    email: bool = True
+    severity: Literal["INFO", "WARNING", "HIGH", "CRITICAL"] = "HIGH"
+
+
+@app.get("/alerts/catalog")
+async def alerts_catalog(_user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    exch = S.config.value
+    return {**alert_catalog(), "exchange": {"enabled": bool(exch("exchange", "enabled", False)),
+                                            "recipients": S.alerts.recipients(), "mailer": S.mailer.status()}}
+
+
+@app.post("/alerts/test", dependencies=[Depends(same_origin_guard)])
+async def alerts_test(body: AlertTestBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    record = await S.alerts.raise_alert(
+        body.severity, "test", f"Test notification from {user['u']}",
+        "If you can see this, Sentinel notifications reach you. Choose which events notify you in CONFIG > ALERTS.",
+        details={"requested_by": user["u"]}, event="test", actionable=False,
+        notify={"desktop": body.desktop, "email": False},
+    )
+    out: dict[str, Any] = {"ok": True, "alert": record, "email": None}
+    if body.email:
+        if not S.config.value("exchange", "enabled", False):
+            out["email"] = {"ok": False, "error": "Exchange delivery is disabled (CONFIG > EXCHANGE)"}
+        elif not S.alerts.recipients():
+            out["email"] = {"ok": False, "error": "No alert recipients configured"}
+        else:
+            ok, err = await S.mailer.send(f"[IIS Sentinel][{body.severity}] Test notification",
+                                          render_alert_html(record or {}), recipients=S.alerts.recipients(),
+                                          retries=1, bypass_circuit=True)
+            out["email"] = {"ok": ok, "error": err, "recipients": S.alerts.recipients()}
+    return out
+
+
 @app.post("/alerts/{alert_id}/ack")
 async def ack_alert(alert_id: int, _user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
     async def _op(s):  # type: ignore[no-untyped-def]
@@ -839,11 +1019,6 @@ async def ack_alert(alert_id: int, _user: dict[str, Any] = Depends(current_user)
 # --------------------------------------------------------------------------------------
 # Monitored servers API
 # --------------------------------------------------------------------------------------
-def same_origin_guard(request: Request) -> None:
-    if not _same_origin(request.headers.get("origin"), request.headers.get("host")):
-        raise HTTPException(status_code=403, detail="Cross-origin request refused")
-
-
 class ServerBody(BaseModel):
     model_config = {"extra": "forbid"}
 
@@ -852,6 +1027,8 @@ class ServerBody(BaseModel):
     winrm_username: str = Field(default="", max_length=256)
     winrm_password: str = Field(default="", max_length=512)
     log_unc_path: str = Field(default="", max_length=1024)
+    log_start_mode: Literal["end", "tail", "full"] = "end"
+    log_tail_lines: int = Field(default=1000, ge=1, le=1_000_000)
     winrm_transport: Literal["ntlm", "kerberos", "credssp", "basic"] = "ntlm"
     winrm_port: int | None = Field(default=None, ge=1, le=65535)
     winrm_use_ssl: bool = False
@@ -867,6 +1044,8 @@ class ServerPatch(BaseModel):
     winrm_username: str | None = Field(default=None, max_length=256)
     winrm_password: str | None = Field(default=None, max_length=512)
     log_unc_path: str | None = Field(default=None, max_length=1024)
+    log_start_mode: Literal["end", "tail", "full"] | None = None
+    log_tail_lines: int | None = Field(default=None, ge=1, le=1_000_000)
     winrm_transport: Literal["ntlm", "kerberos", "credssp", "basic"] | None = None
     winrm_port: int | None = Field(default=None, ge=1, le=65535)
     winrm_use_ssl: bool | None = None
@@ -886,11 +1065,16 @@ async def add_server(body: ServerBody, user: dict[str, Any] = Depends(current_us
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     log.info("Server %s (%s) added by %s", server["server_name"], server["ip_address"], user["u"])
+    await S.alerts.raise_alert("INFO", "config", f"Server {server['server_name']} added by {user['u']}",
+                               f"{server['server_name']} ({server['ip_address']}) is now monitored. Logs: {server['log_unc_path'] or 'not configured'}.",
+                               details={"user": user["u"], "ip_address": server["ip_address"]}, server_id=server["id"],
+                               event="server_config_changed")
     return {"server": server}
 
 
 @app.put("/servers/{server_id}", dependencies=[Depends(same_origin_guard)])
 async def update_server(server_id: int, body: ServerPatch, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    before = S.registry.get(server_id)
     try:
         server = await S.registry.update(server_id, body.model_dump(exclude_none=True))
     except KeyError as exc:
@@ -898,6 +1082,12 @@ async def update_server(server_id: int, body: ServerPatch, user: dict[str, Any] 
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     log.info("Server %s updated by %s", server["server_name"], user["u"])
+    after = S.registry.get(server_id) or {}
+    changed = sorted(k for k in after if k not in ("status",) and before and after.get(k) != before.get(k))
+    if changed:
+        await S.alerts.raise_alert("INFO", "config", f"Server {server['server_name']} edited by {user['u']}",
+                                   f"Changed: {', '.join(changed)}.", details={"user": user["u"], "changed": changed},
+                                   server_id=server_id, event="server_config_changed")
     return {"server": server}
 
 
@@ -911,6 +1101,9 @@ async def delete_server(server_id: int, user: dict[str, Any] = Depends(current_u
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="Server not found") from exc
     log.info("Server %s removed by %s", name, user["u"])
+    await S.alerts.raise_alert("INFO", "config", f"Server {name} removed by {user['u']}",
+                               f"{name} is no longer monitored.", details={"user": user["u"], "server": name},
+                               event="server_config_changed")
     return {"ok": True}
 
 
@@ -988,17 +1181,26 @@ async def defense_ban(body: BanBody, user: dict[str, Any] = Depends(current_user
     async with S.ban_locks[(server_id, ip)]:
         log.warning("BAN requested by %s: %s on %s (alert %s)", user["u"], ip, server["server_name"], body.alert_id)
         try:
-            ok, output = await S.remote.ban(server_id, ip)
-        except asyncio.TimeoutError as exc:
-            raise HTTPException(status_code=504, detail=f"{server['server_name']} did not respond to WinRM in time") from exc
-        except (RemoteError, ValueError) as exc:
-            raise HTTPException(status_code=502, detail=f"Ban failed on {server['server_name']}: {exc}") from exc
-        except Exception as exc:  # noqa: BLE001
-            log.exception("Ban of %s on %s failed", ip, server["server_name"])
-            raise HTTPException(status_code=502, detail=f"Ban failed on {server['server_name']}: {type(exc).__name__}: {exc}") from exc
-        if not ok:
-            log.error("netsh on %s refused ban of %s: %s", server["server_name"], ip, output)
-            raise HTTPException(status_code=502, detail=f"netsh on {server['server_name']} failed: {output[:400]}")
+            try:
+                ok, output = await S.remote.ban(server_id, ip)
+            except asyncio.TimeoutError as exc:
+                raise HTTPException(status_code=504, detail=f"{server['server_name']} did not respond to WinRM in time") from exc
+            except (RemoteError, ValueError) as exc:
+                raise HTTPException(status_code=502, detail=f"Ban failed on {server['server_name']}: {exc}") from exc
+            except Exception as exc:  # noqa: BLE001
+                log.exception("Ban of %s on %s failed", ip, server["server_name"])
+                raise HTTPException(status_code=502, detail=f"Ban failed on {server['server_name']}: {type(exc).__name__}: {exc}") from exc
+            if not ok:
+                log.error("netsh on %s refused ban of %s: %s", server["server_name"], ip, output)
+                raise HTTPException(status_code=502, detail=f"netsh on {server['server_name']} failed: {output[:400]}")
+        except HTTPException as exc:
+            await S.alerts.raise_alert(
+                "HIGH", "defense", f"Firewall ban FAILED: {ip}",
+                f"{user['u']} approved banning {ip} but the rule could not be created on {server['server_name']}: {exc.detail}. "
+                "The attacker is NOT blocked.", details={"ip": ip, "error": str(exc.detail), "alert_id": body.alert_id},
+                server_id=server_id, event="ban_failed", actionable=False,
+            )
+            raise
 
         rule = f"SENTINEL BAN: {ip}"
 
@@ -1021,6 +1223,7 @@ async def defense_ban(body: BanBody, user: dict[str, Any] = Depends(current_user
         "INFO", "defense", f"Firewall ban executed: {ip}",
         f"{user['u']} approved the ban. Windows Firewall rule '{rule}' is now blocking {ip} on {server['server_name']}.",
         details={"ip": ip, "rule": rule, "alert_ids": alert_ids, "output": output[:500]}, server_id=server_id,
+        event="ban_executed",
     )
     return {"ok": True, "ban": ban, "alert_ids": alert_ids, "output": output}
 
@@ -1078,6 +1281,10 @@ async def lift_ban(ban_id: int, user: dict[str, Any] = Depends(current_user)) ->
     await run_db(_op)
     log.warning("Ban %s (%s on %s) lifted by %s", ban_id, ban.ip_address, name, user["u"])
     S.hub.broadcast({"type": "unban", "id": ban_id, "server_id": ban.server_id, "ip_address": ban.ip_address})
+    await S.alerts.raise_alert("INFO", "defense", f"Firewall ban lifted: {ban.ip_address}",
+                               f"{user['u']} removed the Sentinel firewall rule for {ban.ip_address} on {name}.",
+                               details={"ip": ban.ip_address, "user": user["u"]}, server_id=ban.server_id,
+                               event="ban_lifted", actionable=False)
     return {"ok": True}
 
 

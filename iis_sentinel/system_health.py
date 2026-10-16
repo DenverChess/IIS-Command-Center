@@ -32,6 +32,8 @@ log = logging.getLogger("sentinel.health")
 
 POOL_STATES = {0: "Starting", 1: "Started", 2: "Stopping", 3: "Stopped", 4: "Unknown"}
 _APPCMD_RE = re.compile(r'APPPOOL\s+"(?P<name>[^"]+)"\s+\((?P<attrs>[^)]*)\)')
+_APPCMD_SITE_RE = re.compile(r'SITE\s+"(?P<name>[^"]+)"\s+\(id:(?P<id>\d+),bindings:(?P<bindings>.*?),state:(?P<state>\w+)\)')
+_SITE_FOLDER_RE = re.compile(r"^W3SVC(\d+)$", re.IGNORECASE)
 _SERVICE_STATES = {1: "STOPPED", 2: "START_PENDING", 3: "STOP_PENDING", 4: "RUNNING", 5: "CONTINUE_PENDING", 6: "PAUSE_PENDING", 7: "PAUSED"}
 
 
@@ -77,6 +79,23 @@ def _query_pools_appcmd() -> dict[str, str]:
     return pools
 
 
+def _query_sites_appcmd() -> list[dict[str, Any]]:
+    appcmd = Path(os.environ.get("windir", r"C:\Windows")) / "System32" / "inetsrv" / "appcmd.exe"
+    if not appcmd.exists():
+        return []
+    proc = subprocess.run([str(appcmd), "list", "site"], capture_output=True, text=True, timeout=20,
+                          creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if proc.returncode != 0:
+        raise RuntimeError(proc.stderr.strip() or f"appcmd exit code {proc.returncode}")
+    sites = []
+    for m in _APPCMD_SITE_RE.finditer(proc.stdout):
+        sid = int(m.group("id"))
+        state = m.group("state")
+        sites.append({"id": sid, "name": m.group("name"), "state": state, "running": state == "Started",
+                      "log_folder": f"W3SVC{sid}", "bindings": [b for b in m.group("bindings").split(",") if b]})
+    return sorted(sites, key=lambda s: s["id"])
+
+
 def _service_state(name: str) -> str:
     try:
         import win32serviceutil  # type: ignore
@@ -98,6 +117,7 @@ def _service_state(name: str) -> str:
 class _ServerState:
     def __init__(self) -> None:
         self.pools: dict[str, str] = {}
+        self.sites: dict[int, str] = {}
         self.w3svc: str | None = None
         self.online: bool | None = None
 
@@ -125,6 +145,17 @@ class HealthMonitor:
 
     def reload(self) -> None:
         self._reconcile.set()
+
+    def site_name(self, server_id: int, folder: str) -> str:
+        """Friendly IIS site name for a log folder (W3SVC2 -> 'Portal'), or '' when unknown."""
+        m = _SITE_FOLDER_RE.match(folder or "")
+        if not m:
+            return ""
+        site_id = int(m.group(1))
+        for site in (self.latest.get(server_id) or {}).get("sites") or []:
+            if site.get("id") == site_id:
+                return str(site.get("name") or "")
+        return ""
 
     def snapshot(self) -> list[dict[str, Any]]:
         out = []
@@ -187,6 +218,12 @@ class HealthMonitor:
             log.warning("disk_usage(%s) failed: %s", disk_path, exc)
             disk_percent, free_percent, free_gb, total_gb = 0.0, 100.0, 0.0, 0.0
         pools = self._app_pools()
+        sites: list[dict[str, Any]] = []
+        if IS_WINDOWS and not DEMO_MODE:
+            try:
+                sites = _query_sites_appcmd()
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Unable to list IIS sites: %s", exc)
         if DEMO_MODE:
             w3svc = was = "RUNNING"
         elif IS_WINDOWS:
@@ -209,6 +246,9 @@ class HealthMonitor:
             "app_pools": [{"name": k, "state": v, "running": v == "Started"} for k, v in sorted(pools.items())],
             "app_pool_source": self._pool_source,
             "app_pool_error": self._pool_error,
+            "sites": sites,
+            "site_source": "appcmd" if sites else "none",
+            "certs": [],
             "w3svc_state": w3svc,
             "was_state": was,
             "uptime_seconds": round(time.time() - boot),
@@ -251,26 +291,61 @@ class HealthMonitor:
                     f"Application pool '{name}' is {state}"
                     + (" (detected at startup)." if first_seen else f" (was {prev}). Sites in this pool are not serving requests."),
                     details={"app_pool": name, "state": state, "previous": prev, "source": s["app_pool_source"]},
-                    dedup_key=f"pool:{name}:down", cooldown=60,
+                    dedup_key=f"pool:{name}:down", cooldown=60, event="app_pool_stopped",
                 )
             elif state == "Started" and prev in ("Stopped", "Stopping", "Missing"):
                 await self._alert(server_id, "INFO", "recovery", f"IIS App Pool '{name}' recovered",
-                                  f"Application pool '{name}' is running again (was {prev}).", details={"app_pool": name})
+                                  f"Application pool '{name}' is running again (was {prev}).", details={"app_pool": name},
+                                  event="app_pool_recovered")
         if s["app_pool_source"] not in ("error", "unavailable") and not s.get("app_pool_error"):
             for name in set(st.pools) - set(current):
                 await self._alert(server_id, "WARNING", "system", f"IIS App Pool '{name}' disappeared",
                                   f"Application pool '{name}' is no longer reported by IIS.", details={"app_pool": name},
-                                  dedup_key=f"pool:{name}:gone", cooldown=3600)
+                                  dedup_key=f"pool:{name}:gone", cooldown=3600, event="app_pool_removed")
             st.pools = current
 
         w3 = s["w3svc_state"]
         if w3 not in ("RUNNING", "N/A", "UNKNOWN", "NOT_INSTALLED") and st.w3svc in (None, "RUNNING"):
             await self._alert(server_id, "CRITICAL", "system", f"W3SVC (World Wide Web Publishing Service) is {w3}",
                               "The IIS web service is not running. All sites on this server are offline.",
-                              details={"w3svc": w3, "was": s["was_state"]}, dedup_key="w3svc:down", cooldown=300)
+                              details={"w3svc": w3, "was": s["was_state"]}, dedup_key="w3svc:down", cooldown=300,
+                              event="w3svc_down")
         elif w3 == "RUNNING" and st.w3svc not in (None, "RUNNING", "N/A", "UNKNOWN"):
-            await self._alert(server_id, "INFO", "recovery", "W3SVC is running again", "IIS web service recovered.")
+            await self._alert(server_id, "INFO", "recovery", "W3SVC is running again", "IIS web service recovered.",
+                              event="w3svc_recovered")
         st.w3svc = w3
+
+        sites = {int(x["id"]): x for x in s.get("sites") or []}
+        if sites:
+            for site_id, site in sites.items():
+                prev = st.sites.get(site_id)
+                state = str(site.get("state") or "Unknown")
+                label = f"IIS site '{site['name']}' (W3SVC{site_id})"
+                if prev == "Started" and state not in ("Started", "Unknown"):
+                    await self._alert(server_id, "HIGH", "system", f"{label} is {state.upper()}",
+                                      f"The site stopped serving requests (was {prev}). Bindings: {', '.join(site.get('bindings') or []) or '-'}.",
+                                      details={"site_id": site_id, "site": site["name"], "state": state, "previous": prev},
+                                      dedup_key=f"site:{site_id}:down", cooldown=60, event="site_stopped")
+                elif state == "Started" and prev not in (None, "Started", "Unknown"):
+                    await self._alert(server_id, "INFO", "recovery", f"{label} started",
+                                      f"The site is serving requests again (was {prev}).",
+                                      details={"site_id": site_id, "site": site["name"]}, event="site_started")
+            st.sites = {k: str(v.get("state") or "Unknown") for k, v in sites.items()}
+
+        warn_days = float(self.config.value("alerts", "cert_warning_days", 21))
+        for cert in s.get("certs") or []:
+            days = float(cert.get("days_left", 9999))
+            if days > warn_days:
+                continue
+            sev = "CRITICAL" if days <= 0 else "HIGH" if days <= 7 else "WARNING"
+            when = "EXPIRED" if days <= 0 else f"expires in {days:.0f} day(s)"
+            await self._alert(
+                server_id, sev, "system", f"TLS certificate for '{cert.get('site')}' {when}",
+                f"{cert.get('subject')} on binding {cert.get('binding')} expires {cert.get('not_after')}. "
+                "Renew it and update the HTTPS binding before browsers start refusing the site.",
+                details=cert, dedup_key=f"cert:{cert.get('thumbprint')}:{cert.get('binding')}", cooldown=86400,
+                event="cert_expiring",
+            )
 
         if s["disk_free_percent"] < float(cfg["disk_free_critical"]) and s["disk_total_gb"] > 0:
             await self._alert(
@@ -278,7 +353,7 @@ class HealthMonitor:
                 f"Only {s['disk_free_gb']:.2f} GB free of {s['disk_total_gb']:.1f} GB on the IIS log volume. "
                 "IIS stops logging (and can stop serving) when the log volume fills up.",
                 details={"disk_path": s["disk_path"], "free_gb": s["disk_free_gb"], "free_percent": s["disk_free_percent"]},
-                dedup_key="disk:critical", cooldown=3600,
+                dedup_key="disk:critical", cooldown=3600, event="disk_low",
             )
         if s["cpu_percent"] > float(cfg["cpu_threshold"]):
             details: dict[str, Any] = {"cpu_percent": s["cpu_percent"]}
@@ -287,12 +362,13 @@ class HealthMonitor:
             await self._alert(
                 server_id, "HIGH", "system", f"CPU utilisation {s['cpu_percent']:.0f}% (threshold {cfg['cpu_threshold']}%)",
                 "Sustained high CPU can indicate a runaway worker process (w3wp.exe) or a volumetric attack.",
-                details=details, dedup_key="cpu:high", cooldown=900,
+                details=details, dedup_key="cpu:high", cooldown=900, event="cpu_high",
             )
         if s["ram_percent"] > float(cfg["ram_threshold"]):
             await self._alert(server_id, "WARNING", "system", f"Memory utilisation {s['ram_percent']:.0f}%",
                               f"{s['ram_used_gb']} GB of {s['ram_total_gb']} GB in use.",
-                              details={"ram_percent": s["ram_percent"]}, dedup_key="ram:high", cooldown=1800)
+                              details={"ram_percent": s["ram_percent"]}, dedup_key="ram:high", cooldown=1800,
+                              event="ram_high")
 
     async def _connectivity(self, server: dict[str, Any], ok: bool, error: str | None) -> None:
         sid = server["id"]
@@ -300,7 +376,8 @@ class HealthMonitor:
         changed = self.registry.set_status(sid, "health", ok, error)
         if ok and st.online is False:
             log.info("[%s] WinRM health link restored", server["server_name"])
-            await self._alert(sid, "INFO", "recovery", "Server reachable again", "Health telemetry restored.")
+            await self._alert(sid, "INFO", "recovery", "Server reachable again", "Health telemetry restored.",
+                              event="server_recovered")
         elif not ok and changed:
             log.error("[%s] health poll failed: %s", server["server_name"], error)
             await self._alert(
@@ -308,6 +385,7 @@ class HealthMonitor:
                 f"Sentinel cannot collect health from {server['server_name']} ({server['ip_address']}): {error}. "
                 "Monitoring of the other servers continues.",
                 details={"ip_address": server["ip_address"], "error": error}, dedup_key="unreachable", cooldown=1800,
+                event="server_unreachable",
             )
         st.online = ok
 

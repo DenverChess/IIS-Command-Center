@@ -71,12 +71,14 @@ backoff **while the rest of the fleet keeps streaming**.
 - **PENDING THREATS** queue, grouped per attacker per target server
 - One-click **APPROVE BAN** pushes a Windows Firewall rule to *that* server
 - Ban history, one-click unban, dismiss without action
+- Click any IP for **WHOIS / IP intel**: owner, network, abuse contact, reverse DNS, its request history, ban on any server
 - Nothing is ever blocked automatically: a human always approves
 
 </td>
 <td valign="top">
 
 ### `▸` REPORT
+- **ALERTS** tab: 43 events (threats, HTTP 5xx, slow responses, health, certificates, bans, logins…), each with its own desktop / email / severity
 - Exchange (EWS) alert mail with retries, circuit breaker and an hourly cap
 - Scheduled **weekly / monthly HTML reports** with a per-server fleet breakdown
 - "All quiet" reports too, so silence never means "broken"
@@ -174,7 +176,27 @@ IISSentinel-Setup-2.0.0.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART `
 ## `04` Preparing each IIS server
 
 Open **CONFIG → SERVERS** and register each box: a name (`IIS-01`), its IP, WinRM credentials, and the UNC path of
-its log folder (for example `\\10.0.20.11\c$\inetpub\logs\LogFiles\W3SVC1`). Press **TEST** to check WinRM and the share.
+its log folder. Press **TEST** to check WinRM and the share; it lists every site folder it found, with IIS site names.
+Use **EDIT** on any server to change its address, credentials (a blank password keeps the stored one), log path or
+start mode; monitoring restarts with the new settings.
+
+**Every site on the server:** point the log path at the parent folder
+(`\\10.0.20.11\c$\inetpub\logs\LogFiles`) and Sentinel tails every `W3SVC1`, `W3SVC2`, … folder below it. Sites
+created later are picked up automatically (rescan every 60 s) and announced with a "New IIS site" alert. Each log line
+and alert is tagged with the site's friendly name (`Portal (W3SVC2)`). Pointing at a single `W3SVC` folder still works.
+
+**How much history to read** (per server, and under WATCHERS for local folders), applied to each site's current log
+the first time Sentinel sees it:
+
+| Start mode | Behaviour |
+| --- | --- |
+| New lines only | Start at the end of the file, follow new lines |
+| Last N lines | Read the last *N* lines (you choose N), then follow |
+| Whole file | Read the entire current log, then follow |
+
+Sentinel then remembers its position in each file, so a restart resumes exactly where it stopped. Changing the mode
+re-reads using the new setting. History is analysed and recorded, but it never fires notifications (see the live
+window under ALERTS).
 
 | Requirement | Details |
 | --- | --- |
@@ -237,6 +259,32 @@ netsh advfirewall firewall add rule name="SENTINEL BAN: <ip>" dir=in action=bloc
 <td align="center"><sub><b>THREAT MATRIX</b>: scores per (server, IP)</sub></td>
 </tr>
 </table>
+
+---
+
+### Alerts and notifications
+
+**CONFIG → ALERTS** lists every event Sentinel can raise. For each one, choose whether it is recorded (**ON**),
+shown as a toast and desktop pop-up (**DESKTOP**), emailed through Exchange (**EMAIL**), and at what severity.
+
+| Group | Events |
+| --- | --- |
+| Threats | active threat (required: it feeds the ban queue), SQLi, XSS, traversal, scanner, 404 flood, auth brute force, threat cleared |
+| HTTP | server errors (HTTP 500-599, configurable, rolled up per URL), error bursts per site, watched codes (e.g. 413/429), slow responses, traffic / latency anomalies, traffic drop |
+| Health | server unreachable / recovered, log feed offline / restored, new site, site stopped / started, app pool stopped / recovered / removed, W3SVC down / recovered, CPU, RAM, disk, TLS certificate expiring |
+| Defense | ban executed, ban failed, ban lifted |
+| Sentinel | break-glass login, login lockout / failure / success, configuration changed, server added / edited / removed, report failed, Sentinel started |
+
+The same tab also has:
+
+- **Delivery:** email recipients, which override the Exchange alert list.
+- **Test:** desktop and email test buttons.
+- **HTTP detection:** HTTP detection thresholds, plus URL prefixes to ignore (health checks, SignalR).
+- **Timing:** certificate warning days, and quiet hours (CRITICAL can bypass).
+- **Muting:** muted servers, for maintenance windows.
+
+Desktop pop-ups need the browser's permission and a secure context: `https://` or `http://localhost`. Over plain
+HTTP from another machine, in-page toasts and the alert tone still work.
 
 ---
 
@@ -413,13 +461,16 @@ Every log line, health sample, threat and alert pushed over the WebSocket carrie
 | `POST` | `/logout` | End the session |
 | `GET` | `/healthz` | Liveness, uptime and background-task status (no auth) |
 | `GET` | `/servers` | Monitored servers (passwords masked), connectivity, latest health, log tailer status |
-| `POST` | `/servers` | `{server_name, ip_address, winrm_username, winrm_password, log_unc_path, winrm_transport?, winrm_port?, winrm_use_ssl?, winrm_verify_ssl?}` |
+| `POST` | `/servers` | `{server_name, ip_address, winrm_username, winrm_password, log_unc_path, log_start_mode?, log_tail_lines?, winrm_transport?, winrm_port?, winrm_use_ssl?, winrm_verify_ssl?}` |
 | `PUT` / `DELETE` | `/servers/{id}` | Update (a blank password keeps the stored one) / remove |
 | `POST` | `/servers/{id}/test` | Check WinRM and the log share without consuming log lines |
 | `POST` | `/defense/ban` | `{alert_id}` (or `{server_id, ip}`): firewall ban on the alert's server; the alert becomes `Approved` |
 | `POST` | `/defense/dismiss` | `{alert_id}`: the alert becomes `Dismissed` |
 | `GET` / `DELETE` | `/defense/bans`, `/defense/bans/{id}` | Active bans / lift a ban |
-| `GET` / `POST` | `/config` | `ad`, `exchange`, `watchers`, `reports` sections (secrets masked) |
+| `GET` / `POST` | `/config` | `ad`, `exchange`, `watchers`, `reports`, `alerts` sections (secrets masked) |
+| `GET` | `/alerts/catalog` | Every notifiable event with its defaults, plus Exchange delivery status |
+| `POST` | `/alerts/test` | `{desktop, email, severity}`: raise a test notification and optionally send a test email |
+| `GET` | `/threats/whois/{ip}?refresh=` | RDAP WHOIS + reverse DNS (cached 6 h), active bans and alert count for an IP |
 | `POST` | `/config/test/exchange` | Send a test mail |
 | `GET` | `/threats/live` | Recent malicious requests plus threat and anomaly alerts |
 | `GET` | `/threats/active?server_id=` | Threat matrix (scored server/IP pairs) |

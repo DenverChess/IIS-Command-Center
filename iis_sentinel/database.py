@@ -33,6 +33,9 @@ from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
+from alert_catalog import EVENTS as ALERT_EVENTS
+from alert_catalog import SEVERITIES, default_event_settings
+
 log = logging.getLogger("sentinel.db")
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -87,7 +90,10 @@ class MonitoredServer(Base):
     winrm_username: Mapped[str] = mapped_column(String(256), default="")
     # Stored through protect_secret(): DPAPI-encrypted on Windows, base64 elsewhere.
     winrm_password: Mapped[str] = mapped_column(Text, default="")
+    # Either one site's folder (...\W3SVC1) or the parent holding every site's W3SVC<n> folder.
     log_unc_path: Mapped[str] = mapped_column(String(1024), default="")
+    log_start_mode: Mapped[str] = mapped_column(String(8), default="end")
+    log_tail_lines: Mapped[int] = mapped_column(Integer, default=1000)
     winrm_transport: Mapped[str] = mapped_column(String(16), default="ntlm")
     winrm_port: Mapped[int] = mapped_column(Integer, default=5985)
     winrm_use_ssl: Mapped[bool] = mapped_column(Boolean, default=False)
@@ -168,6 +174,7 @@ class ActionableAlert(Base):
     ts: Mapped[datetime] = mapped_column(DateTime, index=True)
     severity: Mapped[str] = mapped_column(String(16), index=True)
     category: Mapped[str] = mapped_column(String(32), index=True)
+    event: Mapped[str] = mapped_column(String(48), default="")
     title: Mapped[str] = mapped_column(String(256))
     message: Mapped[str] = mapped_column(Text, default="")
     source_ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
@@ -243,7 +250,10 @@ SessionLocal = async_sessionmaker(engine, expire_on_commit=False, class_=AsyncSe
 _ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
     "log_entries": {"server_id": "INTEGER NOT NULL DEFAULT 0"},
     "system_metrics": {"server_id": "INTEGER NOT NULL DEFAULT 0"},
-    "alerts": {"server_id": "INTEGER NOT NULL DEFAULT 0", "status": "VARCHAR(16) NOT NULL DEFAULT 'Pending'"},
+    "alerts": {"server_id": "INTEGER NOT NULL DEFAULT 0", "status": "VARCHAR(16) NOT NULL DEFAULT 'Pending'",
+               "event": "VARCHAR(48) NOT NULL DEFAULT ''"},
+    "monitored_servers": {"log_start_mode": "VARCHAR(8) NOT NULL DEFAULT 'end'",
+                          "log_tail_lines": "INTEGER NOT NULL DEFAULT 1000"},
 }
 
 
@@ -360,7 +370,7 @@ def unprotect_secret(stored: str) -> str:
 # --------------------------------------------------------------------------------------
 SECRET_MASK = "********"
 SECRET_FIELDS: set[tuple[str, str]] = {("exchange", "password")}
-SEVERITIES = ["INFO", "WARNING", "HIGH", "CRITICAL"]
+LOG_START_MODES = ("end", "tail", "full")
 
 DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
     "ad": {
@@ -395,7 +405,10 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "local_server_name": "",
         "remote_timeout": 30,
         "file_pattern": "u_ex*.log",
+        # Legacy switch (pre-2.1); log_start_mode supersedes it.
         "start_at_end": True,
+        "log_start_mode": "end",
+        "log_tail_lines": 1000,
         "poll_interval": 2,
         "health_interval": 60,
         "cpu_threshold": 90,
@@ -419,6 +432,31 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "hour": 7,
         "minute": 0,
         "recipients": [],
+    },
+    "alerts": {
+        "events": default_event_settings(),
+        # Empty = exchange.alert_recipients.
+        "email_recipients": [],
+        "desktop_notifications": True,
+        "sound": True,
+        "quiet_hours_enabled": False,
+        "quiet_start": "22:00",
+        "quiet_end": "07:00",
+        "quiet_bypass_critical": True,
+        "muted_servers": [],
+        # Log lines older than this (backfill of tail/full start modes) are recorded but never notify.
+        "live_window_minutes": 15,
+        "http_error_codes": ["500-599"],
+        "http_error_cooldown_minutes": 10,
+        "http_error_burst_threshold": 10,
+        "http_error_burst_window_minutes": 5,
+        "watched_status_codes": ["413", "429"],
+        "watched_status_cooldown_minutes": 15,
+        "slow_response_ms": 10000,
+        "slow_response_threshold": 5,
+        "slow_response_window_minutes": 5,
+        "http_ignore_paths": [],
+        "cert_warning_days": 21,
     },
 }
 
@@ -448,6 +486,45 @@ def _emails(v: list[str]) -> None:
         raise ValueError(f"invalid email address(es): {', '.join(bad)}")
 
 
+_STATUS_TOKEN_RE = re.compile(r"^(?:(\d)xx|(\d{3})(?:\s*-\s*(\d{3}))?)$", re.IGNORECASE)
+
+
+def parse_status_codes(tokens: list[str]) -> list[tuple[int, int]]:
+    """'500', '500-599' or '5xx' -> inclusive (lo, hi) ranges."""
+    ranges: list[tuple[int, int]] = []
+    for raw in tokens:
+        tok = str(raw).strip()
+        m = _STATUS_TOKEN_RE.match(tok)
+        if not m:
+            raise ValueError(f"'{tok}' is not a status code, range (500-599) or class (5xx)")
+        if m.group(1):
+            lo = int(m.group(1)) * 100
+            hi = lo + 99
+        else:
+            lo = int(m.group(2))
+            hi = int(m.group(3) or lo)
+        if not (100 <= lo <= hi <= 999):
+            raise ValueError(f"'{tok}' is not a valid HTTP status range")
+        ranges.append((lo, hi))
+    return ranges
+
+
+def _status_codes(v: list[str]) -> None:
+    parse_status_codes(v)
+
+
+def _hhmm(v: str) -> None:
+    m = re.match(r"^(\d{1,2}):(\d{2})$", v)
+    if not m or int(m.group(1)) > 23 or int(m.group(2)) > 59:
+        raise ValueError("must be a 24h time like 22:00")
+
+
+def _alert_events(v: dict[str, dict[str, Any]]) -> None:
+    for eid, s in v.items():
+        if s.get("severity") not in ("default", *SEVERITIES):
+            raise ValueError(f"{eid}.severity must be default or one of {', '.join(SEVERITIES)}")
+
+
 VALIDATORS: dict[tuple[str, str], Callable[[Any], None]] = {
     ("ad", "port"): _range(1, 65535),
     ("ad", "timeout"): _range(1, 120),
@@ -471,6 +548,23 @@ VALIDATORS: dict[tuple[str, str], Callable[[Any], None]] = {
     ("watchers", "threat_score_threshold"): _range(1, 100000),
     ("watchers", "threat_half_life_minutes"): _range(1, 10080),
     ("watchers", "retention_days"): _range(1, 3650),
+    ("watchers", "log_start_mode"): _choice(*LOG_START_MODES),
+    ("watchers", "log_tail_lines"): _range(1, 1_000_000),
+    ("alerts", "events"): _alert_events,
+    ("alerts", "email_recipients"): _emails,
+    ("alerts", "quiet_start"): _hhmm,
+    ("alerts", "quiet_end"): _hhmm,
+    ("alerts", "live_window_minutes"): _range(1, 10080),
+    ("alerts", "http_error_codes"): _status_codes,
+    ("alerts", "http_error_cooldown_minutes"): _range(0, 1440),
+    ("alerts", "http_error_burst_threshold"): _range(2, 100000),
+    ("alerts", "http_error_burst_window_minutes"): _range(1, 1440),
+    ("alerts", "watched_status_codes"): _status_codes,
+    ("alerts", "watched_status_cooldown_minutes"): _range(0, 1440),
+    ("alerts", "slow_response_ms"): _range(100, 3_600_000),
+    ("alerts", "slow_response_threshold"): _range(1, 100000),
+    ("alerts", "slow_response_window_minutes"): _range(1, 1440),
+    ("alerts", "cert_warning_days"): _range(1, 365),
     ("reports", "schedule"): _choice("weekly", "monthly", "both", "disabled"),
     ("reports", "day_of_week"): _choice(*sorted(_DOW)),
     ("reports", "day_of_month"): _range(1, 28),
@@ -480,7 +574,18 @@ VALIDATORS: dict[tuple[str, str], Callable[[Any], None]] = {
 }
 
 
-def _coerce(default: Any, value: Any, name: str) -> Any:
+def _coerce(default: Any, value: Any, name: str, base: Any = None) -> Any:
+    """Coerce `value` to the type of `default`. Dicts are merged key-by-key onto `base` (or the default),
+    so a partial update only touches the keys it sends and unknown keys are dropped."""
+    if isinstance(default, dict):
+        if not isinstance(value, dict):
+            raise ValueError(f"{name} must be an object")
+        merged = copy.deepcopy(base if isinstance(base, dict) else default)
+        merged = {k: merged.get(k, copy.deepcopy(dv)) for k, dv in default.items()}
+        for k, v in value.items():
+            if k in default:
+                merged[k] = _coerce(default[k], v, f"{name}.{k}", merged.get(k))
+        return merged
     if isinstance(default, bool):
         if isinstance(value, bool):
             return value
@@ -528,6 +633,7 @@ def _env_seed() -> dict[str, dict[str, Any]]:
             {
                 "log_dirs": [],
                 "start_at_end": False,
+                "log_start_mode": "tail",
                 "health_interval": 10,
                 "baseline_interval": 60,
                 "baseline_min_samples": 3,
@@ -562,19 +668,37 @@ class ConfigStore:
             elif section in seed:
                 stored = seed[section]
             merged = copy.deepcopy(defaults)
+            if section == "alerts" and section not in rows and "exchange" in rows:
+                merged["events"] = self._legacy_email_events()
+            if section == "watchers" and "log_start_mode" not in stored and stored.get("start_at_end") is False:
+                stored = {**stored, "log_start_mode": "full"}
             for k, v in stored.items():
                 if k not in defaults:
                     continue
                 try:
-                    merged[k] = _coerce(defaults[k], v, f"{section}.{k}")
+                    merged[k] = _coerce(defaults[k], v, f"{section}.{k}", merged.get(k))
                 except ValueError:
                     log.warning("Ignoring invalid stored value for %s.%s", section, k)
             for k in defaults:
                 if (section, k) in SECRET_FIELDS:
                     merged[k] = unprotect_secret(str(merged.get(k, "")))
+            self._enforce(section, merged)
             self._cache[section] = merged
             if section not in rows:
                 await self._persist(section)
+
+    def _legacy_email_events(self) -> dict[str, dict[str, Any]]:
+        """First start after upgrading: email exactly what exchange.alert_min_severity used to email."""
+        min_sev = self._cache.get("exchange", {}).get("alert_min_severity", "HIGH")
+        rank = SEVERITIES.index(min_sev) if min_sev in SEVERITIES else 2
+        return default_event_settings(email_min_rank=rank)
+
+    @staticmethod
+    def _enforce(section: str, values: dict[str, Any]) -> None:
+        if section == "alerts":
+            for eid, ev in ALERT_EVENTS.items():
+                if ev["core"]:
+                    values["events"][eid]["enabled"] = True
 
     def get(self, section: str) -> dict[str, Any]:
         return copy.deepcopy(self._cache[section])
@@ -601,7 +725,7 @@ class ConfigStore:
                     continue
                 if (section, k) in SECRET_FIELDS and v == SECRET_MASK:
                     continue
-                coerced = _coerce(defaults[k], v, f"{section}.{k}")
+                coerced = _coerce(defaults[k], v, f"{section}.{k}", candidate.get(k))
                 validator = VALIDATORS.get((section, k))
                 if validator:
                     try:
@@ -609,6 +733,7 @@ class ConfigStore:
                     except ValueError as exc:
                         raise ValueError(f"{section}.{k} {exc}") from exc
                 candidate[k] = coerced
+            self._enforce(section, candidate)
             self._cache[section] = candidate
             await self._persist(section)
         for cb in self._listeners:
@@ -708,6 +833,8 @@ class ServerRegistry:
             "winrm_username": row.winrm_username,
             "winrm_password": unprotect_secret(row.winrm_password),
             "log_unc_path": row.log_unc_path,
+            "log_start_mode": row.log_start_mode or "end",
+            "log_tail_lines": int(row.log_tail_lines or 1000),
             "winrm_transport": row.winrm_transport,
             "winrm_port": row.winrm_port,
             "winrm_use_ssl": row.winrm_use_ssl,
@@ -723,9 +850,11 @@ class ServerRegistry:
             if (await s.execute(select(MonitoredServer.id).limit(1))).first():
                 return
             for name, ip in DEMO_SERVERS:
-                path = str(DEMO_LOG_ROOT / name / "W3SVC1") if ip.startswith("127.") else rf"\\{ip}\IISLogs\W3SVC1"
+                # The parent of the per-site W3SVC<n> folders: every site on the server is tailed.
+                path = str(DEMO_LOG_ROOT / name) if ip.startswith("127.") else rf"\\{ip}\IISLogs"
                 s.add(MonitoredServer(server_name=name, ip_address=ip, winrm_username="CORP\\svc_sentinel",
-                                      winrm_password=protect_secret("demo"), log_unc_path=path, created_at=utcnow()))
+                                      winrm_password=protect_secret("demo"), log_unc_path=path, log_start_mode="tail",
+                                      log_tail_lines=500, created_at=utcnow()))
 
         await run_db(_op)
 
@@ -750,6 +879,8 @@ class ServerRegistry:
             "ip_address": "127.0.0.1",
             "log_dirs": list(dirs),
             "log_unc_path": "",
+            "log_start_mode": self.config.value("watchers", "log_start_mode", "end"),
+            "log_tail_lines": int(self.config.value("watchers", "log_tail_lines", 1000)),
             "enabled": True,
             "local": True,
             "simulated": False,
@@ -830,12 +961,23 @@ class ServerRegistry:
             raise ValueError("winrm_port must be an integer") from exc
         if not 1 <= port <= 65535:
             raise ValueError("winrm_port must be between 1 and 65535")
+        mode = (text("log_start_mode", 8) or "end").lower()
+        if mode not in LOG_START_MODES:
+            raise ValueError(f"log_start_mode must be one of {', '.join(LOG_START_MODES)}")
+        try:
+            tail_lines = int(data.get("log_tail_lines") or 1000)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("log_tail_lines must be an integer") from exc
+        if not 1 <= tail_lines <= 1_000_000:
+            raise ValueError("log_tail_lines must be between 1 and 1000000")
         return {
             "server_name": name,
             "ip_address": ip,
             "winrm_username": username,
             "winrm_password": password,
             "log_unc_path": unc,
+            "log_start_mode": mode,
+            "log_tail_lines": tail_lines,
             "winrm_transport": transport,
             "winrm_port": port,
             "winrm_use_ssl": use_ssl,
