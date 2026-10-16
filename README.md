@@ -220,7 +220,7 @@ window under ALERTS).
 Attack signatures, spikes and **ACTIVE THREAT** escalations create *actionable* alerts with status
 ![Pending](https://img.shields.io/badge/-Pending-ffae00?style=flat-square&labelColor=050505).
 They land in the **PENDING THREATS** panel, one row per attacker per target server. **APPROVE BAN** sends the ban to
-*that* server:
+*that* server (or to a perimeter firewall, see below):
 
 ```mermaid
 %%{init: {'theme':'base','themeVariables':{'background':'#050505','primaryColor':'#0a0f14','primaryTextColor':'#00f3ff','primaryBorderColor':'#00f3ff','lineColor':'#00f3ff','actorBkg':'#0a0f14','actorBorder':'#00f3ff','actorTextColor':'#00f3ff','signalColor':'#0aff00','signalTextColor':'#0aff00','noteBkgColor':'#1a0005','noteTextColor':'#ff0033','noteBorderColor':'#ff0033','fontFamily':'JetBrains Mono, monospace'}}}%%
@@ -248,6 +248,30 @@ netsh advfirewall firewall add rule name="SENTINEL BAN: <ip>" dir=in action=bloc
 - **Idempotent:** the rule is only added if it doesn't already exist, and approving the same alert twice returns `409`.
 - **Clears the queue:** every other Pending alert from that attacker on that server becomes ![Approved](https://img.shields.io/badge/-Approved-0aff00?style=flat-square&labelColor=050505).
 - **Reversible:** **BANS → UNBAN** (`DELETE /defense/bans/{id}`) deletes the firewall rule. Alerts can also be ![Dismissed](https://img.shields.io/badge/-Dismissed-555555?style=flat-square&labelColor=050505) without action.
+
+### Where the ban goes: CONFIG → FIREWALL
+
+Pick one provider with the radio buttons. The setup steps for each one are shown in the tab.
+
+| Provider | What APPROVE BAN does | Scope |
+| --- | --- | --- |
+| **Windows Firewall (on server)** | The `netsh` rule above, pushed over WinRM (the default) | The attacked server |
+| **pfSense / OPNsense** | Adds the IP to a Host alias referenced by your block rule. OPNsense uses its built-in API (key + secret); pfSense needs the `pfSense-pkg-RESTAPI` v2 package and applies the filter after the change | Every server |
+| **SonicWall** | SonicOS 7 API: creates address object `SENTINEL_<ip>`, adds it to your deny-rule address group, then commits | Every server |
+| **Palo Alto** | PAN-OS User-ID XML API: tags the IP (default `sentinel-ban`). A Dynamic Address Group in your deny rule matches the tag. No commit is needed, and bans can auto-expire | Every server |
+
+- **Your rules stay yours:** Sentinel only adds and removes addresses. You create the alias, group or Dynamic Address Group and the block rule once.
+- **One approval clears every server:** a perimeter ban resolves that attacker's pending threats on every server.
+- **LIFT removes the right entry:** each ban remembers which provider made it, so LIFT works even after you switch providers.
+- **Credentials are encrypted:** firewall credentials are stored DPAPI-encrypted, like the Exchange password.
+- **Test before you rely on it:** **SAVE & TEST CONNECTION** checks the credentials and that the alias or group exists.
+
+### Locations in the threat matrix
+
+The GEO column comes from a local GeoIP database. On first start, Sentinel downloads the free DB-IP *IP to City Lite*
+database (CC BY 4.0, about 130 MB, no account needed) into `data\geoip\` and refreshes it monthly. A MaxMind
+`GeoLite2-City.mmdb` placed in that folder takes precedence. On a host without internet access, Sentinel shows the
+WHOIS registry country instead. You can turn the download off under **WATCHERS**.
 
 <table>
 <tr>
@@ -467,11 +491,13 @@ Every log line, health sample, threat and alert pushed over the WebSocket carrie
 | `POST` | `/defense/ban` | `{alert_id}` (or `{server_id, ip}`): firewall ban on the alert's server; the alert becomes `Approved` |
 | `POST` | `/defense/dismiss` | `{alert_id}`: the alert becomes `Dismissed` |
 | `GET` / `DELETE` | `/defense/bans`, `/defense/bans/{id}` | Active bans / lift a ban |
-| `GET` / `POST` | `/config` | `ad`, `exchange`, `watchers`, `reports`, `alerts` sections (secrets masked) |
+| `GET` / `POST` | `/config` | `ad`, `exchange`, `watchers`, `reports`, `alerts`, `firewall` sections (secrets masked) |
 | `GET` | `/alerts/catalog` | Every notifiable event with its defaults, plus Exchange delivery status |
 | `POST` | `/alerts/test` | `{desktop, email, severity}`: raise a test notification and optionally send a test email |
 | `GET` | `/threats/whois/{ip}?refresh=` | RDAP WHOIS + reverse DNS (cached 6 h), active bans and alert count for an IP |
 | `POST` | `/config/test/exchange` | Send a test mail |
+| `GET` / `POST` | `/firewall`, `/firewall/test` | Active ban provider / test its API connection |
+| `GET` | `/geoip` | GeoIP database in use |
 | `GET` | `/threats/live` | Recent malicious requests plus threat and anomaly alerts |
 | `GET` | `/threats/active?server_id=` | Threat matrix (scored server/IP pairs) |
 | `GET` | `/threats/ip/{ip}?server_id=` | Threat state and recent requests for one IP |
