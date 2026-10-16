@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import threading
 from typing import Any
 from xml.etree import ElementTree
 from xml.sax.saxutils import quoteattr
@@ -170,6 +171,8 @@ class PfSense:
 # SonicWall (SonicOS 7 REST API)
 # --------------------------------------------------------------------------------------
 class SonicWall:
+    _group_lock = threading.Lock()
+
     def __init__(self, c: dict[str, Any]) -> None:
         self.url = _base(c["sonicwall_url"]) + "/api/sonicos"
         self.user = c["sonicwall_username"]
@@ -247,21 +250,53 @@ class SonicWall:
             raise FirewallError(f"address group '{self.group}' not found ({exc}). Create it under Object > Address "
                                 "Groups and reference it in a deny access rule") from exc
 
+    @staticmethod
+    def _group(data: Any) -> dict[str, Any]:
+        try:
+            g = data["address_groups"][0]["ipv4"]
+        except (KeyError, IndexError, TypeError):
+            return {}
+        return g if isinstance(g, dict) else {}
+
+    @staticmethod
+    def _members(group: dict[str, Any]) -> list[str]:
+        items = (group.get("address_object") or {}).get("ipv4") or []
+        return [str(m["name"]) for m in items if isinstance(m, dict) and m.get("name")]
+
+    def _write_members(self, s: Any, group: dict[str, Any], names: list[str], what: str) -> None:
+        # SonicOS PUT replaces the group's member list, so always send the complete list (including any
+        # IPv6 objects or nested groups the operator put in it by hand).
+        body: dict[str, Any] = {"name": self.group, "address_object": {"ipv4": [{"name": n} for n in names]}}
+        ipv6 = (group.get("address_object") or {}).get("ipv6")
+        if ipv6:
+            body["address_object"]["ipv6"] = ipv6
+        if group.get("address_group"):
+            body["address_group"] = group["address_group"]
+        self._call(s, "PUT", f"/address-groups/ipv4/name/{self.group}", what, json={"address_groups": [{"ipv4": body}]})
+
     def ban(self, ip: str) -> str:
         name = self.obj_name(ip)
 
         def op(s: Any) -> str:
-            self._check_group(s)
-            try:
-                self._call(s, "POST", "/address-objects/ipv4", "create address object",
-                           json={"address_objects": [{"ipv4": {"name": name, "zone": self.zone, "host": {"ip": ip}}}]})
-            except FirewallError as exc:
-                if "exist" not in str(exc).lower():
-                    raise
-            self._call(s, "PUT", f"/address-groups/ipv4/name/{self.group}", "add to group",
-                       json={"address_groups": [{"ipv4": {"name": self.group, "address_object": {"ipv4": [{"name": name}]}}}]})
-            self._call(s, "POST", "/config/pending", "commit")
-            return f"address object {name} added to SonicWall group {self.group} and committed"
+            with SonicWall._group_lock:
+                group = self._group(self._check_group(s))
+                try:
+                    self._call(s, "POST", "/address-objects/ipv4", "create address object",
+                               json={"address_objects": [{"ipv4": {"name": name, "zone": self.zone, "host": {"ip": ip}}}]})
+                except FirewallError as exc:
+                    if "exist" not in str(exc).lower():
+                        raise
+                members = self._members(group)
+                if name not in members:
+                    self._write_members(s, group, members + [name], "add to group")
+                after = self._members(self._group(self._check_group(s)))
+                if name not in after:
+                    raise FirewallError(f"{name} was created but the SonicWall did not keep it in group {self.group}")
+                lost = [m for m in members if m not in after]
+                if lost:
+                    log.error("SonicWall group %s lost members while adding %s: %s", self.group, name, lost)
+                self._call(s, "POST", "/config/pending", "commit")
+                return f"address object {name} added to SonicWall group {self.group} ({len(after)} member(s)) and committed"
 
         return self._run(op)
 
@@ -269,18 +304,28 @@ class SonicWall:
         name = self.obj_name(ip)
 
         def op(s: Any) -> str:
-            try:
-                self._call(s, "DELETE", f"/address-groups/ipv4/name/{self.group}", "remove from group",
-                           json={"address_groups": [{"ipv4": {"name": self.group, "address_object": {"ipv4": [{"name": name}]}}}]})
-            except FirewallError as exc:
-                log.info("SonicWall group member removal for %s: %s (deleting the object instead)", name, exc)
-            try:
-                self._call(s, "DELETE", f"/address-objects/ipv4/name/{name}", "delete address object")
-            except FirewallError as exc:
-                if "not found" not in str(exc).lower() and "404" not in str(exc):
-                    raise
-            self._call(s, "POST", "/config/pending", "commit")
-            return f"address object {name} removed from SonicWall group {self.group} and committed"
+            with SonicWall._group_lock:
+                group = self._group(self._check_group(s))
+                members = self._members(group)
+                if name in members:
+                    remaining = [m for m in members if m != name]
+                    try:
+                        self._write_members(s, group, remaining, "remove from group")
+                    except FirewallError as exc:
+                        if remaining:
+                            raise
+                        # Some SonicOS builds refuse an empty member list; fall back to deleting the member.
+                        log.info("SonicWall refused an empty group %s (%s); deleting the member instead", self.group, exc)
+                        self._call(s, "DELETE", f"/address-groups/ipv4/name/{self.group}", "remove from group",
+                                   json={"address_groups": [{"ipv4": {"name": self.group,
+                                                                      "address_object": {"ipv4": [{"name": name}]}}}]})
+                try:
+                    self._call(s, "DELETE", f"/address-objects/ipv4/name/{name}", "delete address object")
+                except FirewallError as exc:
+                    if "not found" not in str(exc).lower() and "404" not in str(exc):
+                        raise
+                self._call(s, "POST", "/config/pending", "commit")
+                return f"address object {name} removed from SonicWall group {self.group} and committed"
 
         return self._run(op)
 
