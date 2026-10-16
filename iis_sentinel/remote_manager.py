@@ -10,6 +10,7 @@ hangs (offline, SMB stall, WinRM timeout) can never pile up threads or stall mon
 from __future__ import annotations
 
 import asyncio
+import base64
 import ipaddress
 import json
 import logging
@@ -251,13 +252,43 @@ def normalize_health(raw: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+_STDIN_BOOTSTRAP = base64.b64encode(
+    "& ([scriptblock]::Create((@($input) -join [char]10)))".encode("utf-16-le")
+).decode("ascii")
+
+
+def _run_ps_stdin(session: Any, script: str) -> tuple[bytes, bytes, int]:
+    """Run a PowerShell script of any size: Session.run_ps puts the whole script on the command line
+    (-EncodedCommand), which cmd.exe rejects past 8191 characters. Here only a tiny bootstrap goes on the
+    command line and the script itself is streamed over WinRM stdin."""
+    proto = session.protocol
+    shell_id = proto.open_shell(codepage=65001)
+    try:
+        cmd_id = proto.run_command(shell_id, "powershell.exe",
+                                   ["-NoLogo", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass",
+                                    "-EncodedCommand", _STDIN_BOOTSTRAP])
+        try:
+            proto.send_command_input(shell_id, cmd_id, script.replace("\r\n", "\n").encode("utf-8"), end=True)
+            out, err, code = proto.get_command_output(shell_id, cmd_id)
+        finally:
+            proto.cleanup_command(shell_id, cmd_id)
+    finally:
+        proto.close_shell(shell_id)
+    if err and err.lstrip().startswith(b"#< CLIXML") and hasattr(session, "_clean_error_msg"):
+        try:
+            err = session._clean_error_msg(err)  # noqa: SLF001
+        except Exception:  # noqa: BLE001
+            pass
+    return out, err, code
+
+
 def get_remote_health(server_ip: str, username: str, password: str, **opts: Any) -> dict[str, Any]:
     """Run the health PowerShell over WinRM; returns CPU/RAM/disk/app-pool/service state."""
-    resp = _session(server_ip, username, password, **opts).run_ps(HEALTH_PS)
-    out = _decode(resp.std_out).strip()
-    if resp.status_code != 0:
-        err = _decode(resp.std_err).strip() or out
-        raise RemoteError(f"health script exited {resp.status_code}: {err[:500]}")
+    out_b, err_b, code = _run_ps_stdin(_session(server_ip, username, password, **opts), HEALTH_PS)
+    out = _decode(out_b).strip()
+    if code != 0:
+        err = _decode(err_b).strip() or out
+        raise RemoteError(f"health script exited {code}: {err[:500]}")
     line = next((ln for ln in reversed(out.splitlines()) if ln.strip().startswith("{")), "")
     if not line:
         raise RemoteError(f"health script returned no JSON: {out[:300]}")
