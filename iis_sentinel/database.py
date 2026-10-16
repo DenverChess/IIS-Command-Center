@@ -668,7 +668,7 @@ class ConfigStore:
             elif section in seed:
                 stored = seed[section]
             merged = copy.deepcopy(defaults)
-            if section == "alerts" and section not in rows:
+            if section == "alerts" and section not in rows and "exchange" in rows:
                 merged["events"] = self._legacy_email_events()
             if section == "watchers" and "log_start_mode" not in stored and stored.get("start_at_end") is False:
                 stored = {**stored, "log_start_mode": "full"}
