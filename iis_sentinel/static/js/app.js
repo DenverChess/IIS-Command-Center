@@ -176,7 +176,8 @@ function dashboardApp() {
     notifPerm: "Notification" in window ? Notification.permission : "unsupported",
 
     // WHOIS / IP intel modal
-    whois: null,
+    whois: { ip: "", data: null, intel: null },
+    whoisOpen: false,
 
     _k: 0,
 
@@ -672,14 +673,16 @@ function dashboardApp() {
     async openWhois(ip, serverId = null, refresh = false) {
       if (!ip) return;
       const sid = serverId == null ? this.selId() : serverId;
-      const keep = this.whois && this.whois.ip === ip ? this.whois : null;
+      const keep = this.whoisOpen && this.whois.ip === ip ? this.whois : null;
       const first = this.enabledServers().find((s) => s.id === sid) || this.enabledServers()[0];
-      const state = {
+      this.whois = {
         ip, server_id: sid, loading: true, error: "", banBusy: false,
         data: keep ? keep.data : null, intel: keep ? keep.intel : null,
         banServer: keep ? keep.banServer : (first ? String(first.id) : ""),
       };
-      this.whois = state;
+      this.whoisOpen = true;
+      // Mutate Alpine's reactive proxy, not the plain object assigned above, or the modal never re-renders.
+      const state = this.whois;
       const enc = encodeURIComponent(ip);
       const [w, intel] = await Promise.allSettled([
         api(`/threats/whois/${enc}${refresh ? "?refresh=true" : ""}`),
@@ -692,18 +695,21 @@ function dashboardApp() {
       state.loading = false;
     },
 
-    closeWhois() { this.whois = null; },
+    closeWhois() { this.whoisOpen = false; },
 
-    W() { return (this.whois && this.whois.data && this.whois.data.whois) || {}; },
+    W() { return (this.whois.data && this.whois.data.whois) || {}; },
+    WI() { const i = this.whois.intel; return { state: (i && i.state) || null, recent: (i && i.recent) || [] }; },
+    WS() { return this.WI().state || {}; },
+    WB() { return (this.whois.data && this.whois.data.bans) || []; },
 
     whoisBanned(sid) {
-      if (this.whois && this.whois.data && this.whois.data.bans.some((b) => b.server_id === sid)) return true;
-      return !!this.whois && this.bans.some((b) => b.server_id === sid && b.ip_address === this.whois.ip);
+      if (this.whois.data && this.whois.data.bans.some((b) => b.server_id === sid)) return true;
+      return this.bans.some((b) => b.server_id === sid && b.ip_address === this.whois.ip);
     },
 
     async whoisBan() {
       const w = this.whois;
-      if (!w || !w.banServer || w.banBusy) return;
+      if (!this.whoisOpen || !w.banServer || w.banBusy) return;
       const srv = this.serverById(Number(w.banServer));
       if (!srv) return;
       if (!window.confirm(`APPROVE FIREWALL BAN\n\nBlock ${w.ip} on ${srv.server_name}?\n\n` +

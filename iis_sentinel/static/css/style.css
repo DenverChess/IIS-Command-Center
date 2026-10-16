@@ -384,8 +384,9 @@ select.input { appearance: none; background-image: linear-gradient(45deg, transp
 .report-row a { color: var(--cyan); }
 
 .toast-stack { position: fixed; right: 16px; top: 66px; z-index: 60; display: flex; flex-direction: column; gap: 8px; width: 360px; pointer-events: none; }
+.toast-stack.beside-drawer { right: calc(min(720px, 100vw) + 16px); }
 .toast {
-  pointer-events: auto; padding: 10px 12px; background: rgba(10, 2, 4, 0.95); border: 1px solid var(--red); box-shadow: var(--glow-red);
+  pointer-events: none; padding: 10px 12px; background: rgba(10, 2, 4, 0.95); border: 1px solid var(--red); box-shadow: var(--glow-red);
   font-size: 12px; animation: toast-in 0.3s ease-out;
 }
 .toast.HIGH { border-color: #ff5e00; }

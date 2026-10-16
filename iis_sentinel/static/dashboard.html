@@ -379,7 +379,7 @@
     </footer>
 
     <!-- ============================================================ TOASTS -->
-    <div class="toast-stack">
+    <div class="toast-stack" :class="{ 'beside-drawer': cfgOpen }">
       <template x-for="t in toasts" :key="t._k">
         <div class="toast" :class="t.severity + (t.ok ? ' ok' : '')">
           <div class="h" x-text="(t.server_name ? '[' + t.server_name + '] ' : '') + t.severity + ' // ' + (t.category || '').toUpperCase()"></div>
@@ -715,8 +715,8 @@
     </div>
 
     <!-- ============================================================ WHOIS / IP INTEL -->
-    <div class="overlay center" x-show="whois" x-cloak @click.self="closeWhois()" @keydown.escape.window="closeWhois()">
-      <template x-if="whois">
+    <div class="overlay center" x-show="whoisOpen" x-cloak @click.self="closeWhois()" @keydown.escape.window="closeWhois()">
+      <template x-if="whoisOpen">
       <div class="modal" role="dialog" aria-label="IP intelligence">
         <div class="modal-head">
           <div>
@@ -780,32 +780,32 @@
           </template>
 
           <div class="section-label"><span>SENTINEL HISTORY</span>
-            <span x-text="(whois.data ? whois.data.alert_count + ' ALERT' + (whois.data.alert_count === 1 ? '' : 'S') : '') + (whois.intel ? ' · ' + whois.intel.recent.length + ' RECENT REQ' : '')"></span></div>
-          <template x-if="whois.intel && whois.intel.state">
+            <span x-text="(whois.data ? (whois.data.alert_count || 0) + ' ALERT' + (whois.data.alert_count === 1 ? '' : 'S') : '') + (whois.intel ? ' · ' + WI().recent.length + ' RECENT REQ' : '')"></span></div>
+          <template x-if="WI().state">
             <div class="kv" style="margin-bottom:10px">
-              <span class="k">THREAT STATE</span><span class="v" :class="whois.intel.state.active ? 'neon-red' : whois.intel.state.score >= 10 ? 'neon-amber' : 'neon-green'"
-                x-text="whois.intel.state.status + ' · SCORE ' + Math.round(whois.intel.state.score) + ' (PEAK ' + Math.round(whois.intel.state.peak_score) + ')'"></span>
-              <span class="k">TARGET</span><span class="v" x-text="whois.intel.state.server_name + ' · ' + fmtNum(whois.intel.state.requests) + ' REQ · ' + whois.intel.state.attack_hits + ' ATTACK HITS'"></span>
-              <span class="k">SIGNATURES</span><span class="v" x-text="Object.entries(whois.intel.state.tags || {}).map(([k, n]) => k + '×' + n).join('  ') || '—'"></span>
+              <span class="k">THREAT STATE</span><span class="v" :class="WS().active ? 'neon-red' : WS().score >= 10 ? 'neon-amber' : 'neon-green'"
+                x-text="WS().status + ' · SCORE ' + Math.round(WS().score) + ' (PEAK ' + Math.round(WS().peak_score) + ')'"></span>
+              <span class="k">TARGET</span><span class="v" x-text="WS().server_name + ' · ' + fmtNum(WS().requests) + ' REQ · ' + WS().attack_hits + ' ATTACK HITS'"></span>
+              <span class="k">SIGNATURES</span><span class="v" x-text="Object.entries(WS().tags || {}).map(([k, n]) => k + '×' + n).join('  ') || '—'"></span>
             </div>
           </template>
-          <template x-if="whois.intel && whois.intel.recent.length">
+          <template x-if="WI().recent.length">
             <table class="mini">
               <colgroup><col style="width:13%"><col style="width:15%"><col style="width:13%"><col style="width:7%"><col style="width:7%"><col style="width:45%"></colgroup>
               <thead><tr><th>TIME</th><th>SERVER</th><th>SITE</th><th>VERB</th><th>CODE</th><th>REQUEST</th></tr></thead>
-              <tbody><template x-for="(r, i) in whois.intel.recent" :key="i">
+              <tbody><template x-for="(r, i) in WI().recent" :key="i">
                 <tr><td x-text="fmtTime(r.ts)"></td><td x-text="r.server_name"></td><td :title="r.site" x-text="r.site_name || r.site || '—'"></td><td x-text="r.method"></td>
                     <td :class="r.status >= 500 ? 'bad' : r.status >= 400 ? 'warn' : ''" x-text="r.status"></td>
                     <td :class="r.tags ? 'bad' : ''" :title="r.uri + (r.query ? '?' + r.query : '') + '\n' + (r.ua || '')" x-text="r.uri + (r.query ? '?' + r.query : '') + (r.tags ? '  [' + r.tags + ']' : '')"></td></tr>
               </template></tbody>
             </table>
           </template>
-          <div class="muted small" x-show="whois.intel && !whois.intel.recent.length && !whois.intel.state">No requests from this address in the log database.</div>
+          <div class="muted small" x-show="whois.intel && !WI().recent.length && !WI().state">No requests from this address in the log database.</div>
 
-          <template x-if="whois.data && whois.data.bans.length">
+          <template x-if="WB().length">
             <div>
-              <div class="section-label"><span>ACTIVE BANS</span><span x-text="whois.data.bans.length"></span></div>
-              <template x-for="b in whois.data.bans" :key="b.id">
+              <div class="section-label"><span>ACTIVE BANS</span><span x-text="WB().length"></span></div>
+              <template x-for="b in WB()" :key="b.id">
                 <div class="small"><span class="srv-tag" x-text="b.server_name"></span> <span class="neon-red" x-text="b.rule_name"></span> <span class="muted" x-text="' · ' + fmtTime(b.banned_at) + ' by ' + b.banned_by"></span></div>
               </template>
             </div>
