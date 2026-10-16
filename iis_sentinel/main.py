@@ -52,6 +52,9 @@ from database import (
     utcnow,
 )
 from events import AlertManager, Hub
+from firewall import PROVIDERS as FIREWALL_PROVIDERS
+from firewall import FirewallError, FirewallManager
+from geoip import GeoResolver
 from http_monitor import HttpMonitor
 from log_tailer import LogTailer, run_demo_fleet
 from whois_lookup import WhoisClient
@@ -448,6 +451,8 @@ class State:
     pipeline: Pipeline
     http: HttpMonitor
     whois: WhoisClient
+    geo: GeoResolver
+    firewall: FirewallManager
     reporter: Reporter
     signer: SessionSigner
     throttle: LoginThrottle
@@ -491,6 +496,21 @@ async def periodic_broadcast() -> None:
             pruned = S.threats.prune()
             if pruned:
                 log.info("Pruned %d idle IP states", pruned)
+
+
+async def geo_enricher() -> None:
+    """Fill in locations the instant lookup could not answer (no GeoIP database yet: RDAP country, rate-limited)."""
+    db = None
+    while True:
+        await asyncio.sleep(5)
+        current = S.geo.status()["database"]
+        if current != db:
+            db = current
+            S.threats.refresh_geo()
+        for ip in S.threats.missing_geo(limit=50 if db else 4):
+            geo = await S.geo.resolve(ip)
+            if geo:
+                S.threats.set_geo(ip, geo)
 
 
 def _servers_payload() -> list[dict[str, Any]]:
@@ -566,14 +586,16 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     S.alerts = AlertManager(S.hub, S.config, S.mailer)
     S.alerts.server_name = S.registry.name
     S.auth = ADAuthenticator(S.config)
-    S.threats = ThreatEngine(S.config, S.registry.name)
+    S.whois = WhoisClient()
+    S.geo = GeoResolver(DATA_DIR, S.whois, lambda: bool(S.config.value("watchers", "geoip_auto_download", True)))
+    S.threats = ThreatEngine(S.config, S.registry.name, S.geo.quick)
+    S.firewall = FirewallManager(S.config, S.remote)
     S.baseliner = Baseliner(S.config)
     S.health = HealthMonitor(S.config, S.alerts, S.hub, S.registry, S.remote)
     queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=50000)
     S.tailer = LogTailer(S.config, S.registry, S.remote, queue, on_status=_log_feed_status, on_sites=_sites_discovered)
     S.ban_locks = defaultdict(asyncio.Lock)
     S.http = HttpMonitor(S.config)
-    S.whois = WhoisClient()
     S.pipeline = Pipeline(queue, S.threats, S.baseliner, S.alerts, S.hub, S.http, S.health.site_name)
     S.reporter = Reporter(S.config, S.mailer)
     S.reporter.on_failure = _report_failed
@@ -587,6 +609,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         elif section == "watchers":
             # log_dirs toggles the optional local server (id 0).
             _on_servers_changed()
+        elif section == "firewall":
+            S.hub.broadcast({"type": "firewall", "data": S.firewall.summary()})
 
     S.config.on_change(_on_config)
     S.registry.on_change(_on_servers_changed)
@@ -601,6 +625,8 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         "system_health": S.health.run,
         "baseliner": S.baseliner.run,
         "broadcaster": periodic_broadcast,
+        "geoip": S.geo.run,
+        "geo_enricher": geo_enricher,
     }
     if DEMO_MODE:
         jobs["demo_traffic"] = run_demo_fleet
@@ -820,7 +846,7 @@ async def post_config(request: Request, user: dict[str, Any] = Depends(current_u
     except (json.JSONDecodeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="Body must be JSON") from exc
     if not isinstance(payload, dict) or not payload:
-        raise HTTPException(status_code=400, detail="Expected an object keyed by section (ad, exchange, watchers, reports, alerts)")
+        raise HTTPException(status_code=400, detail="Expected an object keyed by section (ad, exchange, watchers, reports, alerts, firewall)")
     errors: dict[str, str] = {}
     changed: dict[str, list[str]] = {}
     for section, values in payload.items():
@@ -840,6 +866,25 @@ async def post_config(request: Request, user: dict[str, Any] = Depends(current_u
         await S.alerts.raise_alert("INFO", "config", f"Configuration changed by {user['u']}", summary,
                                    details={"changed": changed, "user": user["u"]}, event="config_changed")
     return await get_config(user)
+
+
+class FirewallTestBody(BaseModel):
+    provider: Literal["windows", "pfsense", "sonicwall", "paloalto"] | None = None
+
+
+@app.get("/firewall")
+async def firewall_summary(_user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    return {**S.firewall.summary(), "providers": FIREWALL_PROVIDERS}
+
+
+@app.post("/firewall/test", dependencies=[Depends(same_origin_guard)])
+async def firewall_test(body: FirewallTestBody, _user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    return await S.firewall.test(body.provider)
+
+
+@app.get("/geoip")
+async def geoip_status(_user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    return S.geo.status()
 
 
 @app.post("/config/test/exchange")
@@ -1131,7 +1176,8 @@ def _ban_dict(b: BannedIP) -> dict[str, Any]:
     return {
         "id": b.id, "server_id": b.server_id, "server_name": S.registry.name(b.server_id), "ip_address": b.ip_address,
         "alert_id": b.alert_id, "rule_name": b.rule_name, "banned_by": b.banned_by, "banned_at": iso(b.banned_at),
-        "active": b.active,
+        "active": b.active, "provider": b.provider or "windows",
+        "provider_label": FIREWALL_PROVIDERS.get(b.provider or "windows", b.provider),
     }
 
 
@@ -1178,52 +1224,64 @@ async def defense_ban(body: BanBody, user: dict[str, Any] = Depends(current_user
     if server is None:
         raise HTTPException(status_code=409, detail=f"Target server {S.registry.name(server_id)} is no longer monitored")
 
-    async with S.ban_locks[(server_id, ip)]:
-        log.warning("BAN requested by %s: %s on %s (alert %s)", user["u"], ip, server["server_name"], body.alert_id)
+    provider = S.firewall.provider()
+    perimeter = provider != "windows"
+    where = FIREWALL_PROVIDERS[provider] if perimeter else server["server_name"]
+    async with S.ban_locks[(-1 if perimeter else server_id, ip)]:
+        log.warning("BAN requested by %s: %s via %s (target %s, alert %s)", user["u"], ip, where, server["server_name"], body.alert_id)
         try:
             try:
-                ok, output = await S.remote.ban(server_id, ip)
+                ok, output = await S.firewall.ban(provider, server_id, ip)
             except asyncio.TimeoutError as exc:
-                raise HTTPException(status_code=504, detail=f"{server['server_name']} did not respond to WinRM in time") from exc
-            except (RemoteError, ValueError) as exc:
-                raise HTTPException(status_code=502, detail=f"Ban failed on {server['server_name']}: {exc}") from exc
+                raise HTTPException(status_code=504, detail=f"{where} did not respond in time") from exc
+            except (RemoteError, FirewallError, ValueError) as exc:
+                raise HTTPException(status_code=502, detail=f"Ban failed on {where}: {exc}") from exc
             except Exception as exc:  # noqa: BLE001
-                log.exception("Ban of %s on %s failed", ip, server["server_name"])
-                raise HTTPException(status_code=502, detail=f"Ban failed on {server['server_name']}: {type(exc).__name__}: {exc}") from exc
+                log.exception("Ban of %s via %s failed", ip, where)
+                raise HTTPException(status_code=502, detail=f"Ban failed on {where}: {type(exc).__name__}: {exc}") from exc
             if not ok:
                 log.error("netsh on %s refused ban of %s: %s", server["server_name"], ip, output)
                 raise HTTPException(status_code=502, detail=f"netsh on {server['server_name']} failed: {output[:400]}")
         except HTTPException as exc:
             await S.alerts.raise_alert(
                 "HIGH", "defense", f"Firewall ban FAILED: {ip}",
-                f"{user['u']} approved banning {ip} but the rule could not be created on {server['server_name']}: {exc.detail}. "
-                "The attacker is NOT blocked.", details={"ip": ip, "error": str(exc.detail), "alert_id": body.alert_id},
+                f"{user['u']} approved banning {ip} but the block could not be created on {where}: {exc.detail}. "
+                "The attacker is NOT blocked.", details={"ip": ip, "error": str(exc.detail), "alert_id": body.alert_id,
+                                                         "provider": provider},
                 server_id=server_id, event="ban_failed", actionable=False,
             )
             raise
 
-        rule = f"SENTINEL BAN: {ip}"
+        rule = S.firewall.rule_name(provider, ip)
 
         async def _op(s):  # type: ignore[no-untyped-def]
-            row = (await s.execute(select(BannedIP).where(
-                BannedIP.server_id == server_id, BannedIP.ip_address == ip, BannedIP.active.is_(True)
-            ))).scalars().first()
+            cond = and_(BannedIP.ip_address == ip, BannedIP.active.is_(True), BannedIP.provider == provider)
+            if not perimeter:
+                cond = and_(cond, BannedIP.server_id == server_id)
+            row = (await s.execute(select(BannedIP).where(cond))).scalars().first()
             if row is None:
-                row = BannedIP(server_id=server_id, ip_address=ip, alert_id=body.alert_id, rule_name=rule,
+                row = BannedIP(server_id=server_id, ip_address=ip, alert_id=body.alert_id, rule_name=rule, provider=provider,
                                banned_by=user["u"], banned_at=utcnow(), active=True)
                 s.add(row)
                 await s.flush()
             return _ban_dict(row)
 
         ban = await run_db(_op)
-        alert_ids = await _set_alert_status(server_id, ip, "Approved", body.alert_id)
-    S.threats.clear(server_id, ip)
+        # A perimeter block covers every server, so the attacker's pending alerts everywhere are resolved.
+        targets = [server_id] + ([x["id"] for x in S.registry.all(enabled_only=False) if x["id"] != server_id] if perimeter else [])
+        alert_ids: list[int] = []
+        for sid in targets:
+            alert_ids += await _set_alert_status(sid, ip, "Approved", body.alert_id if sid == server_id else None)
+    for sid in targets:
+        S.threats.clear(sid, ip)
     S.hub.broadcast({"type": "ban", "data": ban, "alert_ids": alert_ids, "status": "Approved", "output": output[:500]})
+    msg = (f"{user['u']} approved the ban. Windows Firewall rule '{rule}' is now blocking {ip} on {server['server_name']}."
+           if not perimeter else
+           f"{user['u']} approved the ban. {output}. {ip} is now blocked at the {where} perimeter for every server.")
     await S.alerts.raise_alert(
-        "INFO", "defense", f"Firewall ban executed: {ip}",
-        f"{user['u']} approved the ban. Windows Firewall rule '{rule}' is now blocking {ip} on {server['server_name']}.",
-        details={"ip": ip, "rule": rule, "alert_ids": alert_ids, "output": output[:500]}, server_id=server_id,
-        event="ban_executed",
+        "INFO", "defense", f"Firewall ban executed: {ip}", msg,
+        details={"ip": ip, "rule": rule, "provider": provider, "alert_ids": alert_ids, "output": output[:500]},
+        server_id=server_id, event="ban_executed",
     )
     return {"ok": True, "ban": ban, "alert_ids": alert_ids, "output": output}
 
@@ -1266,10 +1324,11 @@ async def lift_ban(ban_id: int, user: dict[str, Any] = Depends(current_user)) ->
         ban = await s.get(BannedIP, ban_id)
     if ban is None or not ban.active:
         raise HTTPException(status_code=404, detail="Active ban not found")
-    name = S.registry.name(ban.server_id)
-    if S.registry.get(ban.server_id) is not None:
+    provider = ban.provider or "windows"
+    name = S.registry.name(ban.server_id) if provider == "windows" else FIREWALL_PROVIDERS.get(provider, provider)
+    if provider != "windows" or S.registry.get(ban.server_id) is not None:
         try:
-            ok, output = await S.remote.unban(ban.server_id, ban.ip_address)
+            ok, output = await S.firewall.unban(provider, ban.server_id, ban.ip_address)
         except Exception as exc:  # noqa: BLE001
             raise HTTPException(status_code=502, detail=f"Unban failed on {name}: {type(exc).__name__}: {exc}") from exc
         if not ok and "No rules match" not in output:
@@ -1282,7 +1341,7 @@ async def lift_ban(ban_id: int, user: dict[str, Any] = Depends(current_user)) ->
     log.warning("Ban %s (%s on %s) lifted by %s", ban_id, ban.ip_address, name, user["u"])
     S.hub.broadcast({"type": "unban", "id": ban_id, "server_id": ban.server_id, "ip_address": ban.ip_address})
     await S.alerts.raise_alert("INFO", "defense", f"Firewall ban lifted: {ban.ip_address}",
-                               f"{user['u']} removed the Sentinel firewall rule for {ban.ip_address} on {name}.",
+                               f"{user['u']} removed the Sentinel block for {ban.ip_address} on {name}.",
                                details={"ip": ban.ip_address, "user": user["u"]}, server_id=ban.server_id,
                                event="ban_lifted", actionable=False)
     return {"ok": True}
@@ -1355,6 +1414,7 @@ async def ws_dashboard(ws: WebSocket) -> None:
         "alerts": S.alerts.recent(50),
         "baseline": S.baseliner.snapshot(),
         "pipeline": S.pipeline.stats(),
+        "firewall": S.firewall.summary(),
     }
 
     async def sender() -> None:

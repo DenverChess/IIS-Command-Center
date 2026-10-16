@@ -11,5 +11,6 @@ ldap3>=2.9.1
 pywinrm>=0.5.0
 exchangelib>=5.2
 requests>=2.31
+maxminddb>=2.4
 APScheduler>=3.10,<4
 tzlocal>=5.0

@@ -10,6 +10,13 @@ const LIST_FIELDS = {
   alerts: ["email_recipients", "http_error_codes", "watched_status_codes", "http_ignore_paths"],
 };
 
+const FIREWALLS = [
+  { id: "windows", label: "Windows Firewall (on server)", desc: "netsh rule on the attacked IIS server via WinRM. Per-server bans." },
+  { id: "pfsense", label: "pfSense / OPNsense", desc: "Adds the IP to a Host alias used by a block rule. Blocks for every server." },
+  { id: "sonicwall", label: "SonicWall", desc: "SonicOS 7 API: address object in a deny-rule address group. Blocks for every server." },
+  { id: "paloalto", label: "Palo Alto", desc: "PAN-OS User-ID tag feeding a Dynamic Address Group. No commit; blocks for every server." },
+];
+
 const START_MODES = { end: "NEW LINES ONLY", full: "WHOLE FILE" };
 
 let audioCtx = null;
@@ -175,6 +182,10 @@ function dashboardApp() {
     alertCatalog: null,
     notifPerm: "Notification" in window ? Notification.permission : "unsupported",
 
+    FIREWALLS,
+    firewall: { provider: "windows", label: "Windows Firewall (on server)", perimeter: false, target: "", error: null },
+    geoStatus: null,
+
     // WHOIS / IP intel modal
     whois: { ip: "", data: null, intel: null },
     whoisOpen: false,
@@ -271,6 +282,7 @@ function dashboardApp() {
           this.alerts = (msg.alerts || []).map((a) => ({ ...a, _k: ++this._k }));
           if (msg.baseline) this.baseline = msg.baseline;
           this.pipeline = msg.pipeline || {};
+          if (msg.firewall) this.firewall = msg.firewall;
           feed.buffer = [];
           termEl().replaceChildren();
           this.addLogs(msg.logs || []);
@@ -334,6 +346,9 @@ function dashboardApp() {
             this.rpmHistory.push(this.pipeline.lines_per_min || 0);
             if (this.rpmHistory.length > 90) this.rpmHistory.shift();
           }
+          break;
+        case "firewall":
+          if (msg.data) this.firewall = msg.data;
           break;
         case "pong":
           this.setServerTime(msg.server_time);
@@ -592,12 +607,19 @@ function dashboardApp() {
       return sel == null ? this.threats : this.threats.filter((t) => t.server_id === sel);
     },
 
+    banPrompt(ip, serverName) {
+      const f = this.firewall;
+      if (f.perimeter) {
+        return `APPROVE PERIMETER BAN\n\nBlock ${ip} on ${f.label} (${f.target || "not configured"})?\n\n` +
+          `This blocks the address for every server, not just ${serverName}.` + (f.error ? `\n\nWARNING: ${f.error}` : "");
+      }
+      return `APPROVE FIREWALL BAN\n\nBlock ${ip} on ${serverName}?\n\n` +
+        `netsh advfirewall firewall add rule name="SENTINEL BAN: ${ip}" dir=in action=block remoteip=${ip}`;
+    },
+
     async approveBan(p) {
       if (this.banBusy[p.key]) return;
-      const ok = window.confirm(
-        `APPROVE FIREWALL BAN\n\nBlock ${p.ip} on ${p.server_name}?\n\n` +
-        `netsh advfirewall firewall add rule name="SENTINEL BAN: ${p.ip}" dir=in action=block remoteip=${p.ip}`
-      );
+      const ok = window.confirm(this.banPrompt(p.ip, p.server_name));
       if (!ok) return;
       this.banBusy[p.key] = true;
       try {
@@ -703,8 +725,10 @@ function dashboardApp() {
     WB() { return (this.whois.data && this.whois.data.bans) || []; },
 
     whoisBanned(sid) {
-      if (this.whois.data && this.whois.data.bans.some((b) => b.server_id === sid)) return true;
-      return this.bans.some((b) => b.server_id === sid && b.ip_address === this.whois.ip);
+      const prov = this.firewall.provider;
+      const hit = (b) => (b.provider || "windows") === prov && (this.firewall.perimeter || b.server_id === sid);
+      if (this.whois.data && this.whois.data.bans.some(hit)) return true;
+      return this.bans.some((b) => b.ip_address === this.whois.ip && hit(b));
     },
 
     async whoisBan() {
@@ -712,8 +736,7 @@ function dashboardApp() {
       if (!this.whoisOpen || !w.banServer || w.banBusy) return;
       const srv = this.serverById(Number(w.banServer));
       if (!srv) return;
-      if (!window.confirm(`APPROVE FIREWALL BAN\n\nBlock ${w.ip} on ${srv.server_name}?\n\n` +
-        `netsh advfirewall firewall add rule name="SENTINEL BAN: ${w.ip}" dir=in action=block remoteip=${w.ip}`)) return;
+      if (!window.confirm(this.banPrompt(w.ip, srv.server_name))) return;
       w.banBusy = true;
       try {
         const r = await api("/defense/ban", { method: "POST", body: JSON.stringify({ server_id: srv.id, ip: w.ip }) });
@@ -880,7 +903,36 @@ function dashboardApp() {
       this.cfgTab = t;
       this.cfgMsg = { ok: true, text: "" };
       if (t === "alerts") this.loadAlertCatalog();
-      if (t === "watchers") this.refreshServers();
+      if (t === "watchers") { this.refreshServers(); this.loadGeoStatus(); }
+    },
+
+    async loadGeoStatus() {
+      try { this.geoStatus = await api("/geoip"); } catch (_) { this.geoStatus = null; }
+    },
+
+    geoStatusText() {
+      const g = this.geoStatus;
+      if (!g) return "";
+      if (g.database) return `Location source: ${g.source}${g.built ? " (built " + g.built + ")" : ""}`;
+      return g.source === "rdap-country" ? "Location source: WHOIS registry country (no GeoIP database yet)" : "Location source: none";
+    },
+
+    async testFirewall() {
+      await this.saveConfig();
+      if (!this.cfgMsg.ok) return;
+      try {
+        const s = await api("/firewall");
+        this.firewall = s;
+        if (s.provider === "windows") return;
+        this.busy = true;
+        this.cfgMsg = { ok: true, text: `Testing ${s.label}…` };
+        const r = await api("/firewall/test", { method: "POST", body: JSON.stringify({}) });
+        this.cfgMsg = { ok: r.ok, text: (r.ok ? "CONNECTION OK: " : "TEST FAILED: ") + r.message };
+      } catch (e) {
+        this.cfgMsg = { ok: false, text: e.message };
+      } finally {
+        this.busy = false;
+      }
     },
 
     async loadAlertCatalog() {
@@ -943,6 +995,8 @@ function dashboardApp() {
         await api("/config", { method: "POST", body: JSON.stringify(payload) });
         await this.loadConfig();
         if (section === "alerts" || section === "exchange") this.loadAlertCatalog();
+        if (section === "firewall") { try { this.firewall = await api("/firewall"); } catch (_) {} }
+        if (section === "watchers") this.loadGeoStatus();
         this.cfgMsg = { ok: true, text: `${section.toUpperCase()} configuration saved.` };
       } catch (e) {
         this.cfgMsg = { ok: false, text: e.message };

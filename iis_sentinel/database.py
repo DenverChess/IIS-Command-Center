@@ -193,6 +193,7 @@ class BannedIP(Base):
     ip_address: Mapped[str] = mapped_column(String(64), index=True)
     alert_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("alerts.id"), nullable=True)
     rule_name: Mapped[str] = mapped_column(String(256), default="")
+    provider: Mapped[str] = mapped_column(String(16), default="windows")
     banned_by: Mapped[str] = mapped_column(String(256), default="")
     banned_at: Mapped[datetime] = mapped_column(DateTime)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -252,6 +253,7 @@ _ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
     "system_metrics": {"server_id": "INTEGER NOT NULL DEFAULT 0"},
     "alerts": {"server_id": "INTEGER NOT NULL DEFAULT 0", "status": "VARCHAR(16) NOT NULL DEFAULT 'Pending'",
                "event": "VARCHAR(48) NOT NULL DEFAULT ''"},
+    "banned_ips": {"provider": "VARCHAR(16) NOT NULL DEFAULT 'windows'"},
     "monitored_servers": {"log_start_mode": "VARCHAR(8) NOT NULL DEFAULT 'end'",
                           "log_tail_lines": "INTEGER NOT NULL DEFAULT 1000"},
 }
@@ -369,7 +371,13 @@ def unprotect_secret(stored: str) -> str:
 # Config store
 # --------------------------------------------------------------------------------------
 SECRET_MASK = "********"
-SECRET_FIELDS: set[tuple[str, str]] = {("exchange", "password")}
+SECRET_FIELDS: set[tuple[str, str]] = {
+    ("exchange", "password"),
+    ("firewall", "pfsense_api_key"), ("firewall", "pfsense_api_secret"),
+    ("firewall", "sonicwall_password"),
+    ("firewall", "paloalto_api_key"), ("firewall", "paloalto_password"),
+}
+FIREWALL_PROVIDERS = ("windows", "pfsense", "sonicwall", "paloalto")
 LOG_START_MODES = ("end", "tail", "full")
 
 DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
@@ -424,6 +432,7 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "threat_score_threshold": 50,
         "threat_half_life_minutes": 30,
         "retention_days": 45,
+        "geoip_auto_download": True,
     },
     "reports": {
         "schedule": "weekly",
@@ -457,6 +466,31 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "slow_response_window_minutes": 5,
         "http_ignore_paths": [],
         "cert_warning_days": 21,
+    },
+    "firewall": {
+        # Where APPROVE BAN pushes the block. windows = netsh on the attacked server (per-server bans).
+        "provider": "windows",
+        "timeout": 15,
+        "pfsense_platform": "opnsense",
+        "pfsense_url": "",
+        "pfsense_api_key": "",
+        "pfsense_api_secret": "",
+        "pfsense_alias": "SENTINEL_BANS",
+        "pfsense_verify_ssl": True,
+        "sonicwall_url": "",
+        "sonicwall_username": "",
+        "sonicwall_password": "",
+        "sonicwall_group": "SENTINEL_BANS",
+        "sonicwall_zone": "WAN",
+        "sonicwall_verify_ssl": True,
+        "paloalto_url": "",
+        "paloalto_api_key": "",
+        "paloalto_username": "",
+        "paloalto_password": "",
+        "paloalto_tag": "sentinel-ban",
+        "paloalto_vsys": "vsys1",
+        "paloalto_timeout_minutes": 0,
+        "paloalto_verify_ssl": True,
     },
 }
 
@@ -519,6 +553,16 @@ def _hhmm(v: str) -> None:
         raise ValueError("must be a 24h time like 22:00")
 
 
+def _mgmt_url(v: str) -> None:
+    if v and not re.match(r"^(https?://)?[A-Za-z0-9.\-\[\]:]+(:\d+)?(/[^\s]*)?$", v):
+        raise ValueError("must be a management URL like https://192.0.2.1 or https://fw.corp.local:8443")
+
+
+def _object_name(v: str) -> None:
+    if not re.match(r"^[A-Za-z0-9_.\-]{1,63}$", v):
+        raise ValueError("must be 1-63 letters, digits, '.', '_' or '-'")
+
+
 def _alert_events(v: dict[str, dict[str, Any]]) -> None:
     for eid, s in v.items():
         if s.get("severity") not in ("default", *SEVERITIES):
@@ -565,6 +609,16 @@ VALIDATORS: dict[tuple[str, str], Callable[[Any], None]] = {
     ("alerts", "slow_response_threshold"): _range(1, 100000),
     ("alerts", "slow_response_window_minutes"): _range(1, 1440),
     ("alerts", "cert_warning_days"): _range(1, 365),
+    ("firewall", "provider"): _choice(*FIREWALL_PROVIDERS),
+    ("firewall", "pfsense_platform"): _choice("pfsense", "opnsense"),
+    ("firewall", "timeout"): _range(3, 120),
+    ("firewall", "pfsense_url"): _mgmt_url,
+    ("firewall", "sonicwall_url"): _mgmt_url,
+    ("firewall", "paloalto_url"): _mgmt_url,
+    ("firewall", "pfsense_alias"): _object_name,
+    ("firewall", "sonicwall_group"): _object_name,
+    ("firewall", "paloalto_tag"): _object_name,
+    ("firewall", "paloalto_timeout_minutes"): _range(0, 43200),
     ("reports", "schedule"): _choice("weekly", "monthly", "both", "disabled"),
     ("reports", "day_of_week"): _choice(*sorted(_DOW)),
     ("reports", "day_of_month"): _range(1, 28),
@@ -644,7 +698,7 @@ def _env_seed() -> dict[str, dict[str, Any]]:
 
 
 class ConfigStore:
-    """In-memory cached, DB-persisted config, split into sections (ad, exchange, watchers, reports)."""
+    """In-memory cached, DB-persisted config, split into sections (ad, exchange, watchers, reports, alerts, firewall)."""
 
     def __init__(self) -> None:
         self._cache: dict[str, dict[str, Any]] = copy.deepcopy(DEFAULT_CONFIG)
