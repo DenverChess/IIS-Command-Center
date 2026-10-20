@@ -50,6 +50,7 @@ backoff **while the rest of the fleet keeps streaming**.
 ### `▸` DETECT
 - **Signatures:** SQL injection, XSS, path traversal / LFI, scanner user-agents (`sqlmap`, `nikto`, `nuclei`…)
 - **Spikes:** 404 floods and 401/403 brute-force bursts
+- **Directory enumeration:** 3+ different missing paths from one IP in 5 min, queued for ban with the probed URIs and WHOIS owner
 - **Z-score anomalies** against a 24h baseline per IP, per server and per client population
 - **Threat scoring** per *(server, attacker IP)* with half-life decay
 
@@ -69,8 +70,10 @@ backoff **while the rest of the fleet keeps streaming**.
 
 ### `▸` RESPOND
 - **PENDING THREATS** queue, grouped per attacker per target server
-- One-click **APPROVE BAN** pushes a Windows Firewall rule to *that* server
+- One-click **APPROVE BAN** pushes a Windows Firewall rule to *that* server, or **BAN ALL** clears the whole queue
+- Perimeter bans on **SonicWall**, pfSense / OPNsense or Palo Alto, with SonicWall address-group management in the UI
 - Ban history, one-click unban, dismiss without action
+- **Live log search** (full-text, status / IP / URI / date filters) over everything Sentinel has stored
 - Click any IP for **WHOIS / IP intel**: owner, network, abuse contact, reverse DNS, its request history, ban on any server
 - Nothing is ever blocked automatically: a human always approves
 
@@ -247,6 +250,9 @@ netsh advfirewall firewall add rule name="SENTINEL BAN: <ip>" dir=in action=bloc
 - **Strict IP validation:** loopback, unspecified and multicast addresses are refused, as is anything that isn't a literal IP.
 - **Idempotent:** the rule is only added if it doesn't already exist, and approving the same alert twice returns `409`.
 - **Clears the queue:** every other Pending alert from that attacker on that server becomes ![Approved](https://img.shields.io/badge/-Approved-0aff00?style=flat-square&labelColor=050505).
+- **BAN ALL:** the big red button above the queue bans every pending attacker in one go, after a confirmation
+  ("You are about to ban X IPs across Y servers"). Each IP is banned once (once per server with Windows Firewall);
+  failures stay in the queue and are listed in a toast.
 - **Reversible:** **BANS → UNBAN** (`DELETE /defense/bans/{id}`) deletes the firewall rule. Alerts can also be ![Dismissed](https://img.shields.io/badge/-Dismissed-555555?style=flat-square&labelColor=050505) without action.
 
 ### Where the ban goes: CONFIG → FIREWALL
@@ -264,7 +270,28 @@ Pick one provider with the radio buttons. The setup steps for each one are shown
 - **One approval clears every server:** a perimeter ban resolves that attacker's pending threats on every server.
 - **LIFT removes the right entry:** each ban remembers which provider made it, so LIFT works even after you switch providers.
 - **Credentials are encrypted:** firewall credentials are stored DPAPI-encrypted, like the Exchange password.
-- **Test before you rely on it:** **SAVE & TEST CONNECTION** checks the credentials and that the alias or group exists.
+- **Test before you rely on it:** **TEST CONNECTION** checks the settings on screen (before you save them): credentials
+  and that the alias or group exists. The result is shown as a toast.
+- **Belt and braces:** tick *Also add the Windows Firewall rule* to push the `netsh` rule to the attacked server as
+  well as the perimeter block. LIFT removes both.
+
+#### SonicWall
+
+- **HTTP or HTTPS:** the *SonicWall API URL* is used exactly as typed (`http://192.168.168.168` or `https://fw:4433`).
+  It is never upgraded to HTTPS. TLS certificate verification is **off**, so the factory self-signed certificate works.
+- **One admin session at a time:** SonicOS allows a single config session, so Sentinel queues its API calls. A BAN ALL of 50
+  IPs never kicks itself out, and every ban PUTs the complete member list (SonicOS replaces members on PUT).
+- **Group management:** the *Address groups* table in **CONFIG → FIREWALL** lists every IPv4 group on the box with its members.
+  You can create a group, make it the default ban group (**USE**) or delete it. The current default group can't be deleted.
+  Deleting a group also removes its `SENTINEL_*` address objects.
+- **Hosts and networks:** `POST /firewall/groups/{name}/members` takes a host (`203.0.113.7`) or a CIDR (`203.0.113.0/24`),
+  which becomes a network object.
+- **Commit, then verify:** every change is committed (`/config/pending`) and then verified, because SonicOS 7.3 reads return
+  committed configuration.
+- **Errors:** wrong credentials, a missing group and HTTP 429 rate limiting each get a clear error. A 429 is retried
+  automatically, honouring `Retry-After`.
+- **Open the settings:** the **Perimeter Firewall** card in the right-hand panel shows where bans go and opens
+  **FIREWALL SETTINGS**.
 
 ### Locations in the threat matrix
 
@@ -293,7 +320,7 @@ shown as a toast and desktop pop-up (**DESKTOP**), emailed through Exchange (**E
 
 | Group | Events |
 | --- | --- |
-| Threats | active threat (required: it feeds the ban queue), SQLi, XSS, traversal, scanner, 404 flood, auth brute force, threat cleared |
+| Threats | active threat (required: it feeds the ban queue), SQLi, XSS, traversal, scanner, 404 flood, directory enumeration (404 scan), auth brute force, threat cleared |
 | HTTP | server errors (HTTP 500-599, configurable, rolled up per URL), error bursts per site, watched codes (e.g. 413/429), slow responses, traffic / latency anomalies, traffic drop |
 | Health | server unreachable / recovered, log feed offline / restored, new site, site stopped / started, app pool stopped / recovered / removed, W3SVC down / recovered, CPU, RAM, disk, TLS certificate expiring |
 | Defense | ban executed, ban failed, ban lifted |
@@ -321,6 +348,7 @@ HTTP from another machine, in-page toasts and the alert tone still work.
 | Path traversal / LFI | **+10** | `../`, encoded variants, `/etc/passwd`, `win.ini` |
 | Scanner user-agent | **+5** | `sqlmap`, `nikto`, `nuclei`, `acunetix`, `masscan`… |
 | 404 spike | **+5** | ≥ `spike_404_threshold` 404s from one IP inside the spike window |
+| Directory enumeration | **+5** | ≥ `enum_404_threshold` (3) **different** 404 paths from one IP within `enum_404_window_minutes` (5). It raises a Pending *Directory Enumeration (404 Scan)* alert with the URIs and the WHOIS owner. `favicon.ico`, `robots.txt`, `apple-touch-icon*`, `sitemap*.xml` and `/.well-known/*` are ignored. The counters are saved to the database every 60 s, so a restart doesn't reset a scan in progress |
 | 401 / 403 spike | **+5** | ≥ `spike_auth_threshold` auth failures from one IP |
 | Z-score anomaly | **+20** | Requests/min or bandwidth/min with Z > 3.0 against the IP's 24h baseline |
 
@@ -401,7 +429,9 @@ iis_sentinel/
 ├── log_tailer.py      one tail task per server · rolling W3C parser (rollover, truncation, #Fields aware)
 ├── system_health.py   one health task per server · app pool / W3SVC / disk / CPU alerts · offline detection
 ├── baseliner.py       24h statistical baseline (per server / per IP / population) · Z-score anomalies
-├── threat_rules.py    SQLi / XSS / traversal / scanner signatures · 404 + 401/403 spikes · threat scores
+├── threat_rules.py    SQLi / XSS / traversal / scanner signatures · 404 + 401/403 spikes · dir enumeration · scores
+├── firewall.py        ban providers: Windows (netsh) · pfSense / OPNsense · SonicWall · Palo Alto
+├── sonicwall_api.py   async SonicOS 7 client (httpx, http or https, no TLS verify): groups, objects, commit
 ├── database.py        async SQLAlchemy (SQLite WAL) · server registry · DPAPI-protected config store
 ├── events.py          WebSocket fan-out hub · alert pipeline (persist → broadcast → email)
 ├── ad_auth.py         Active Directory bind (LDAPS / StartTLS, nested-group gate) · break-glass login
@@ -496,7 +526,12 @@ Every log line, health sample, threat and alert pushed over the WebSocket carrie
 | `POST` | `/alerts/test` | `{desktop, email, severity}`: raise a test notification and optionally send a test email |
 | `GET` | `/threats/whois/{ip}?refresh=` | RDAP WHOIS + reverse DNS (cached 6 h), active bans and alert count for an IP |
 | `POST` | `/config/test/exchange` | Send a test mail |
-| `GET` / `POST` | `/firewall`, `/firewall/test` | Active ban provider / test its API connection |
+| `POST` | `/defense/ban-all` | `{alert_ids: [...]}`: ban every attacker behind those Pending alerts. Returns `{banned, failed, skipped, alert_ids, ip_count, server_count}` |
+| `GET` / `POST` | `/firewall`, `/firewall/test` | Active ban provider / test a connection (`{provider, settings?}`: unsaved form values; a masked secret keeps the saved one) |
+| `GET` / `POST` | `/firewall/config` | `{firewall_type, api_url, username, api_key, default_group_name, zone, also_windows}` (secret masked). Saved in the `firewall` config section |
+| `GET` / `POST` / `DELETE` | `/firewall/groups` (`DELETE ?name=`) | SonicWall IPv4 address groups with resolved members / create `{name, description}` / delete |
+| `POST` / `DELETE` | `/firewall/groups/{name}/members` (`DELETE ?address=`) | Add / remove a host or CIDR (`SENTINEL_*` object) and commit |
+| `GET` | `/logs/search` | `q` (free text plus `ip:` `status:` `uri:` `method:` `server:` tokens), `status=all\|4xx\|5xx\|404\|<code>`, `ip`, `uri`, `server_id`, `since`, `until` (ISO, UTC), `page`, `page_size` (≤ 200) |
 | `GET` | `/geoip` | GeoIP database in use |
 | `GET` | `/threats/live` | Recent malicious requests plus threat and anomaly alerts |
 | `GET` | `/threats/active?server_id=` | Threat matrix (scored server/IP pairs) |
@@ -527,8 +562,18 @@ Every log line, health sample, threat and alert pushed over the WebSocket carrie
   - **AD and Exchange:** calls have hard timeouts and return errors instead of raising.
   - **Exchange mail:** has retries, a circuit breaker and an hourly cap.
   - **Reports:** always recorded in the database, even when delivery fails.
-- **Durable storage.** SQLite runs in WAL mode with busy timeouts and lock retries. Log writes are batched and
-  re-queued on failure. Older databases are migrated in place.
+- **Durable storage.** SQLite runs in WAL mode with busy timeouts and lock retries.
+  - **Batched writes:** log lines are written in batches of 500 or every 5 s, whichever comes first. A batch that still
+    hits a lock after the retries is put back and written with the next one.
+  - **Instant live view:** the live view never waits for the database. An in-memory ring buffer feeds the WebSocket
+    every 0.3 s.
+  - **Migrations:** older databases are migrated in place.
+- **Full-text log search.** An SQLite FTS5 index covers URI, query string, user agent, client IP, method and user,
+  and triggers keep it in sync with every insert and purge.
+  - **Upgrades:** rows written before the upgrade are indexed in the background, in small chunks.
+  - **No FTS5:** on SQLite builds without FTS5, search falls back to `LIKE` matching.
+  - **In the dashboard:** the search bar above the live feed (300 ms debounce) switches the feed to paged **SEARCH RESULTS**.
+    **CLEAR SEARCH / LIVE MODE** goes back to the live stream.
 - **Log rotation is never blocked.** Log files are opened per read, never held open.
 
 ---
