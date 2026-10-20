@@ -8,6 +8,7 @@ import asyncio
 import base64
 import hashlib
 import hmac
+import ipaddress
 import json
 import logging
 import os
@@ -45,7 +46,11 @@ from database import (
     SECRET_FIELDS,
     SECRET_MASK,
     ActionableAlert,
+    AllowlistEntry,
     BannedIP,
+    BannedRange,
+    allowlist_overlaps,
+    parse_network,
     ConfigStore,
     LogEntry,
     ScheduledReport,
@@ -69,7 +74,8 @@ import sonicwall_api
 from geoip import GeoResolver
 from http_monitor import HttpMonitor
 from log_tailer import LogTailer, run_demo_fleet
-from whois_lookup import WhoisClient
+from defense_engine import DefenseEngine
+from whois_lookup import WhoisClient, calculate_escalation_cidr, network_for_scope
 from mailer import Mailer, render_alert_html
 from remote_manager import RemoteError, RemoteManager, validate_ban_ip
 from reporter import Reporter
@@ -504,6 +510,7 @@ class State:
     whois: WhoisClient
     geo: GeoResolver
     firewall: FirewallManager
+    defense: DefenseEngine
     reporter: Reporter
     signer: SessionSigner
     throttle: LoginThrottle
@@ -673,6 +680,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     S.geo = GeoResolver(DATA_DIR, S.whois, lambda: bool(S.config.value("watchers", "geoip_auto_download", True)))
     S.threats = ThreatEngine(S.config, S.registry.name, S.geo.quick)
     S.firewall = FirewallManager(S.config, S.remote)
+    S.defense = DefenseEngine(S.config, S.registry, S.remote, S.firewall)
     S.baseliner = Baseliner(S.config)
     S.health = HealthMonitor(S.config, S.alerts, S.hub, S.registry, S.remote)
     queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=50000)
@@ -776,7 +784,7 @@ async def security_headers(request: Request, call_next: Callable[[Request], Awai
         "img-src 'self' data:; connect-src 'self' ws: wss:; frame-ancestors 'none'"
     )
     if request.url.path.startswith(("/api", "/login", "/config", "/threats", "/system", "/alerts", "/reports", "/stats",
-                                    "/servers", "/defense")):
+                                    "/servers", "/defense", "/banned-ranges", "/allowlist", "/intel", "/logs", "/firewall")):
         response.headers["Cache-Control"] = "no-store"
     return response
 
@@ -1552,6 +1560,10 @@ async def _execute_ban(server_id: int, ip: str, alert_id: int | None, user: str)
     server = S.registry.get(server_id)
     if server is None:
         raise HTTPException(status_code=409, detail=f"Target server {S.registry.name(server_id)} is no longer monitored")
+    allowed = await allowlist_overlaps(ip)
+    if allowed:
+        raise HTTPException(status_code=409, detail=f"{ip} is allowlisted ({allowed[0]['ip_or_cidr']}"
+                                                    f"{': ' + allowed[0]['description'] if allowed[0]['description'] else ''})")
 
     provider = S.firewall.provider()
     perimeter = provider != "windows"
@@ -1781,6 +1793,261 @@ async def lift_ban(ban_id: int, user: dict[str, Any] = Depends(current_user)) ->
                                f"{user['u']} removed the Sentinel block for {ban.ip_address} on {name}.{extra}",
                                details={"ip": ban.ip_address, "user": user["u"]}, server_id=ban.server_id,
                                event="ban_lifted", actionable=False)
+    return {"ok": True}
+
+
+# --------------------------------------------------------------------------------------
+# CIDR range bans, subnet escalation and the allowlist
+# --------------------------------------------------------------------------------------
+class RangeBanBody(BaseModel):
+    model_config = {"extra": "forbid"}
+
+    alert_id: int | None = Field(default=None, ge=1)
+    ip: str | None = Field(default=None, max_length=64)
+    server_id: int | None = Field(default=None, ge=0)
+    scope: str | None = Field(default=None, max_length=8)
+    firewall_target: Literal["windows", "sonicwall", "both"] | None = None
+
+
+class AllowlistBody(BaseModel):
+    ip_or_cidr: str = Field(min_length=1, max_length=64)
+    description: str = Field(default="", max_length=256)
+
+
+def _clean_ip(ip: str) -> str:
+    try:
+        addr = ipaddress.ip_address(str(ip).strip())
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"'{str(ip)[:64]}' is not a valid IP address") from exc
+    return str(addr.ipv4_mapped if addr.version == 6 and addr.ipv4_mapped else addr)
+
+
+def _range_dict(r: BannedRange) -> dict[str, Any]:
+    try:
+        ips = json.loads(r.source_ips or "[]")
+    except ValueError:
+        ips = []
+    try:
+        applied = json.loads(r.applied or "{}")
+    except ValueError:
+        applied = {}
+    return {
+        "id": r.id, "cidr": r.cidr_notation, "cidr_notation": r.cidr_notation, "scope": r.scope, "reason": r.reason,
+        "threat_score": r.threat_score, "banned_at": iso(r.banned_at), "is_active": r.is_active,
+        "source_ip_count": r.source_ip_count, "source_ips": ips, "server_id": r.server_id,
+        "server_name": S.registry.name(r.server_id) if r.server_id is not None else "",
+        "firewall_target": r.firewall_target, "applied": applied, "alert_id": r.alert_id, "banned_by": r.banned_by,
+        "output": r.output, "lifted_at": iso(r.lifted_at), "lifted_by": r.lifted_by,
+        "size": parse_network(r.cidr_notation).num_addresses if r.cidr_notation else 0,
+    }
+
+
+@app.get("/intel/recommend-cidr")
+async def recommend_cidr(ip: str, server_id: int | None = None, _user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    """Everything the BAN THREAT dialog needs: escalation advice, WHOIS, allowlist / self-ban pre-flight per scope."""
+    ip = _clean_ip(ip)
+    rec, whois = await asyncio.gather(calculate_escalation_cidr(ip), S.whois.enrich_ip(ip))
+    for opt in rec["options"]:
+        pre = await S.defense.preflight(opt["cidr"])
+        opt.update({"recommended": opt["cidr"] == rec["recommended_cidr"], "blocked": not pre["ok"], "error": pre["error"],
+                    "allowlist": pre["allowlist"]})
+    w = whois or {}
+    have_whois = not w.get("error") and any(w.get(k) for k in ("organization", "network_name", "country", "origin_as"))
+    sw = S.defense.sonicwall_status()
+    threat = S.threats.ip_detail(ip, server_id) or {}
+    return {
+        **rec,
+        "whois": ({"organization": w.get("organization") or w.get("network_name"), "network_name": w.get("network_name"),
+                   "asn": ", ".join(w.get("origin_as") or []), "country": w.get("country"), "registry": w.get("registry"),
+                   "abuse_email": w.get("abuse_email"), "abuse_phone": w.get("abuse_phone"), "cidr_range": w.get("cidr_range"),
+                   "reverse_dns": w.get("reverse_dns"), "summary": w.get("summary")} if have_whois else None),
+        "whois_error": None if have_whois else (w.get("error") or "No WHOIS data available"),
+        "allowlisted": any(o["allowlist"] for o in rec["options"] if o["recommended"]),
+        "default_target": S.defense.default_target(),
+        "targets": {"windows": {"ready": bool(S.registry.all()), "error": None if S.registry.all() else "no monitored servers"},
+                    "sonicwall": {"ready": sw["ready"], "error": sw["error"], "group": sw["group"]}},
+        "threat_score": threat.get("score"),
+    }
+
+
+async def _approve_alerts_in(net: Any, server_ids: list[int] | None, primary_id: int | None) -> list[int]:
+    """Approve every Pending alert whose source IP falls in `net` (on the given servers, or all when None)."""
+    async def _op(s):  # type: ignore[no-untyped-def]
+        q = select(ActionableAlert.id, ActionableAlert.source_ip, ActionableAlert.server_id).where(
+            ActionableAlert.status == "Pending", ActionableAlert.source_ip.is_not(None)).limit(20000)
+        ids = []
+        for aid, src, sid in (await s.execute(q)).all():
+            if server_ids is not None and sid not in server_ids:
+                continue
+            try:
+                if parse_network(src).network_address in net:
+                    ids.append(aid)
+            except ValueError:
+                continue
+        if primary_id is not None and primary_id not in ids:
+            ids.append(primary_id)
+        if ids:
+            await s.execute(update(ActionableAlert).where(ActionableAlert.id.in_(ids)).values(status="Approved", acknowledged=True))
+        return ids
+
+    ids = await run_db(_op)
+    for alert_id in ids:
+        S.alerts.update_recent(alert_id, status="Approved", acknowledged=True)
+    return ids
+
+
+@app.post("/defense/ban-range", dependencies=[Depends(same_origin_guard)])
+async def defense_ban_range(body: RangeBanBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    alert: ActionableAlert | None = None
+    if body.alert_id is not None:
+        async with SessionLocal() as s:
+            alert = await s.get(ActionableAlert, body.alert_id)
+        if alert is None:
+            raise HTTPException(status_code=404, detail="Alert not found")
+        if not alert.source_ip:
+            raise HTTPException(status_code=400, detail="This alert has no source IP to ban")
+        ip, server_id = alert.source_ip, alert.server_id
+    elif body.ip:
+        ip, server_id = body.ip, body.server_id
+    else:
+        raise HTTPException(status_code=400, detail="Provide alert_id (or ip)")
+    ip = _clean_ip(ip)
+    rec = await calculate_escalation_cidr(ip)
+    try:
+        net = network_for_scope(ip, body.scope) if body.scope else parse_network(rec["recommended_cidr"])
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    scope = f"/{net.prefixlen}"
+    target = body.firewall_target or S.defense.default_target()
+    if str(net) == rec["recommended_cidr"]:
+        reason = rec["reason"]
+    else:
+        reason = f"operator chose {scope} (recommended {rec['scope']}: {rec['reason']})"
+    sources = [ip] + [x for x in rec["attacker_ips"] if parse_network(x).network_address in net]
+    threat = S.threats.ip_detail(ip, server_id) or {}
+    result = await S.defense.execute_range_ban(
+        str(net), scope, target, server_id, reason=reason,
+        threat_score=float(threat.get("score") or 0), source_ips=sources, alert_id=body.alert_id, user=user["u"])
+    where = {"windows": "Windows Firewall", "sonicwall": "the SonicWall group", "both": "Windows Firewall + SonicWall"}[target]
+    if not result["success"]:
+        await S.alerts.raise_alert(
+            "HIGH", "defense", f"Range ban FAILED: {net}",
+            f"{user['u']} approved banning {net} ({scope}) on {where} but it was not applied: {result['error']}. "
+            "The range is NOT blocked.", details={"cidr": str(net), "error": result["error"], "alert_id": body.alert_id,
+                                                  "results": result.get("results", [])},
+            server_id=server_id if server_id is not None else LOCAL_SERVER_ID, event="ban_failed", actionable=False,
+        )
+        code = 409 if (result.get("allowlist") or result.get("protected")) else 502
+        raise HTTPException(status_code=code, detail=result["error"])
+    if result.get("already"):
+        return {"ok": True, **result, "alert_ids": []}
+
+    applied = result["applied"]
+    scope_servers = None if applied.get("sonicwall") else list(applied.get("windows") or [])
+    alert_ids = await _approve_alerts_in(net, scope_servers, body.alert_id)
+    for srv in S.registry.all(enabled_only=False):
+        if scope_servers is None or srv["id"] in scope_servers:
+            for src_ip in sources:
+                S.threats.clear(srv["id"], src_ip)
+    async with SessionLocal() as s:
+        row = await s.get(BannedRange, result["id"])
+    data = _range_dict(row) if row else {}
+    S.hub.broadcast({"type": "alert_status", "ids": alert_ids, "status": "Approved"})
+    S.hub.broadcast({"type": "range_ban_notification", "cidr": str(net), "scope": scope, "reason": reason,
+                     "firewall_target": target, "data": data, "alert_ids": alert_ids})
+    partial = "; ".join(f"{r['target']}{' ' + r['server'] if r['server'] else ''}: {r['message']}"
+                        for r in result["results"] if not r["ok"])
+    await S.alerts.raise_alert(
+        "WARNING" if partial else "INFO", "defense", f"Range ban executed: {net} ({scope})",
+        f"{user['u']} banned {net} ({net.num_addresses:,} address{'es' if net.num_addresses != 1 else ''}) on {where}. "
+        f"Reason: {reason}." + (f" Partially failed: {partial}" if partial else ""),
+        details={"cidr": str(net), "scope": scope, "firewall_target": target, "reason": reason, "source_ips": sources[:50],
+                 "alert_ids": alert_ids, "results": result["results"]},
+        server_id=server_id if server_id is not None else LOCAL_SERVER_ID, event="range_ban_executed", actionable=False,
+    )
+    return {"ok": True, **result, "reason": reason, "alert_ids": alert_ids, "range": data}
+
+
+@app.get("/banned-ranges")
+async def list_banned_ranges(active: bool | None = None, page: int = 1, page_size: int = 50,
+                             _user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    page = max(1, page)
+    page_size = max(1, min(page_size, 500))
+    q = select(BannedRange)
+    cq = select(func.count(BannedRange.id))
+    if active is not None:
+        q, cq = q.where(BannedRange.is_active.is_(active)), cq.where(BannedRange.is_active.is_(active))
+    async with SessionLocal() as s:
+        total = (await s.execute(cq)).scalar_one()
+        rows = (await s.execute(q.order_by(desc(BannedRange.id)).offset((page - 1) * page_size).limit(page_size))).scalars().all()
+    return {"ranges": [_range_dict(r) for r in rows], "total": total, "page": page, "page_size": page_size,
+            "pages": max(1, -(-total // page_size))}
+
+
+@app.delete("/banned-ranges/{range_id}", dependencies=[Depends(same_origin_guard)])
+async def lift_banned_range(range_id: int, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    result = await S.defense.lift_range_ban(range_id, user["u"])
+    if not result["success"]:
+        raise HTTPException(status_code=404 if result.get("not_found") else 502, detail=result["error"])
+    S.hub.broadcast({"type": "range_unban", "id": range_id, "cidr": result["cidr"]})
+    await S.alerts.raise_alert(
+        "INFO", "defense", f"Range ban lifted: {result['cidr']}",
+        f"{user['u']} removed the Sentinel block for {result['cidr']} ({result['firewall_target']}).",
+        details={"cidr": result["cidr"], "user": user["u"], "results": result["results"]},
+        server_id=result["server_id"] if result["server_id"] is not None else LOCAL_SERVER_ID,
+        event="range_ban_lifted", actionable=False,
+    )
+    return {"ok": True, **result}
+
+
+def _allow_dict(r: AllowlistEntry) -> dict[str, Any]:
+    return {"id": r.id, "ip_or_cidr": r.ip_or_cidr, "description": r.description, "added_by": r.added_by,
+            "added_at": iso(r.added_at), "is_active": r.is_active}
+
+
+@app.get("/allowlist")
+async def list_allowlist(_user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    async with SessionLocal() as s:
+        rows = (await s.execute(select(AllowlistEntry).where(AllowlistEntry.is_active.is_(True))
+                                .order_by(desc(AllowlistEntry.id)))).scalars().all()
+    return {"entries": [_allow_dict(r) for r in rows]}
+
+
+@app.post("/allowlist", status_code=201, dependencies=[Depends(same_origin_guard)])
+async def add_allowlist(body: AllowlistBody, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    try:
+        net = parse_network(body.ip_or_cidr)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"'{body.ip_or_cidr}' is not a valid IP address or CIDR range") from exc
+    value = str(net.network_address) if net.prefixlen == net.max_prefixlen else str(net)
+    entry = AllowlistEntry(ip_or_cidr=value, description=body.description.strip(), added_by=user["u"],
+                           added_at=utcnow(), is_active=True)
+
+    async def _op(s):  # type: ignore[no-untyped-def]
+        s.add(entry)
+        await s.flush()
+        return _allow_dict(entry)
+
+    data = await run_db(_op)
+    async with SessionLocal() as s:
+        overlapping = [r.cidr_notation for r in (await s.execute(select(BannedRange).where(BannedRange.is_active.is_(True)))).scalars()
+                       if parse_network(r.cidr_notation).version == net.version and parse_network(r.cidr_notation).overlaps(net)]
+    log.info("Allowlist: %s added by %s", value, user["u"])
+    S.hub.broadcast({"type": "allowlist", "action": "add", "data": data})
+    return {"ok": True, "entry": data, "overlapping_bans": overlapping}
+
+
+@app.delete("/allowlist/{entry_id}", dependencies=[Depends(same_origin_guard)])
+async def delete_allowlist(entry_id: int, user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    async def _op(s):  # type: ignore[no-untyped-def]
+        res = await s.execute(update(AllowlistEntry).where(AllowlistEntry.id == entry_id, AllowlistEntry.is_active.is_(True))
+                              .values(is_active=False))
+        return res.rowcount
+
+    if not await run_db(_op):
+        raise HTTPException(status_code=404, detail="Allowlist entry not found")
+    log.info("Allowlist entry %s removed by %s", entry_id, user["u"])
+    S.hub.broadcast({"type": "allowlist", "action": "delete", "id": entry_id})
     return {"ok": True}
 
 
