@@ -33,6 +33,9 @@ _EVENTS: list[tuple[str, str, str, str, str, bool, bool, bool, bool]] = [
      "WARNING", True, False, False, False),
     ("spike_404", "threats", "404 scan burst", "One IP produced a burst of 404s (content discovery / forced browsing).",
      "WARNING", True, False, False, False),
+    ("dir_enum", "threats", "Directory enumeration (404 scan)",
+     "One IP requested several different missing paths within a few minutes (forced browsing / directory brute force). "
+     "Queued for ban approval with the probed URIs and WHOIS owner.", "WARNING", True, True, False, False),
     ("spike_auth", "threats", "Brute force (401/403 burst)", "One IP produced a burst of 401/403 responses (password spraying).",
      "WARNING", True, True, False, False),
     ("threat_cleared", "threats", "Threat cleared", "An attacker's score decayed back below the threshold.", "INFO", True, False, False, False),

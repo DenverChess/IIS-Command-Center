@@ -87,6 +87,25 @@
               <button class="chip" :class="{ on: paused }" @click="togglePause()" x-text="paused ? 'PAUSED (' + pendingWhilePaused + ')' : 'PAUSE'"></button>
             </span>
           </div>
+          <div class="log-search" :class="{ on: search.active }">
+            <label class="search-box">
+              <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="2"/><line x1="15.5" y1="15.5" x2="21" y2="21" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>
+              <input class="input" type="search" placeholder="Search logs: uri, ip, user agent…  (ip:1.2.3.4  status:404  uri:/admin  method:POST)"
+                     x-model="search.q" @input="onSearchInput()" @keydown.enter.prevent="runSearch(1)" @keydown.escape="clearSearch()" aria-label="Search logs">
+            </label>
+            <select class="input" x-model="search.status" @change="runSearch(1)" aria-label="Status filter">
+              <template x-for="o in SEARCH_STATUS" :key="o.id"><option :value="o.id" x-text="o.label"></option></template>
+            </select>
+          </div>
+          <div class="search-bar" x-show="search.active" x-cloak>
+            <span class="neon-amber">SEARCH RESULTS</span>
+            <span :class="search.error ? 'neon-red' : 'muted'" x-text="searchSummary()"></span>
+            <span class="muted" x-show="search.index && search.index.backfill" x-text="search.index && search.index.backfill ? 'INDEXING OLDER LOGS ' + Math.round(100 * search.index.backfill.next / Math.max(1, search.index.backfill.target)) + '%' : ''"></span>
+            <span class="spacer"></span>
+            <button class="chip" @click="searchPage(-1)" :disabled="search.loading || search.page <= 1">‹ NEWER</button>
+            <button class="chip" @click="searchPage(1)" :disabled="search.loading || search.page >= search.pages">OLDER ›</button>
+            <button class="chip on" @click="clearSearch()" x-text="'CLEAR SEARCH / LIVE MODE' + (pendingWhilePaused && !paused ? ' (+' + pendingWhilePaused + ')' : '')"></button>
+          </div>
           <div class="terminal" id="terminal" x-ignore></div>
         </div>
       </section>
@@ -108,6 +127,10 @@
 
           <!-- PENDING THREATS: operator approval queue (one row per attacker per target server) -->
           <div class="panel-body" style="padding:0" x-show="centerTab === 'pending'">
+            <div class="ban-all-bar" x-show="pendingGroups().length > 0">
+              <span class="muted" x-text="pendingGroups().length + ' attacker' + (pendingGroups().length === 1 ? '' : 's') + ' awaiting approval'"></span>
+              <button class="btn ban-all" @click="openBanAll()" :disabled="banAll.busy" x-text="banAll.busy ? 'BANNING…' : 'BAN ALL'"></button>
+            </div>
             <table class="matrix">
               <colgroup><col style="width:21%"><col style="width:16%"><col style="width:29%"><col style="width:12%"><col style="width:22%"></colgroup>
               <thead><tr><th>SOURCE IP</th><th>TARGET SERVER</th><th>THREAT</th><th>SCORE</th><th style="text-align:right">ACTION</th></tr></thead>
@@ -322,6 +345,21 @@
               <span class="k">RAM</span><span class="v" x-text="health.ram_total_gb ? health.ram_used_gb + ' / ' + health.ram_total_gb + ' GB' : '—'"></span>
               <span class="k">LOG FEED</span><span class="v" :class="logFeedOk() === false ? 'neon-red' : logFeedOk() ? 'neon-green' : 'muted'" :title="logFeedError()" x-text="logFeedOk() === false ? 'OFFLINE' : logFeedOk() ? 'STREAMING' : '—'"></span>
             </div>
+          </div>
+        </div>
+
+        <div class="panel fw-card" :class="{ alarm: !!firewall.error }">
+          <div class="panel-head">
+            <span class="title">Perimeter Firewall</span>
+            <span class="meta" :class="firewall.error ? 'neon-red' : 'neon-green'" x-text="firewall.error ? 'NOT READY' : 'ARMED'"></span>
+          </div>
+          <div class="panel-body">
+            <div class="kv">
+              <span class="k">BANS GO TO</span><span class="v neon-cyan" x-text="firewall.label || '—'"></span>
+              <span class="k">TARGET</span><span class="v" :title="firewall.target" x-text="firewall.target || '—'"></span>
+            </div>
+            <div class="small neon-red" style="margin-top:6px" x-show="firewall.error" x-text="firewall.error"></div>
+            <button class="btn small" style="margin-top:8px;width:100%" @click="openConfig('firewall')">FIREWALL SETTINGS</button>
           </div>
         </div>
 
@@ -621,13 +659,50 @@
 
               <div x-show="form.firewall.provider === 'sonicwall'">
                 <div class="form-grid">
-                  <div class="field"><label>Management URL</label><input class="input" x-model="form.firewall.sonicwall_url" placeholder="https://10.0.0.1"></div>
-                  <div class="field"><label>Address group</label><input class="input" x-model="form.firewall.sonicwall_group" placeholder="SENTINEL_BANS"></div>
+                  <div class="field full"><label>SonicWall API URL (HTTP or HTTPS)</label>
+                    <div class="input-row">
+                      <input class="input" x-model="form.firewall.sonicwall_url" placeholder="http://192.168.168.168 or https://10.0.0.1:4433">
+                      <button class="btn small" type="button" @click="testFirewall()" :disabled="busy" x-text="busy ? 'TESTING…' : 'TEST CONNECTION'"></button>
+                    </div>
+                    <div class="hint" style="margin:4px 0 0">SSL verification is disabled. HTTP and self-signed HTTPS are both supported.</div>
+                  </div>
                   <div class="field"><label>Admin username</label><input class="input" x-model="form.firewall.sonicwall_username" autocomplete="off"></div>
                   <div class="field"><label>Admin password</label><input class="input" type="password" autocomplete="new-password" x-model="form.firewall.sonicwall_password"></div>
+                  <div class="field"><label>Default ban group</label><input class="input" x-model="form.firewall.sonicwall_group" placeholder="SENTINEL_BANS"></div>
                   <div class="field"><label>Zone for ban objects</label><input class="input" x-model="form.firewall.sonicwall_zone" placeholder="WAN"></div>
                 </div>
-                <label class="check"><input type="checkbox" x-model="form.firewall.sonicwall_verify_ssl"> Verify the firewall's HTTPS certificate</label>
+
+                <div class="section-label"><span>ADDRESS GROUPS ON THE SONICWALL</span>
+                  <span><button class="btn small ghost" type="button" @click="loadFwGroups()" :disabled="fwGroups.loading" x-text="fwGroups.loading ? 'LOADING…' : (fwGroups.loaded ? 'REFRESH' : 'LOAD GROUPS')"></button></span></div>
+                <div class="hint" style="margin-top:0">Uses the <b>saved</b> SonicWall settings. SAVE FIREWALL first after changing the URL or credentials.</div>
+                <div class="notice err" x-show="fwGroups.error" x-text="fwGroups.error"></div>
+                <template x-if="fwGroups.loaded">
+                  <table class="mini fw-groups">
+                    <colgroup><col style="width:30%"><col style="width:10%"><col style="width:36%"><col style="width:24%"></colgroup>
+                    <thead><tr><th>GROUP</th><th>SIZE</th><th>MEMBERS</th><th style="text-align:right">ACTION</th></tr></thead>
+                    <tbody>
+                      <template x-for="grp in fwGroups.list" :key="grp.name">
+                        <tr :class="{ 'fw-default': grp.name.toLowerCase() === (form.firewall.sonicwall_group || '').toLowerCase() }">
+                          <td :title="grp.name"><span x-text="grp.name"></span>
+                            <small class="neon-green" x-show="grp.name.toLowerCase() === (form.firewall.sonicwall_group || '').toLowerCase()"> DEFAULT</small></td>
+                          <td x-text="grp.member_count"></td>
+                          <td :title="grp.members.map((m) => m.name + (m.address ? ' = ' + m.address : '')).join('\n')"
+                              x-text="grp.members.slice(0, 4).map((m) => m.address || m.name).join(', ') + (grp.members.length > 4 ? ' +' + (grp.members.length - 4) : '') || '—'"></td>
+                          <td class="actions">
+                            <button class="btn small ghost" type="button" @click="useFwGroup(grp)" :disabled="grp.name.toLowerCase() === (form.firewall.sonicwall_group || '').toLowerCase()">USE</button>
+                            <button class="btn small danger" type="button" @click="deleteFwGroup(grp)" :disabled="!!fwGroups.busy[grp.name] || grp.default" x-text="fwGroups.busy[grp.name] ? '…' : 'DELETE'"></button>
+                          </td>
+                        </tr>
+                      </template>
+                    </tbody>
+                  </table>
+                </template>
+                <div class="muted small" x-show="fwGroups.loaded && !fwGroups.list.length">No IPv4 address groups returned.</div>
+                <div class="input-row" style="margin-top:8px">
+                  <input class="input" x-model="fwGroups.name" placeholder="New group name (e.g. SENTINEL_BANS)" maxlength="63" @keydown.enter.prevent="createFwGroup()">
+                  <input class="input" x-model="fwGroups.description" placeholder="Description (optional)" maxlength="256">
+                  <button class="btn small" type="button" @click="createFwGroup()" :disabled="!fwGroups.name.trim() || !!fwGroups.busy._create" x-text="fwGroups.busy._create ? 'CREATING…' : 'CREATE GROUP'"></button>
+                </div>
                 <div class="hint"><b>One-time setup (SonicOS 7):</b> Device › Settings › Administration: enable the <b>SonicOS API</b> and
                   <b>RFC-2617 HTTP Basic Access authentication</b>. Object › Address Groups: create the group above. Policy › Rules › Access Rules:
                   add a <b>Deny</b> rule WAN → any with that group as source. Each ban creates an address object <code>SENTINEL_&lt;ip&gt;</code>, adds it to the group and commits.</div>
@@ -653,9 +728,12 @@
               <div class="form-grid" x-show="form.firewall.provider !== 'windows'" style="margin-top:10px">
                 <div class="field"><label>API timeout (s)</label><input class="input" type="number" min="3" max="120" x-model.number="form.firewall.timeout"></div>
               </div>
+              <label class="check" x-show="form.firewall.provider !== 'windows'"><input type="checkbox" x-model="form.firewall.also_windows">
+                Also add the Windows Firewall rule (netsh) on the attacked IIS server</label>
               <div class="hint" x-show="form.firewall.provider !== 'windows'">Perimeter bans block the address for every server, so one approval clears that attacker's pending threats on all servers.
                 Sentinel only adds and removes addresses; it never edits your rules. LIFT on the BANS tab removes the address again.</div>
-              <button class="btn small" style="margin-top:10px" @click="testFirewall()" :disabled="busy" x-text="form.firewall.provider === 'windows' ? 'SAVE' : 'SAVE & TEST CONNECTION'"></button>
+              <button class="btn small" style="margin-top:10px" x-show="form.firewall.provider !== 'windows'" @click="testFirewall()" :disabled="busy"
+                      x-text="busy ? 'TESTING…' : 'TEST CONNECTION'" title="Tests the settings on screen without saving them"></button>
             </div>
             </template>
           </div>
@@ -914,6 +992,25 @@
         </div>
       </div>
       </template>
+    </div>
+
+    <!-- ============================================================ BAN ALL CONFIRMATION -->
+    <div class="overlay center" x-show="banAll.open" x-cloak @click.self="banAll.busy || (banAll.open = false)" @keydown.escape.window="banAll.busy || (banAll.open = false)">
+      <div class="modal ban-all-modal" role="alertdialog" aria-label="Confirm ban all">
+        <div class="modal-head"><div class="ip neon-red">BAN ALL</div><span class="grow"></span></div>
+        <div class="modal-body">
+          <div class="ban-all-warning" x-text="banAllText()"></div>
+          <div class="small muted" style="margin-top:10px" x-text="firewall.perimeter
+            ? 'Each IP is blocked once on ' + firewall.label + ' (' + (firewall.target || 'not configured') + '), which covers every server.'
+            : 'Each IP gets a Windows Firewall rule (netsh) on the server it attacked.'"></div>
+          <div class="small neon-red" style="margin-top:6px" x-show="firewall.error" x-text="'WARNING: ' + firewall.error"></div>
+        </div>
+        <div class="modal-foot">
+          <span class="grow" style="flex:1"></span>
+          <button class="btn small ghost" @click="banAll.open = false" :disabled="banAll.busy">CANCEL</button>
+          <button class="btn ban-all" @click="confirmBanAll()" :disabled="banAll.busy" x-text="banAll.busy ? 'BANNING…' : 'BAN ALL'"></button>
+        </div>
+      </div>
     </div>
   </div>
 </body>

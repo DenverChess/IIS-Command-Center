@@ -10,18 +10,20 @@ attacker everywhere. Each one only ever adds / removes an address in a list the 
              No commit is needed, so bans take effect within seconds.
 
 The block rule that references the alias / group / DAG is created once by the operator (see README); Sentinel
-never edits rules. Every call is blocking (requests), so the manager runs them in threads with a hard timeout.
+never edits rules. pfSense and Palo Alto calls are blocking (requests) and run in threads; SonicWall uses the async
+httpx client in sonicwall_api.py. Every call has a hard timeout.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import inspect
 import re
-import threading
 from typing import Any
 from xml.etree import ElementTree
 from xml.sax.saxutils import quoteattr
 
+import sonicwall_api
 from database import ConfigStore
 
 log = logging.getLogger("sentinel.firewall")
@@ -168,23 +170,22 @@ class PfSense:
 
 
 # --------------------------------------------------------------------------------------
-# SonicWall (SonicOS 7 REST API)
+# SonicWall (SonicOS 7 REST API, async client in sonicwall_api.py; TLS verification off, http or https)
 # --------------------------------------------------------------------------------------
 class SonicWall:
-    _group_lock = threading.Lock()
-
     def __init__(self, c: dict[str, Any]) -> None:
-        self.url = _base(c["sonicwall_url"]) + "/api/sonicos"
-        self.user = c["sonicwall_username"]
-        self.password = c["sonicwall_password"]
-        self.group = c["sonicwall_group"].strip()
-        self.zone = c["sonicwall_zone"].strip() or "WAN"
-        self.verify = c["sonicwall_verify_ssl"]
-        self.timeout = float(c["timeout"])
+        self.url = (c.get("sonicwall_url") or "").strip()
+        self.user = c.get("sonicwall_username") or ""
+        self.password = c.get("sonicwall_password") or ""
+        self.group = (c.get("sonicwall_group") or "").strip()
+        self.zone = (c.get("sonicwall_zone") or "").strip() or "WAN"
+        self.timeout = float(c.get("timeout") or 15)
+        if not self.url:
+            raise FirewallError("SonicWall API URL is not configured")
         if not (self.user and self.password):
             raise FirewallError("admin username and password are not configured")
         if not self.group:
-            raise FirewallError("address group is not configured")
+            raise FirewallError("default address group is not configured")
 
     @property
     def label(self) -> str:
@@ -192,164 +193,30 @@ class SonicWall:
 
     @staticmethod
     def obj_name(ip: str) -> str:
-        return f"SENTINEL_{ip.replace(':', '_')}"[:63]
+        return sonicwall_api.object_name(ip)
 
-    def _session(self) -> Any:
-        import requests
-
-        if not self.verify:
-            import urllib3
-
-            urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-        s = requests.Session()
-        s.verify = self.verify
-        s.auth = (self.user, self.password)
-        s.headers.update({"Accept": "application/json", "Content-Type": "application/json"})
-        return s
-
-    def _call(self, s: Any, method: str, path: str, what: str, **kw: Any) -> Any:
-        import requests
-
+    def session(self) -> "sonicwall_api.SonicWallSession":
         try:
-            resp = s.request(method, self.url + path, timeout=self.timeout, **kw)
-        except requests.exceptions.RequestException as exc:
-            raise FirewallError(f"cannot reach the SonicWall: {type(exc).__name__}: {str(exc)[:200]}") from exc
-        data = None
+            return sonicwall_api.SonicWallSession(self.url, self.user, self.password, timeout=self.timeout,
+                                                  zone=self.zone, protected_group=self.group)
+        except sonicwall_api.SonicWallError as exc:
+            raise FirewallError(str(exc)) from exc
+
+    async def run(self, op: Any) -> Any:
         try:
-            data = resp.json()
-        except ValueError:
-            pass
-        if resp.status_code >= 400 or (isinstance(data, dict) and (data.get("status") or {}).get("success") is False):
-            info = ""
-            if isinstance(data, dict):
-                infos = (data.get("status") or {}).get("info") or []
-                info = "; ".join(str(i.get("message")) for i in infos if isinstance(i, dict)) or str(data)[:300]
-            raise FirewallError(f"{what}: HTTP {resp.status_code} {info or resp.text[:300]}")
-        return data
+            async with self.session() as api:
+                return await op(api)
+        except sonicwall_api.SonicWallError as exc:
+            raise FirewallError(str(exc)) from exc
 
-    def _run(self, fn: Any) -> str:
-        s = self._session()
-        self._call(s, "POST", "/auth", "login (enable 'RFC-2617 HTTP Basic Access authentication' for the SonicOS API)",
-                   json={"override": True})
-        try:
-            try:
-                self._call(s, "POST", "/config-mode", "config mode")
-            except FirewallError:
-                pass  # SonicOS 6.5 / auto-config-mode builds have no explicit config mode
-            return fn(s)
-        finally:
-            try:
-                self._call(s, "DELETE", "/auth", "logout")
-            except FirewallError:
-                pass
+    async def ban(self, ip: str) -> str:
+        return await self.run(lambda api: api.add_ip_to_group(self.group, ip))
 
-    def _check_group(self, s: Any) -> Any:
-        try:
-            return self._call(s, "GET", f"/address-groups/ipv4/name/{self.group}", "group lookup")
-        except FirewallError as exc:
-            raise FirewallError(f"address group '{self.group}' not found ({exc}). Create it under Object > Address "
-                                "Groups and reference it in a deny access rule") from exc
+    async def unban(self, ip: str) -> str:
+        return await self.run(lambda api: api.remove_ip_from_group(self.group, ip))
 
-    @staticmethod
-    def _group(data: Any) -> dict[str, Any]:
-        try:
-            g = data["address_groups"][0]["ipv4"]
-        except (KeyError, IndexError, TypeError):
-            return {}
-        return g if isinstance(g, dict) else {}
-
-    @staticmethod
-    def _members(group: dict[str, Any]) -> list[str]:
-        items = (group.get("address_object") or {}).get("ipv4") or []
-        return [str(m["name"]) for m in items if isinstance(m, dict) and m.get("name")]
-
-    def _write_members(self, s: Any, group: dict[str, Any], names: list[str], what: str) -> None:
-        # SonicOS PUT replaces the group's member list, so always send the complete list (including any
-        # IPv6 objects or nested groups the operator put in it by hand).
-        body: dict[str, Any] = {"name": self.group, "address_object": {"ipv4": [{"name": n} for n in names]}}
-        ipv6 = (group.get("address_object") or {}).get("ipv6")
-        if ipv6:
-            body["address_object"]["ipv6"] = ipv6
-        if group.get("address_group"):
-            body["address_group"] = group["address_group"]
-        self._call(s, "PUT", f"/address-groups/ipv4/name/{self.group}", what, json={"address_groups": [{"ipv4": body}]})
-
-    def ban(self, ip: str) -> str:
-        name = self.obj_name(ip)
-
-        def op(s: Any) -> str:
-            with SonicWall._group_lock:
-                group = self._group(self._check_group(s))
-                try:
-                    self._call(s, "POST", "/address-objects/ipv4", "create address object",
-                               json={"address_objects": [{"ipv4": {"name": name, "zone": self.zone, "host": {"ip": ip}}}]})
-                except FirewallError as exc:
-                    if "exist" not in str(exc).lower():
-                        raise
-                members = self._members(group)
-                if name not in members:
-                    self._write_members(s, group, members + [name], "add to group")
-                # Reads return the committed config, so verify only after the commit; a mismatch is reported,
-                # never allowed to discard the pending change.
-                self._call(s, "POST", "/config/pending", "commit")
-                note = ""
-                try:
-                    after = self._members(self._group(self._check_group(s)))
-                except FirewallError as exc:
-                    after, note = [], f" (could not re-read the group to verify: {exc})"
-                if after:
-                    lost = [m for m in members if m not in after]
-                    if name not in after:
-                        note = f" — WARNING: the committed group does not list {name}; check {self.group} on the SonicWall"
-                        log.error("SonicWall group %s does not list %s after commit", self.group, name)
-                    elif lost:
-                        note = f" — WARNING: {len(lost)} earlier member(s) missing from {self.group}: {', '.join(lost[:5])}"
-                        log.error("SonicWall group %s lost members while adding %s: %s", self.group, name, lost)
-                count = f" ({len(after)} member(s))" if after else ""
-                return f"address object {name} added to SonicWall group {self.group}{count} and committed{note}"
-
-        return self._run(op)
-
-    def unban(self, ip: str) -> str:
-        name = self.obj_name(ip)
-
-        def op(s: Any) -> str:
-            with SonicWall._group_lock:
-                group = self._group(self._check_group(s))
-                members = self._members(group)
-                if name in members:
-                    remaining = [m for m in members if m != name]
-                    try:
-                        self._write_members(s, group, remaining, "remove from group")
-                    except FirewallError as exc:
-                        if remaining:
-                            raise
-                        # Some SonicOS builds refuse an empty member list; fall back to deleting the member.
-                        log.info("SonicWall refused an empty group %s (%s); deleting the member instead", self.group, exc)
-                        self._call(s, "DELETE", f"/address-groups/ipv4/name/{self.group}", "remove from group",
-                                   json={"address_groups": [{"ipv4": {"name": self.group,
-                                                                      "address_object": {"ipv4": [{"name": name}]}}}]})
-                try:
-                    self._call(s, "DELETE", f"/address-objects/ipv4/name/{name}", "delete address object")
-                except FirewallError as exc:
-                    if "not found" not in str(exc).lower() and "404" not in str(exc):
-                        raise
-                self._call(s, "POST", "/config/pending", "commit")
-                return f"address object {name} removed from SonicWall group {self.group} and committed"
-
-        return self._run(op)
-
-    def test(self) -> str:
-        def op(s: Any) -> str:
-            data = self._check_group(s)
-            members = []
-            try:
-                members = data["address_groups"][0]["ipv4"].get("address_object", {}).get("ipv4", [])
-            except (KeyError, IndexError, TypeError):
-                pass
-            return f"SonicOS API OK; group {self.group} has {len(members)} member(s)"
-
-        return self._run(op)
+    async def test(self) -> str:
+        return await self.run(lambda api: api.test(self.group))
 
 
 # --------------------------------------------------------------------------------------
@@ -440,20 +307,25 @@ class FirewallManager:
         p = self.config.value("firewall", "provider", "windows")
         return p if p in PROVIDERS else "windows"
 
-    def _client(self, provider: str) -> Any:
+    def _client(self, provider: str, overrides: dict[str, Any] | None = None) -> Any:
         cls = _CLASSES.get(provider)
         if cls is None:
             raise FirewallError(f"unknown firewall provider '{provider}'")
-        return cls(self.config.get("firewall"))
+        c = {**self.config.get("firewall"), **(overrides or {})}
+        return cls(c)
+
+    def also_windows(self, provider: str | None = None) -> bool:
+        return (provider or self.provider()) != "windows" and bool(self.config.value("firewall", "also_windows", False))
 
     def summary(self) -> dict[str, Any]:
         p = self.provider()
-        out = {"provider": p, "label": PROVIDERS[p], "perimeter": p != "windows", "target": "", "error": None}
+        out = {"provider": p, "label": PROVIDERS[p], "perimeter": p != "windows", "target": "", "error": None,
+               "also_windows": self.also_windows(p)}
         if p == "windows":
             out["target"] = "Windows Firewall on the attacked IIS server"
         else:
             try:
-                out["target"] = self._client(p).label
+                out["target"] = self._client(p).label + (" + Windows Firewall on the server" if out["also_windows"] else "")
             except FirewallError as exc:
                 out["error"] = str(exc)
         return out
@@ -466,14 +338,29 @@ class FirewallManager:
         except FirewallError:
             return PROVIDERS.get(provider, provider)
 
-    async def _call(self, provider: str, method: str, ip: str | None = None) -> str:
-        client = self._client(provider)
+    def _timeout(self) -> float:
+        return float(self.config.value("firewall", "timeout", 15)) * 4 + 10
+
+    async def _call(self, provider: str, method: str, ip: str | None = None,
+                    overrides: dict[str, Any] | None = None) -> str:
+        client = self._client(provider, overrides)
         fn = getattr(client, method)
-        timeout = float(self.config.value("firewall", "timeout", 15)) * 4 + 10
+        args = [ip] if ip else []
+        timeout = self._timeout()
         try:
-            return await asyncio.wait_for(asyncio.to_thread(fn, *([ip] if ip else [])), timeout=timeout)
+            if inspect.iscoroutinefunction(fn):
+                return await asyncio.wait_for(fn(*args), timeout=timeout)
+            return await asyncio.wait_for(asyncio.to_thread(fn, *args), timeout=timeout)
         except asyncio.TimeoutError as exc:
             raise FirewallError(f"{PROVIDERS[provider]} did not answer within {timeout:.0f}s") from exc
+
+    async def sonicwall(self, op: Any, overrides: dict[str, Any] | None = None) -> Any:
+        """Run ``op(session)`` inside one authenticated SonicOS session (group management endpoints)."""
+        client = self._client("sonicwall", overrides)
+        try:
+            return await asyncio.wait_for(client.run(op), timeout=self._timeout())
+        except asyncio.TimeoutError as exc:
+            raise FirewallError(f"SonicWall did not answer within {self._timeout():.0f}s") from exc
 
     async def ban(self, provider: str, server_id: int, ip: str) -> tuple[bool, str]:
         if provider == "windows":
@@ -485,13 +372,13 @@ class FirewallManager:
             return await self.remote.unban(server_id, ip)
         return True, await self._call(provider, "unban", ip)
 
-    async def test(self, provider: str | None = None) -> dict[str, Any]:
+    async def test(self, provider: str | None = None, overrides: dict[str, Any] | None = None) -> dict[str, Any]:
         p = provider or self.provider()
         if p == "windows":
             return {"ok": True, "message": "Windows Firewall bans run netsh over each server's WinRM connection; use TEST "
                                            "under SERVERS to check a server."}
         try:
-            return {"ok": True, "message": await self._call(p, "test")}
+            return {"ok": True, "message": await self._call(p, "test", overrides=overrides)}
         except FirewallError as exc:
             return {"ok": False, "message": str(exc)}
         except Exception as exc:  # noqa: BLE001
