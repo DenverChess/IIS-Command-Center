@@ -271,7 +271,8 @@ netsh advfirewall firewall add rule name="SENTINEL BAN: <ip>" dir=in action=bloc
 | `/24` subnet | 2+ other attackers from the same /24 within **1 hour** | `/64` |
 | `/16` large subnet | 3+ other attackers from the same /16 within **24 hours**, some outside this /24 | `/48` |
 
-  A ban is never wider than `/16` (IPv6 `/32`). All math uses Python's `ipaddress`; CIDRs are never built from strings.
+A ban is never wider than `/16` (IPv6 `/32`). All math uses Python's `ipaddress`; CIDRs are never built from strings.
+
 - **Scope radios:** Single IP / Subnet / Large Subnet. The recommended one is marked, and any scope that overlaps an allowlist
   entry or contains a monitored server's address is disabled with the reason.
 - **Target radios:** Windows Firewall (netsh on the alert's server), SonicWall Group (the configured default group), or Both.
