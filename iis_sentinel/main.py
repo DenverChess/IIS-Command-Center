@@ -786,6 +786,9 @@ async def security_headers(request: Request, call_next: Callable[[Request], Awai
     if request.url.path.startswith(("/api", "/login", "/config", "/threats", "/system", "/alerts", "/reports", "/stats",
                                     "/servers", "/defense", "/banned-ranges", "/allowlist", "/intel", "/logs", "/firewall")):
         response.headers["Cache-Control"] = "no-store"
+    elif "Cache-Control" not in response.headers:
+        # Revalidate (ETag / 304) so a new dashboard.html never runs against a cached older app.js.
+        response.headers["Cache-Control"] = "no-cache"
     return response
 
 
