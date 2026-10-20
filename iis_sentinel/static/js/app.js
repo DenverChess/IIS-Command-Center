@@ -18,6 +18,12 @@ const FIREWALLS = [
 ];
 
 const START_MODES = { end: "NEW LINES ONLY", full: "WHOLE FILE" };
+const SEARCH_STATUS = [
+  { id: "all", label: "All Status" },
+  { id: "4xx", label: "4xx Only" },
+  { id: "5xx", label: "5xx Only" },
+  { id: "404", label: "404 Only" },
+];
 
 let audioCtx = null;
 function alertTone(severity) {
@@ -189,6 +195,19 @@ function dashboardApp() {
     // WHOIS / IP intel modal
     whois: { ip: "", data: null, intel: null },
     whoisOpen: false,
+
+    // log search (left panel) — while active, live lines are buffered but not drawn
+    SEARCH_STATUS,
+    search: { q: "", status: "all", active: false, loading: false, page: 1, pages: 1, total: 0, capped: false,
+              took: 0, error: "", mode: "", unflushed: 0, index: null },
+    _searchTimer: null,
+    _searchSeq: 0,
+
+    // BAN ALL
+    banAll: { open: false, busy: false, ips: 0, servers: 0, alertIds: [] },
+
+    // SonicWall address groups (CONFIG > FIREWALL)
+    fwGroups: { list: [], loaded: false, loading: false, error: "", name: "", description: "", busy: {} },
 
     _k: 0,
 
@@ -404,7 +423,7 @@ function dashboardApp() {
       if (!lines.length) return;
       feed.buffer.push(...lines);
       if (feed.buffer.length > this.MAX_BUFFER) feed.buffer.splice(0, feed.buffer.length - this.MAX_BUFFER);
-      if (this.paused) { this.pendingWhilePaused += lines.length; return; }
+      if (this.paused || this.search.active) { this.pendingWhilePaused += lines.length; return; }
       this.appendToTerminal(lines.filter((l) => this.passes(l)));
     },
 
@@ -420,6 +439,7 @@ function dashboardApp() {
     },
 
     rerenderFeed() {
+      if (this.search.active) { this.runSearch(1); return; }
       const term = termEl();
       term.replaceChildren();
       this.appendToTerminal(feed.buffer.filter((l) => this.passes(l)));
@@ -431,6 +451,62 @@ function dashboardApp() {
     togglePause() {
       this.paused = !this.paused;
       if (!this.paused) { this.pendingWhilePaused = 0; this.rerenderFeed(); }
+    },
+
+    /* ------------------------------------------------------------ log search */
+    onSearchInput() {
+      clearTimeout(this._searchTimer);
+      this._searchTimer = setTimeout(() => this.runSearch(1), 300);
+    },
+
+    async runSearch(page = 1) {
+      clearTimeout(this._searchTimer);
+      const s = this.search;
+      const q = s.q.trim();
+      if (!q && s.status === "all") { this.clearSearch(); return; }
+      const seq = ++this._searchSeq;
+      s.active = true;
+      s.loading = true;
+      s.error = "";
+      const params = new URLSearchParams({ q, status: s.status, page: String(page), page_size: "100" });
+      if (this.selId() != null) params.set("server_id", String(this.selId()));
+      try {
+        const r = await api(`/logs/search?${params}`);
+        if (seq !== this._searchSeq || !s.active) return;
+        Object.assign(s, { page: r.page, pages: r.pages, total: r.total, capped: r.total_capped, took: r.took_ms,
+                           mode: r.mode, unflushed: r.unflushed || 0, index: r.index });
+        const term = termEl();
+        term.replaceChildren();
+        const frag = document.createDocumentFragment();
+        (r.results || []).forEach((l) => frag.appendChild(this.renderLine(l)));
+        term.appendChild(frag);
+        term.scrollTop = 0;
+      } catch (e) {
+        if (seq === this._searchSeq) s.error = e.message;
+      } finally {
+        if (seq === this._searchSeq) s.loading = false;
+      }
+    },
+
+    searchPage(delta) {
+      const p = this.search.page + delta;
+      if (p >= 1 && p <= this.search.pages) this.runSearch(p);
+    },
+
+    searchSummary() {
+      const s = this.search;
+      if (s.loading) return "SEARCHING…";
+      if (s.error) return s.error;
+      const total = s.total.toLocaleString() + (s.capped ? "+" : "");
+      return `${total} MATCH${s.total === 1 ? "" : "ES"} · PAGE ${s.page}/${s.pages} · ${s.took} ms`;
+    },
+
+    clearSearch() {
+      clearTimeout(this._searchTimer);
+      ++this._searchSeq;
+      Object.assign(this.search, { q: "", status: "all", active: false, loading: false, page: 1, pages: 1, total: 0, error: "" });
+      this.pendingWhilePaused = 0;
+      this.rerenderFeed();
     },
 
     /* ------------------------------------------------------------ alerts */
@@ -645,7 +721,48 @@ function dashboardApp() {
       this.pending = this.pending.filter((p) => `${p.server_id}|${p.source_ip}` !== key);
       if (!this.bans.some((b) => b.id === ban.id)) {
         this.bans.unshift(ban);
-        this.toast({ severity: "INFO", ok: true, category: "ban executed", server_name: ban.server_name, title: `${ban.ip_address} blocked by ${ban.rule_name}` });
+        if (!this.banAll.busy) this.toast({ severity: "INFO", ok: true, category: "ban executed", server_name: ban.server_name, title: `${ban.ip_address} blocked by ${ban.rule_name}` });
+      }
+    },
+
+    openBanAll() {
+      const groups = this.pendingGroups();
+      if (!groups.length) return;
+      const ips = new Set(groups.map((g) => g.ip));
+      const servers = new Set(groups.map((g) => g.server_id));
+      this.banAll = { open: true, busy: false, ips: ips.size, servers: servers.size,
+                      alertIds: groups.flatMap((g) => g.alerts.map((a) => a.id)) };
+    },
+
+    banAllText() {
+      const b = this.banAll;
+      return `WARNING: You are about to ban ${b.ips} IP${b.ips === 1 ? "" : "s"} across ${b.servers} server${b.servers === 1 ? "" : "s"}. Are you sure?`;
+    },
+
+    async confirmBanAll() {
+      const b = this.banAll;
+      if (b.busy || !b.alertIds.length) return;
+      b.busy = true;
+      try {
+        const r = await api("/defense/ban-all", { method: "POST", body: JSON.stringify({ alert_ids: b.alertIds }) });
+        const done = new Set(r.alert_ids || []);
+        (r.banned || []).forEach((x) => (x.alert_ids || []).forEach((id) => done.add(id)));
+        this.setAlertStatus([...done], "Approved");
+        const bannedIps = new Set((r.banned || []).map((x) => x.ip));
+        this.pending = this.pending.filter((p) => !(this.firewall.perimeter ? bannedIps.has(p.source_ip)
+          : (r.banned || []).some((x) => x.ip === p.source_ip && x.server_id === p.server_id)));
+        this.loadBans();
+        b.open = false;
+        this.toast({ severity: "INFO", ok: true, category: "ban all",
+                     title: `${r.ip_count} IP${r.ip_count === 1 ? "" : "s"} banned across ${r.server_count} server${r.server_count === 1 ? "" : "s"}` }, 9000);
+        if ((r.failed || []).length) {
+          this.toast({ severity: "CRITICAL", category: "ban all", title: `${r.failed.length} ban(s) FAILED — still pending`,
+                       message: r.failed.slice(0, 4).map((f) => `${f.ip}: ${f.error}`).join("\n") }, 15000);
+        }
+      } catch (e) {
+        this.toast({ severity: "CRITICAL", category: "ban all failed", title: e.message }, 12000);
+      } finally {
+        b.busy = false;
       }
     },
 
@@ -918,21 +1035,75 @@ function dashboardApp() {
     },
 
     async testFirewall() {
-      await this.saveConfig();
-      if (!this.cfgMsg.ok) return;
+      const f = this.form && this.form.firewall;
+      if (!f || f.provider === "windows" || this.busy) return;
+      const label = (FIREWALLS.find((x) => x.id === f.provider) || {}).label || f.provider;
+      this.busy = true;
+      this.cfgMsg = { ok: true, text: `Testing ${label} with the settings on screen (not saved)…` };
       try {
-        const s = await api("/firewall");
-        this.firewall = s;
-        if (s.provider === "windows") return;
-        this.busy = true;
-        this.cfgMsg = { ok: true, text: `Testing ${s.label}…` };
-        const r = await api("/firewall/test", { method: "POST", body: JSON.stringify({}) });
+        const r = await api("/firewall/test", { method: "POST", body: JSON.stringify({ provider: f.provider, settings: f }) });
         this.cfgMsg = { ok: r.ok, text: (r.ok ? "CONNECTION OK: " : "TEST FAILED: ") + r.message };
+        this.toast({ severity: r.ok ? "INFO" : "HIGH", ok: r.ok, category: `${label} test`,
+                     title: r.ok ? "Connection OK" : "Connection FAILED", message: r.message }, r.ok ? 7000 : 12000);
       } catch (e) {
         this.cfgMsg = { ok: false, text: e.message };
+        this.toast({ severity: "HIGH", category: `${label} test`, title: "Connection FAILED", message: e.message }, 12000);
       } finally {
         this.busy = false;
       }
+    },
+
+    async loadFwGroups() {
+      const g = this.fwGroups;
+      g.loading = true;
+      g.error = "";
+      try {
+        const r = await api("/firewall/groups");
+        g.list = r.groups || [];
+        g.loaded = true;
+      } catch (e) {
+        g.error = e.message;
+      } finally {
+        g.loading = false;
+      }
+    },
+
+    async createFwGroup() {
+      const g = this.fwGroups;
+      const name = g.name.trim();
+      if (!name || g.busy._create) return;
+      g.busy._create = true;
+      try {
+        const r = await api("/firewall/groups", { method: "POST", body: JSON.stringify({ name, description: g.description.trim() }) });
+        this.toast({ severity: "INFO", ok: true, category: "sonicwall", title: r.message });
+        g.name = "";
+        g.description = "";
+        await this.loadFwGroups();
+      } catch (e) {
+        this.toast({ severity: "HIGH", category: "sonicwall", title: "Create group failed", message: e.message }, 12000);
+      } finally {
+        delete g.busy._create;
+      }
+    },
+
+    async deleteFwGroup(grp) {
+      const g = this.fwGroups;
+      if (!window.confirm(`Delete SonicWall address group ${grp.name}?\n\nAny access rule that references it must be changed first.`)) return;
+      g.busy[grp.name] = true;
+      try {
+        const r = await api(`/firewall/groups?name=${encodeURIComponent(grp.name)}`, { method: "DELETE" });
+        this.toast({ severity: "INFO", ok: true, category: "sonicwall", title: r.message });
+        await this.loadFwGroups();
+      } catch (e) {
+        this.toast({ severity: "HIGH", category: "sonicwall", title: "Delete group failed", message: e.message }, 12000);
+      } finally {
+        delete g.busy[grp.name];
+      }
+    },
+
+    useFwGroup(grp) {
+      if (this.form && this.form.firewall) this.form.firewall.sonicwall_group = grp.name;
+      this.cfgMsg = { ok: true, text: `Default ban group set to ${grp.name}. SAVE FIREWALL to apply.` };
     },
 
     async loadAlertCatalog() {

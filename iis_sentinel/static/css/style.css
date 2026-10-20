@@ -556,3 +556,34 @@ select.input { appearance: none; background-image: linear-gradient(45deg, transp
 .fw-opt.on { border-color: var(--cyan); box-shadow: var(--glow-cyan); }
 .fw-opt input { accent-color: var(--cyan); margin-top: 3px; }
 .fw-opt b { color: var(--text); letter-spacing: 1px; }
+
+/* ---------------------------------------------------------------- log search */
+.log-search { display: flex; gap: 6px; padding: 6px 10px; border-bottom: 1px solid var(--line); background: rgba(0, 20, 26, 0.35); }
+.log-search.on { box-shadow: inset 0 -1px 0 var(--amber); }
+.log-search .search-box { position: relative; flex: 1; min-width: 0; display: block; color: var(--muted); }
+.log-search .search-box svg { position: absolute; left: 9px; top: 50%; transform: translateY(-50%); pointer-events: none; }
+.log-search .search-box .input { padding: 6px 8px 6px 28px; font-size: 11.5px; }
+.log-search .search-box:focus-within { color: var(--cyan); }
+.log-search select.input { width: 120px; flex: none; padding: 6px 24px 6px 8px; font-size: 11px; }
+.search-bar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; padding: 5px 10px; font-size: 10px; letter-spacing: 1px; border-bottom: 1px solid rgba(255, 174, 0, 0.35); background: rgba(255, 174, 0, 0.05); }
+.search-bar .spacer { flex: 1; }
+.search-bar .chip:disabled { opacity: 0.35; cursor: default; }
+
+/* ---------------------------------------------------------------- BAN ALL */
+.ban-all-bar { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 12px; border-bottom: 1px solid rgba(255, 0, 51, 0.35); background: rgba(255, 0, 51, 0.05); font-size: 11px; letter-spacing: 1px; }
+.btn.ban-all {
+  font-size: 15px; font-weight: 700; letter-spacing: 4px; padding: 10px 26px; color: #fff; background: rgba(255, 0, 51, 0.22);
+  border: 1px solid var(--red); text-shadow: var(--glow-red); box-shadow: 0 0 14px rgba(255, 0, 51, 0.55), inset 0 0 12px rgba(255, 0, 51, 0.35);
+}
+.btn.ban-all:hover:not(:disabled) { background: rgba(255, 0, 51, 0.4); box-shadow: 0 0 24px rgba(255, 0, 51, 0.85), inset 0 0 14px rgba(255, 0, 51, 0.5); }
+.btn.ban-all:disabled { opacity: 0.6; cursor: wait; }
+.modal.ban-all-modal { width: min(560px, 94vw); border-color: var(--red); box-shadow: 0 0 50px rgba(255, 0, 51, 0.35); }
+.ban-all-warning { font-size: 16px; line-height: 1.5; color: var(--red); text-shadow: var(--glow-red); font-weight: 700; letter-spacing: 0.5px; }
+
+/* ---------------------------------------------------------------- firewall card / groups */
+.panel.fw-card { flex: none; }
+.input-row { display: flex; gap: 6px; align-items: stretch; }
+.input-row .input { flex: 1; min-width: 0; }
+.input-row .btn { white-space: nowrap; flex: none; }
+.fw-groups tr.fw-default td:first-child { color: var(--green); }
+.fw-groups td.actions { text-align: right; white-space: nowrap; }
