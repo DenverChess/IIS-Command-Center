@@ -144,6 +144,24 @@ def validate_ban_ip(ip: str) -> str:
     return str(addr)
 
 
+# Broadest range Sentinel will ever push as one rule (IPv4 /16 = 65,536 addresses; IPv6 /32).
+MIN_PREFIX = {4: 16, 6: 32}
+
+
+def validate_ban_network(cidr: str) -> str:
+    """Strictly parse an IPv4/IPv6 network (host bits are masked off); it is interpolated into a command line."""
+    try:
+        net = ipaddress.ip_network(str(cidr).strip(), strict=False)
+    except ValueError as exc:
+        raise ValueError(f"'{cidr}' is not a valid IP address or CIDR range") from exc
+    if net.prefixlen < MIN_PREFIX[net.version]:
+        raise ValueError(f"refusing to ban {net}: broader than /{MIN_PREFIX[net.version]}")
+    addr = net.network_address
+    if addr.is_loopback or addr.is_unspecified or addr.is_multicast:
+        raise ValueError(f"refusing to ban {net}: loopback/unspecified/multicast range")
+    return str(net)
+
+
 def _endpoint(host: str, port: int, use_ssl: bool) -> str:
     try:
         if ipaddress.ip_address(host).version == 6:
@@ -310,6 +328,25 @@ def execute_remote_ban(server_ip: str, username: str, password: str, ip_to_ban: 
     if existing.status_code == 0 and ip.encode() in existing.std_out:
         return True, f"rule '{BAN_RULE_PREFIX}{ip}' already present"
     resp = session.run_cmd("netsh", _netsh_args("add", ip))
+    output = (_decode(resp.std_out) + _decode(resp.std_err)).strip()
+    return resp.status_code == 0, output or f"netsh exit code {resp.status_code}"
+
+
+def execute_remote_ban_range(server_ip: str, username: str, password: str, cidr: str, **opts: Any) -> tuple[bool, str]:
+    """Inbound block rule `SENTINEL BAN: <cidr>` with remoteip=<cidr> (idempotent)."""
+    net = validate_ban_network(cidr)
+    session = _session(server_ip, username, password, **opts)
+    existing = session.run_cmd("netsh", _netsh_args("show", net))
+    if existing.status_code == 0 and net.encode() in existing.std_out:
+        return True, f"rule '{BAN_RULE_PREFIX}{net}' already present"
+    resp = session.run_cmd("netsh", _netsh_args("add", net))
+    output = (_decode(resp.std_out) + _decode(resp.std_err)).strip()
+    return resp.status_code == 0, output or f"netsh exit code {resp.status_code}"
+
+
+def execute_remote_unban_range(server_ip: str, username: str, password: str, cidr: str, **opts: Any) -> tuple[bool, str]:
+    net = validate_ban_network(cidr)
+    resp = _session(server_ip, username, password, **opts).run_cmd("netsh", _netsh_args("delete", net))
     output = (_decode(resp.std_out) + _decode(resp.std_err)).strip()
     return resp.status_code == 0, output or f"netsh exit code {resp.status_code}"
 
@@ -577,6 +614,29 @@ class RemoteManager:
         return await self._guard.run(
             (server_id, "unban"), timeout + 15, execute_remote_unban,
             server["ip_address"], server["winrm_username"], server["winrm_password"], ip, **self._opts(server, timeout),
+        )
+
+    async def ban_range(self, server_id: int, cidr: str) -> tuple[bool, str]:
+        return await self._range(server_id, cidr, True)
+
+    async def unban_range(self, server_id: int, cidr: str) -> tuple[bool, str]:
+        return await self._range(server_id, cidr, False)
+
+    async def _range(self, server_id: int, cidr: str, add: bool) -> tuple[bool, str]:
+        net = validate_ban_network(cidr)
+        server = self.registry.get(server_id)
+        if server is None:
+            raise RemoteError(f"server {server_id} is not registered")
+        verb = "range_ban" if add else "range_unban"
+        if server.get("simulated"):
+            await asyncio.sleep(0.3)
+            return True, f"[simulated] rule '{BAN_RULE_PREFIX}{net}' {'added' if add else 'deleted'} on {server['server_name']}"
+        if server_id == LOCAL_SERVER_ID:
+            return await self._guard.run((server_id, verb), 45, _local_netsh, "add" if add else "delete", net)
+        timeout = self._timeout()
+        return await self._guard.run(
+            (server_id, verb), timeout + 15, execute_remote_ban_range if add else execute_remote_unban_range,
+            server["ip_address"], server["winrm_username"], server["winrm_password"], net, **self._opts(server, timeout),
         )
 
     async def test(self, server_id: int) -> dict[str, Any]:
