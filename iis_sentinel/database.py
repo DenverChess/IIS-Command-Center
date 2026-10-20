@@ -28,6 +28,7 @@ from sqlalchemy import (
     delete,
     event,
     select,
+    text,
 )
 from sqlalchemy.exc import OperationalError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
@@ -194,6 +195,8 @@ class BannedIP(Base):
     alert_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("alerts.id"), nullable=True)
     rule_name: Mapped[str] = mapped_column(String(256), default="")
     provider: Mapped[str] = mapped_column(String(16), default="windows")
+    # Set when a perimeter ban also added a Windows Firewall rule on the attacked server (firewall.also_windows).
+    windows_rule: Mapped[str] = mapped_column(String(256), default="")
     banned_by: Mapped[str] = mapped_column(String(256), default="")
     banned_at: Mapped[datetime] = mapped_column(DateTime)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -253,7 +256,8 @@ _ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
     "system_metrics": {"server_id": "INTEGER NOT NULL DEFAULT 0"},
     "alerts": {"server_id": "INTEGER NOT NULL DEFAULT 0", "status": "VARCHAR(16) NOT NULL DEFAULT 'Pending'",
                "event": "VARCHAR(48) NOT NULL DEFAULT ''"},
-    "banned_ips": {"provider": "VARCHAR(16) NOT NULL DEFAULT 'windows'"},
+    "banned_ips": {"provider": "VARCHAR(16) NOT NULL DEFAULT 'windows'",
+                   "windows_rule": "VARCHAR(256) NOT NULL DEFAULT ''"},
     "monitored_servers": {"log_start_mode": "VARCHAR(8) NOT NULL DEFAULT 'end'",
                           "log_tail_lines": "INTEGER NOT NULL DEFAULT 1000"},
 }
@@ -280,6 +284,67 @@ def _migrate(sync_conn: Any) -> None:
         "CREATE INDEX IF NOT EXISTS ix_alerts_status ON alerts (status)",
     ):
         sync_conn.exec_driver_sql(ddl)
+    _create_fts(sync_conn)
+
+
+# Full-text index over the searchable log columns (external content: the text lives once, in log_entries).
+FTS_TABLE = "log_fts"
+FTS_COLUMNS = ("cs_uri_stem", "cs_uri_query", "user_agent", "c_ip", "cs_method", "cs_username")
+FTS_STATE: dict[str, Any] = {"enabled": False, "backfill": None}
+
+
+def _create_fts(sync_conn: Any) -> None:
+    cols = ", ".join(FTS_COLUMNS)
+    new_cols = ", ".join(f"new.{c}" for c in FTS_COLUMNS)
+    old_cols = ", ".join(f"old.{c}" for c in FTS_COLUMNS)
+    exists = sync_conn.exec_driver_sql(
+        f"SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = '{FTS_TABLE}'").first() is not None
+    try:
+        # Rows that existed before the index are indexed in the background (main.fts_backfill), ascending; the
+        # pending id range lives in log_fts_backfill so the delete trigger never "deletes" an unindexed row.
+        sync_conn.exec_driver_sql("CREATE TABLE IF NOT EXISTS log_fts_backfill (next INTEGER NOT NULL, target INTEGER NOT NULL)")
+        if not exists:
+            sync_conn.exec_driver_sql(
+                f"CREATE VIRTUAL TABLE {FTS_TABLE} USING fts5({cols}, content='log_entries', content_rowid='id')")
+            row = sync_conn.exec_driver_sql("SELECT MIN(id), MAX(id) FROM log_entries").first()
+            sync_conn.exec_driver_sql("DELETE FROM log_fts_backfill")
+            if row and row[1]:
+                sync_conn.exec_driver_sql("INSERT INTO log_fts_backfill (next, target) VALUES (?, ?)", (int(row[0]), int(row[1])))
+                log.info("Created the full-text log index; %d existing rows will be indexed in the background",
+                         int(row[1]) - int(row[0]) + 1)
+        sync_conn.exec_driver_sql(
+            f"CREATE TRIGGER IF NOT EXISTS log_fts_ai AFTER INSERT ON log_entries BEGIN "
+            f"INSERT INTO {FTS_TABLE}(rowid, {cols}) VALUES (new.id, {new_cols}); END")
+        sync_conn.exec_driver_sql(
+            f"CREATE TRIGGER IF NOT EXISTS log_fts_ad AFTER DELETE ON log_entries "
+            f"WHEN NOT EXISTS (SELECT 1 FROM log_fts_backfill WHERE old.id >= next AND old.id <= target) BEGIN "
+            f"INSERT INTO {FTS_TABLE}({FTS_TABLE}, rowid, {cols}) VALUES ('delete', old.id, {old_cols}); END")
+        FTS_STATE["enabled"] = True
+    except Exception as exc:  # noqa: BLE001
+        # SQLite without FTS5: search falls back to LIKE scans.
+        log.warning("Full-text search unavailable (%s); log search will use slower LIKE matching", exc)
+        FTS_STATE["enabled"] = False
+
+
+async def fts_backfill_step(chunk: int = 5000) -> dict[str, int] | None:
+    """Index the next chunk of pre-existing rows. Returns progress, or None when nothing is pending."""
+    cols = ", ".join(FTS_COLUMNS)
+
+    async def _op(s: AsyncSession) -> dict[str, int] | None:
+        row = (await s.execute(text("SELECT next, target FROM log_fts_backfill LIMIT 1"))).first()
+        if row is None:
+            return None
+        nxt, target = int(row[0]), int(row[1])
+        hi = min(nxt + chunk, target + 1)
+        await s.execute(text(f"INSERT INTO {FTS_TABLE}(rowid, {cols}) SELECT id, {cols} FROM log_entries "
+                             "WHERE id >= :lo AND id < :hi"), {"lo": nxt, "hi": hi})
+        if hi > target:
+            await s.execute(text("DELETE FROM log_fts_backfill"))
+        else:
+            await s.execute(text("UPDATE log_fts_backfill SET next = :n"), {"n": hi})
+        return {"next": hi, "target": target}
+
+    return await run_db(_op)
 
 
 async def init_db() -> None:
@@ -429,6 +494,9 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "spike_window_seconds": 60,
         "spike_404_threshold": 20,
         "spike_auth_threshold": 10,
+        # Directory enumeration: more than (threshold - 1) 404s from one IP within the window raises a Pending alert.
+        "enum_404_threshold": 3,
+        "enum_404_window_minutes": 5,
         "threat_score_threshold": 50,
         "threat_half_life_minutes": 30,
         "retention_days": 45,
@@ -482,7 +550,6 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "sonicwall_password": "",
         "sonicwall_group": "SENTINEL_BANS",
         "sonicwall_zone": "WAN",
-        "sonicwall_verify_ssl": True,
         "paloalto_url": "",
         "paloalto_api_key": "",
         "paloalto_username": "",
@@ -491,6 +558,8 @@ DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
         "paloalto_vsys": "vsys1",
         "paloalto_timeout_minutes": 0,
         "paloalto_verify_ssl": True,
+        # Perimeter providers: also add the Windows Firewall rule on the attacked server.
+        "also_windows": False,
     },
 }
 
@@ -558,6 +627,24 @@ def _mgmt_url(v: str) -> None:
         raise ValueError("must be a management URL like https://192.0.2.1 or https://fw.corp.local:8443")
 
 
+def _http_url(v: str) -> None:
+    """Any http:// or https:// URL (or a bare host). The scheme is stored exactly as entered."""
+    if not v:
+        return
+    from urllib.parse import urlsplit
+
+    if re.match(r"^[a-z][a-z0-9+.\-]*://", v, re.IGNORECASE) and not re.match(r"^https?://", v, re.IGNORECASE):
+        raise ValueError("must start with http:// or https://")
+    try:
+        parts = urlsplit(v if "://" in v else "https://" + v)
+        ok = bool(parts.hostname) and " " not in v
+        parts.port  # noqa: B018 - raises on an invalid port
+    except ValueError:
+        ok = False
+    if not ok:
+        raise ValueError("must be a URL like http://192.0.2.1 or https://fw.corp.local:8443")
+
+
 def _object_name(v: str) -> None:
     if not re.match(r"^[A-Za-z0-9_.\-]{1,63}$", v):
         raise ValueError("must be 1-63 letters, digits, '.', '_' or '-'")
@@ -589,6 +676,8 @@ VALIDATORS: dict[tuple[str, str], Callable[[Any], None]] = {
     ("watchers", "spike_window_seconds"): _range(5, 3600),
     ("watchers", "spike_404_threshold"): _range(1, 100000),
     ("watchers", "spike_auth_threshold"): _range(1, 100000),
+    ("watchers", "enum_404_threshold"): _range(2, 100000),
+    ("watchers", "enum_404_window_minutes"): _range(1, 1440),
     ("watchers", "threat_score_threshold"): _range(1, 100000),
     ("watchers", "threat_half_life_minutes"): _range(1, 10080),
     ("watchers", "retention_days"): _range(1, 3650),
@@ -613,7 +702,7 @@ VALIDATORS: dict[tuple[str, str], Callable[[Any], None]] = {
     ("firewall", "pfsense_platform"): _choice("pfsense", "opnsense"),
     ("firewall", "timeout"): _range(3, 120),
     ("firewall", "pfsense_url"): _mgmt_url,
-    ("firewall", "sonicwall_url"): _mgmt_url,
+    ("firewall", "sonicwall_url"): _http_url,
     ("firewall", "paloalto_url"): _mgmt_url,
     ("firewall", "pfsense_alias"): _object_name,
     ("firewall", "sonicwall_group"): _object_name,
@@ -766,28 +855,37 @@ class ConfigStore:
             view[section][key] = SECRET_MASK if view[section].get(key) else ""
         return view
 
-    async def update(self, section: str, values: dict[str, Any]) -> dict[str, Any]:
+    def preview(self, section: str, values: dict[str, Any]) -> dict[str, Any]:
+        """The section as it would be after `values` were saved (validated, secrets unmasked), without saving."""
         if section not in DEFAULT_CONFIG:
             raise ValueError(f"unknown config section '{section}'")
         if not isinstance(values, dict):
             raise ValueError("section payload must be an object")
         defaults = DEFAULT_CONFIG[section]
+        candidate = copy.deepcopy(self._cache[section])
+        for k, v in values.items():
+            if k not in defaults:
+                continue
+            if (section, k) in SECRET_FIELDS and v == SECRET_MASK:
+                continue
+            coerced = _coerce(defaults[k], v, f"{section}.{k}", candidate.get(k))
+            validator = VALIDATORS.get((section, k))
+            if validator:
+                try:
+                    validator(coerced)
+                except ValueError as exc:
+                    raise ValueError(f"{section}.{k} {exc}") from exc
+            candidate[k] = coerced
+        self._enforce(section, candidate)
+        return candidate
+
+    async def update(self, section: str, values: dict[str, Any]) -> dict[str, Any]:
+        if section not in DEFAULT_CONFIG:
+            raise ValueError(f"unknown config section '{section}'")
+        if not isinstance(values, dict):
+            raise ValueError("section payload must be an object")
         async with self._lock:
-            candidate = copy.deepcopy(self._cache[section])
-            for k, v in values.items():
-                if k not in defaults:
-                    continue
-                if (section, k) in SECRET_FIELDS and v == SECRET_MASK:
-                    continue
-                coerced = _coerce(defaults[k], v, f"{section}.{k}", candidate.get(k))
-                validator = VALIDATORS.get((section, k))
-                if validator:
-                    try:
-                        validator(coerced)
-                    except ValueError as exc:
-                        raise ValueError(f"{section}.{k} {exc}") from exc
-                candidate[k] = coerced
-            self._enforce(section, candidate)
+            candidate = self.preview(section, values)
             self._cache[section] = candidate
             await self._persist(section)
         for cb in self._listeners:
@@ -815,6 +913,32 @@ class ConfigStore:
                 row.updated_at = utcnow()
 
         await run_db(_op)
+
+
+async def kv_get(key: str, default: Any = None) -> Any:
+    """JSON value stored in a private config row (keys start with '_' and never collide with sections)."""
+    async with SessionLocal() as s:
+        row = await s.get(Config, key)
+    if row is None:
+        return default
+    try:
+        return json.loads(row.value)
+    except json.JSONDecodeError:
+        return default
+
+
+async def kv_put(key: str, value: Any) -> None:
+    payload = json.dumps(value)
+
+    async def _op(s: AsyncSession) -> None:
+        row = await s.get(Config, key)
+        if row is None:
+            s.add(Config(key=key, value=payload, updated_at=utcnow()))
+        else:
+            row.value = payload
+            row.updated_at = utcnow()
+
+    await run_db(_op)
 
 
 async def get_or_create_session_secret() -> bytes:
