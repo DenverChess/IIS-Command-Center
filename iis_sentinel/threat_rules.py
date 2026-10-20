@@ -5,6 +5,7 @@ server that is actually under attack. Scoring (decays with a configurable half-l
     +10  SQL injection signature           +10  XSS signature
     +10  path traversal / LFI signature    +5   known scanner user-agent
     +5   404 spike within the spike window +5   401/403 spike within the spike window
+    +5   directory enumeration (distinct 404 paths >= enum_404_threshold within enum_404_window_minutes)
     +20  Z-score volume/bandwidth anomaly (reported by baseliner)
 Score above `threat_score_threshold` (default 50) flags the IP as an ACTIVE THREAT.
 """
@@ -28,6 +29,7 @@ SCORE_TRAVERSAL = 10
 SCORE_SCANNER = 5
 SCORE_404_SPIKE = 5
 SCORE_AUTH_SPIKE = 5
+SCORE_DIR_ENUM = 5
 SCORE_ZSCORE = 20
 MAX_SCORE_FACTOR = 4
 
@@ -92,6 +94,15 @@ SCANNER_UA = re.compile(
     re.IGNORECASE,
 )
 
+# 404s every browser produces on its own; they never count towards directory enumeration.
+BENIGN_404 = re.compile(
+    r"^/(favicon\.ico|robots\.txt|apple-touch-icon[^/]*\.png|sitemap[^/]*\.xml|browserconfig\.xml|ads\.txt|"
+    r"crossdomain\.xml|\.well-known/.*)$",
+    re.IGNORECASE,
+)
+ENUM_MAX_URIS = 50
+
+
 def normalize_payload(*parts: str) -> str:
     """Decode the request the way an app would see it, defeating double URL / HTML-entity encoding tricks."""
     text = " ".join(p for p in parts if p)[:8192]
@@ -127,6 +138,8 @@ class IPState:
     wauth: deque[float] = field(default_factory=deque)
     last_404_spike: float = 0.0
     last_auth_spike: float = 0.0
+    enum404: deque[tuple[float, str]] = field(default_factory=deque)
+    last_enum: float = 0.0
     active: bool = False
     peak_score: float = 0.0
 
@@ -270,6 +283,11 @@ class ThreatEngine:
             tags.append("AUTH_SPIKE")
             delta += SCORE_AUTH_SPIKE
             events.append(self._event(st, kind="spike", spike="401/403", count=len(st.wauth), window=window))
+        enum = self._enumeration(st, status, stem, log_t, cfg)
+        if enum:
+            tags.append("DIR_ENUM")
+            delta += SCORE_DIR_ENUM
+            events.append(enum)
 
         if tags:
             st.last_attack = now
@@ -285,6 +303,51 @@ class ThreatEngine:
         else:
             events.extend(self._check_escalation(st, cfg))
         return Inspection(tags=tags, delta=delta, events=events)
+
+    def _enumeration(self, st: IPState, status: int, stem: str, log_t: float, cfg: dict[str, Any]) -> dict[str, Any] | None:
+        window = float(cfg.get("enum_404_window_minutes", 5)) * 60.0
+        if status == 404 and stem and not BENIGN_404.match(stem):
+            st.enum404.append((log_t, stem[:300]))
+            if len(st.enum404) > ENUM_MAX_URIS * 4:
+                st.enum404.popleft()
+        while st.enum404 and log_t - st.enum404[0][0] > window:
+            st.enum404.popleft()
+        if status != 404 or log_t - st.last_enum < window:
+            return None
+        uris = list(dict.fromkeys(u for _, u in st.enum404))
+        if len(uris) < int(cfg.get("enum_404_threshold", 3)):
+            return None
+        st.last_enum = log_t
+        return self._event(st, kind="dir_enum", count=len(st.enum404), distinct=len(uris), uris=uris[-ENUM_MAX_URIS:],
+                           window_minutes=window / 60.0)
+
+    def export_enum(self) -> dict[str, Any]:
+        """404 enumeration counters, persisted every 60s so a restart does not reset an in-progress scan."""
+        out: dict[str, Any] = {}
+        for (sid, ip), st in self._ips.items():
+            if st.enum404 or st.last_enum:
+                out[f"{sid}|{ip}"] = {"hits": [[t, u] for t, u in st.enum404], "last": st.last_enum}
+        return out
+
+    def import_enum(self, data: dict[str, Any], max_age: float = 3600.0) -> int:
+        now = time.time()
+        n = 0
+        for key, rec in (data or {}).items():
+            try:
+                sid_s, ip = key.split("|", 1)
+                hits = [(float(t), str(u)) for t, u in rec.get("hits", []) if now - float(t) <= max_age]
+                last = float(rec.get("last") or 0.0)
+            except (ValueError, TypeError, AttributeError):
+                continue
+            if not hits and now - last > max_age:
+                continue
+            st = self._state(int(sid_s), ip)
+            known = set(st.enum404)
+            st.enum404.extend(h for h in hits if h not in known)
+            st.enum404 = deque(sorted(st.enum404)[-ENUM_MAX_URIS * 4:])
+            st.last_enum = max(st.last_enum, last)
+            n += 1
+        return n
 
     def apply_anomaly(self, server_id: int, ip: str, metric: str, zscore: float) -> tuple[int, list[dict[str, Any]]]:
         cfg = self._cfg()
