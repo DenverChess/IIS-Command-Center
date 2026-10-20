@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import ipaddress
+import json
 import logging
 import socket
 import time
@@ -237,4 +238,176 @@ class WhoisClient:
             result["reverse_dns"] = await rdns_task
         except Exception:  # noqa: BLE001
             result["reverse_dns"] = None
+        result["cidr_range"] = registry_cidr(addr, result)
         return result
+
+    async def enrich_ip(self, ip: str, timeout: float = 8.0) -> dict[str, Any]:
+        """WHOIS for the ban dialog. Never raises: a failed or slow lookup returns {'error': ...}."""
+        try:
+            data = await asyncio.wait_for(self.lookup(ip), timeout=timeout)
+        except asyncio.TimeoutError:
+            return {"ip": ip, "error": "WHOIS registry did not answer in time", "cidr_range": None}
+        except Exception as exc:  # noqa: BLE001
+            return {"ip": ip, "error": f"WHOIS lookup failed: {type(exc).__name__}", "cidr_range": None}
+        if "cidr_range" not in data:
+            try:
+                data = {**data, "cidr_range": registry_cidr(ipaddress.ip_address(ip), data)}
+            except ValueError:
+                data = {**data, "cidr_range": None}
+        return data
+
+
+def registry_cidr(addr: ipaddress.IPv4Address | ipaddress.IPv6Address, whois: dict[str, Any]) -> str | None:
+    """Most specific registry-allocated block that contains `addr` (from the RDAP cidr list or start/end range)."""
+    nets: list[Any] = []
+    for c in whois.get("cidr") or []:
+        try:
+            nets.append(ipaddress.ip_network(str(c), strict=False))
+        except ValueError:
+            continue
+    start, end = whois.get("start_address"), whois.get("end_address")
+    if not nets and start and end:
+        try:
+            nets = list(ipaddress.summarize_address_range(ipaddress.ip_address(start), ipaddress.ip_address(end)))
+        except (ValueError, TypeError):
+            nets = []
+    inside = [n for n in nets if n.version == addr.version and addr in n]
+    return str(max(inside, key=lambda n: n.prefixlen)) if inside else None
+
+
+# --------------------------------------------------------------------------------------
+# Subnet escalation: how wide should a ban be?
+# --------------------------------------------------------------------------------------
+# (single, subnet, large subnet) prefix per IP version. /8 (or an IPv6 /32) is never recommended.
+SCOPE_TIERS = {4: (32, 24, 16), 6: (128, 64, 48)}
+SUBNET_WINDOW = 3600
+LARGE_WINDOW = 24 * 3600
+SUBNET_MIN_OTHER_IPS = 2
+LARGE_MIN_OTHER_IPS = 3
+
+
+def scope_options(ip: str) -> list[dict[str, Any]]:
+    addr = ipaddress.ip_address(ip)
+    labels = ("Single IP", "Subnet", "Large Subnet")
+    out = []
+    for tier, (label, prefix) in enumerate(zip(labels, SCOPE_TIERS[addr.version])):
+        net = ipaddress.ip_network(f"{addr}/{prefix}", strict=False)
+        out.append({"tier": ("single", "subnet", "large")[tier], "label": label, "scope": f"/{prefix}",
+                    "cidr": str(net), "size": net.num_addresses})
+    return out
+
+
+def network_for_scope(ip: str, scope: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network:
+    """'/24' (or a tier name: single / subnet / large) applied to `ip`. Only the three tiers are allowed."""
+    addr = ipaddress.ip_address(ip)
+    tiers = SCOPE_TIERS[addr.version]
+    named = {"single": tiers[0], "subnet": tiers[1], "large": tiers[2]}
+    s = str(scope).strip().lower()
+    if s in named:
+        prefix = named[s]
+    else:
+        try:
+            prefix = int(s.lstrip("/"))
+        except ValueError as exc:
+            raise ValueError(f"scope must be one of {', '.join('/' + str(t) for t in tiers)}") from exc
+        v4 = SCOPE_TIERS[4]
+        # The UI's IPv4 scope names map to the same tier on an IPv6 address (/32 -> /128, /24 -> /64, /16 -> /48).
+        if addr.version == 6 and prefix in v4 and prefix not in tiers:
+            prefix = tiers[v4.index(prefix)]
+        if prefix not in tiers:
+            raise ValueError(f"scope must be one of {', '.join('/' + str(t) for t in tiers)}")
+    return ipaddress.ip_network(f"{addr}/{prefix}", strict=False)
+
+
+def _fmt_age(seconds: float) -> str:
+    minutes = max(1, int(round(seconds / 60)))
+    if minutes < 120:
+        return f"{minutes} minute{'s' if minutes != 1 else ''}"
+    return f"{minutes // 60} hours"
+
+
+async def calculate_escalation_cidr(ip_address: str, now: Any = None) -> dict[str, Any]:
+    """Recommend /32, /24 or /16 (IPv6: /128, /64, /48) from attacks seen in the same subnet.
+
+    Evidence is every attack/threat alert and every Sentinel ban (single IP or range) from the last 24 h.
+    Attackers are counted as distinct *other* IPs, so one noisy IP never widens its own ban:
+      /16  >= 3 other attacking IPs in the /16 within 24 h, spread over more than this /24
+      /24  >= 2 other attacking IPs in the /24 within 1 h
+      /32  otherwise, and always for private / reserved addresses
+    """
+    from datetime import timedelta
+
+    from sqlalchemy import select
+
+    from database import ActionableAlert, BannedIP, BannedRange, SessionLocal, parse_network, utcnow
+
+    addr = ipaddress.ip_address(ip_address.strip())
+    if addr.version == 6 and addr.ipv4_mapped is not None:
+        addr = addr.ipv4_mapped
+    single, subnet, large = SCOPE_TIERS[addr.version]
+    net_s = ipaddress.ip_network(f"{addr}/{subnet}", strict=False)
+    net_l = ipaddress.ip_network(f"{addr}/{large}", strict=False)
+    now = now or utcnow()
+    since = now - timedelta(seconds=LARGE_WINDOW)
+
+    async with SessionLocal() as s:
+        alerts = (await s.execute(
+            select(ActionableAlert.source_ip, ActionableAlert.ts)
+            .where(ActionableAlert.ts >= since, ActionableAlert.source_ip.is_not(None),
+                   ActionableAlert.category.in_(("attack", "threat"))).limit(50000))).all()
+        bans = (await s.execute(select(BannedIP.ip_address, BannedIP.banned_at)
+                                .where(BannedIP.banned_at >= since))).all()
+        ranges = (await s.execute(select(BannedRange.source_ips, BannedRange.banned_at)
+                                  .where(BannedRange.banned_at >= since))).all()
+
+    events: list[tuple[Any, Any]] = []  # (address, timestamp)
+    for raw, ts in [*alerts, *bans]:
+        try:
+            a = ipaddress.ip_address(str(raw).strip())
+        except ValueError:
+            continue
+        events.append((a.ipv4_mapped if a.version == 6 and a.ipv4_mapped else a, ts))
+    for raw_ips, ts in ranges:
+        try:
+            ips = json.loads(raw_ips or "[]")
+        except ValueError:
+            ips = []
+        for raw in ips:
+            try:
+                events.append((parse_network(raw).network_address, ts))
+            except ValueError:
+                continue
+
+    in_large = [(a, ts) for a, ts in events if a.version == addr.version and a in net_l]
+    attack_count = len(in_large)
+    others_large: dict[Any, Any] = {}
+    others_subnet_1h: dict[Any, Any] = {}
+    for a, ts in in_large:
+        if a == addr:
+            continue
+        others_large[a] = min(ts, others_large.get(a, ts))
+        if a in net_s and (now - ts).total_seconds() <= SUBNET_WINDOW:
+            others_subnet_1h[a] = min(ts, others_subnet_1h.get(a, ts))
+    outside_subnet = [a for a in others_large if a not in net_s]
+
+    def result(net: Any, reason: str, ips: dict[Any, Any]) -> dict[str, Any]:
+        attackers = sorted((str(a) for a in ips), key=lambda x: ipaddress.ip_address(x))
+        return {"ip": str(addr), "recommended_cidr": str(net), "scope": f"/{net.prefixlen}", "reason": reason,
+                "attack_count": attack_count, "attacker_ips": attackers[:200], "attacker_ip_count": len(attackers),
+                "options": scope_options(str(addr))}
+
+    if not addr.is_global:
+        return result(ipaddress.ip_network(f"{addr}/{single}"),
+                      "internal / reserved address: only the single IP is ever recommended", {})
+    if len(others_large) >= LARGE_MIN_OTHER_IPS and outside_subnet:
+        age = (now - min(others_large.values())).total_seconds()
+        return result(net_l, f"{len(others_large)} other attacking IPs from this /{large} in the last {_fmt_age(age)} "
+                             f"({len(outside_subnet)} outside this /{subnet})", others_large)
+    if len(others_subnet_1h) >= SUBNET_MIN_OTHER_IPS:
+        age = (now - min(others_subnet_1h.values())).total_seconds()
+        return result(net_s, f"{len(others_subnet_1h)} prior attacks from this /{subnet} in the last {_fmt_age(age)}",
+                      others_subnet_1h)
+    if others_large:
+        return result(ipaddress.ip_network(f"{addr}/{single}"),
+                      f"{len(others_large)} other attacking IP(s) nearby in 24 h: not enough to widen the ban", others_large)
+    return result(ipaddress.ip_network(f"{addr}/{single}"), "only this IP has attacked: single-address ban", {})
