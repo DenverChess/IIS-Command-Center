@@ -70,7 +70,9 @@ backoff **while the rest of the fleet keeps streaming**.
 
 ### `▸` RESPOND
 - **PENDING THREATS** queue, grouped per attacker per target server
-- One-click **APPROVE BAN** pushes a Windows Firewall rule to *that* server, or **BAN ALL** clears the whole queue
+- **APPROVE BAN** opens a **BAN THREAT** dialog with WHOIS and a recommended CIDR (/32, /24 or /16, escalated from related attacks in the same subnet), or **BAN ALL** clears the whole queue
+- **Range bans** go to Windows Firewall, the SonicWall group or both, with a **BANNED RANGES** panel and one-click UNBAN
+- An **ALLOWLIST** that no ban, single IP or range, can ever overlap
 - Perimeter bans on **SonicWall**, pfSense / OPNsense or Palo Alto, with SonicWall address-group management in the UI
 - Ban history, one-click unban, dismiss without action
 - **Live log search** (full-text, status / IP / URI / date filters) over everything Sentinel has stored
@@ -254,6 +256,45 @@ netsh advfirewall firewall add rule name="SENTINEL BAN: <ip>" dir=in action=bloc
   ("You are about to ban X IPs across Y servers"). Each IP is banned once (once per server with Windows Firewall);
   failures stay in the queue and are listed in a toast.
 - **Reversible:** **BANS → UNBAN** (`DELETE /defense/bans/{id}`) deletes the firewall rule. Alerts can also be ![Dismissed](https://img.shields.io/badge/-Dismissed-555555?style=flat-square&labelColor=050505) without action.
+
+### CIDR range bans (BAN THREAT dialog)
+
+**APPROVE BAN** opens **BAN THREAT: &lt;ip&gt;**. On open it calls `GET /intel/recommend-cidr` and shows:
+
+- **WHOIS:** org, ASN, country and abuse contact. If the lookup fails, the dialog shows "No WHOIS data available" and the ban still works.
+- **The recommended range and why.** Escalation counts the *other* attacking IPs that hit any server in the same subnet:
+  pending or handled attack/threat alerts plus existing single-IP and range bans from the last 24 h.
+
+| Recommendation | When | IPv6 equivalent |
+| --- | --- | --- |
+| `/32` single IP | Only this IP has attacked, or the address is private/reserved | `/128` |
+| `/24` subnet | 2+ other attackers from the same /24 within **1 hour** | `/64` |
+| `/16` large subnet | 3+ other attackers from the same /16 within **24 hours**, some outside this /24 | `/48` |
+
+A ban is never wider than `/16` (IPv6 `/32`). All math uses Python's `ipaddress`; CIDRs are never built from strings.
+
+- **Scope radios:** Single IP / Subnet / Large Subnet. The recommended one is marked, and any scope that overlaps an allowlist
+  entry or contains a monitored server's address is disabled with the reason.
+- **Target radios:** Windows Firewall (netsh on the alert's server), SonicWall Group (the configured default group), or Both.
+  Unconfigured targets are disabled.
+
+**CONFIRM BAN** posts `/defense/ban-range`:
+
+```text
+netsh advfirewall firewall add rule name="SENTINEL BAN: <cidr>" dir=in action=block remoteip=<cidr>
+SonicWall: address object SENTINEL_<net>_<prefix> added to the default group, then committed
+```
+
+- Every Pending alert from an IP inside the range is Approved.
+- Every console gets a glowing red `[SENTINEL] RANGE BANNED: <cidr> (<scope>) — <reason>` banner above the live log feed.
+- The range appears in **BANNED RANGES** (right column).
+- If one target fails under "Both", the ban is kept for the target that worked and the failure is shown. **UNBAN**
+  (`DELETE /banned-ranges/{id}`) then removes exactly what was applied.
+- The SonicWall API path is IPv4 only. IPv6 ranges can go to Windows Firewall.
+
+**Allowlist** (CONFIG → ALLOWLIST or the button on BANNED RANGES): addresses and ranges Sentinel must never block.
+The check uses network overlap, so a `/16` that merely contains an allowlisted `/32` is refused with
+`CIDR overlaps with allowlist entry`. Single-IP bans are checked too.
 
 ### Where the ban goes: CONFIG → FIREWALL
 
@@ -527,6 +568,10 @@ Every log line, health sample, threat and alert pushed over the WebSocket carrie
 | `GET` | `/threats/whois/{ip}?refresh=` | RDAP WHOIS + reverse DNS (cached 6 h), active bans and alert count for an IP |
 | `POST` | `/config/test/exchange` | Send a test mail |
 | `POST` | `/defense/ban-all` | `{alert_ids: [...]}`: ban every attacker behind those Pending alerts. Returns `{banned, failed, skipped, alert_ids, ip_count, server_count}` |
+| `GET` | `/intel/recommend-cidr?ip=&server_id=` | Escalation recommendation `{recommended_cidr, scope, reason, attack_count, attacker_ips, options[]}` plus WHOIS (or `whois_error`), allowlist hits, ready targets |
+| `POST` | `/defense/ban-range` | `{alert_id}` (or `{ip, server_id}`), optional `scope` (`/32` `/24` `/16`, `single` `subnet` `large`) and `firewall_target` (`windows` `sonicwall` `both`). Defaults: recommended scope, configured target. `409` on allowlist/self-ban overlap |
+| `GET` / `DELETE` | `/banned-ranges?active=&page=&page_size=`, `/banned-ranges/{id}` | Range bans, newest first / lift (removes the netsh rule and/or SonicWall member) |
+| `GET` / `POST` / `DELETE` | `/allowlist`, `/allowlist/{id}` | Allowlist entries / add `{ip_or_cidr, description}` / remove |
 | `GET` / `POST` | `/firewall`, `/firewall/test` | Active ban provider / test a connection (`{provider, settings?}`: unsaved form values; a masked secret keeps the saved one) |
 | `GET` / `POST` | `/firewall/config` | `{firewall_type, api_url, username, api_key, default_group_name, zone, also_windows}` (secret masked). Saved in the `firewall` config section |
 | `GET` / `POST` / `DELETE` | `/firewall/groups` (`DELETE ?name=`) | SonicWall IPv4 address groups with resolved members / create `{name, description}` / delete |
@@ -540,7 +585,7 @@ Every log line, health sample, threat and alert pushed over the WebSocket carrie
 | `GET` | `/stats/baseline?server_id=` | Baseline model, pipeline and watcher status |
 | `GET` / `POST` | `/alerts?server_id=&status=&severity=`, `/alerts/{id}/ack` | Alert history / acknowledge |
 | `GET` / `POST` | `/reports`, `/reports/run`, `/reports/{id}/html` | Report history, run now, view HTML |
-| `WS` | `/ws/dashboard` | `hello` `logs` `health` `servers` `server_status` `threats` `alert` `ban` `alert_status` `baseline` `tick` |
+| `WS` | `/ws/dashboard` | `hello` `logs` `health` `servers` `server_status` `threats` `alert` `ban` `alert_status` `range_ban_notification` (`{cidr, scope, reason, firewall_target}`) `range_unban` `allowlist` `baseline` `tick` |
 
 </details>
 

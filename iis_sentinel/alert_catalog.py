@@ -81,6 +81,9 @@ _EVENTS: list[tuple[str, str, str, str, str, bool, bool, bool, bool]] = [
     ("ban_executed", "defense", "Firewall ban executed", "An operator approved a ban and the firewall rule was created.", "INFO", True, False, False, False),
     ("ban_failed", "defense", "Firewall ban failed", "A ban was approved but the firewall rule could not be created.", "HIGH", True, True, True, False),
     ("ban_lifted", "defense", "Firewall ban lifted", "An operator removed a Sentinel firewall rule.", "INFO", True, False, False, False),
+    ("range_ban_executed", "defense", "CIDR range banned",
+     "An operator approved a subnet (CIDR) ban and it was applied to the Windows Firewall and/or SonicWall group.", "WARNING", True, False, False, False),
+    ("range_ban_lifted", "defense", "CIDR range ban lifted", "An operator removed a Sentinel subnet (CIDR) ban.", "INFO", True, False, False, False),
     # ---- sentinel
     ("breakglass_login", "sentinel", "Break-glass login",
      "Someone signed in with the local emergency account (normally only used when AD is down).", "HIGH", True, True, True, False),

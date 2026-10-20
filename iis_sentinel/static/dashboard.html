@@ -106,6 +106,12 @@
             <button class="chip" @click="searchPage(1)" :disabled="search.loading || search.page >= search.pages">OLDER ›</button>
             <button class="chip on" @click="clearSearch()" x-text="'CLEAR SEARCH / LIVE MODE' + (pendingWhilePaused && !paused ? ' (+' + pendingWhilePaused + ')' : '')"></button>
           </div>
+          <template x-for="b in rangeBanners" :key="b.k">
+            <div class="sentinel-banner pinned" :title="b.ts">
+              <span x-text="b.text"></span>
+              <button class="banner-x" @click="rangeBanners = rangeBanners.filter((x) => x.k !== b.k)" title="Dismiss">✕</button>
+            </div>
+          </template>
           <div class="terminal" id="terminal" x-ignore></div>
         </div>
       </section>
@@ -363,6 +369,32 @@
           </div>
         </div>
 
+        <div class="panel ranges-card">
+          <div class="panel-head">
+            <span class="title">Banned Ranges</span>
+            <span class="meta">
+              <span :class="ranges.length ? 'neon-red' : 'muted'" x-text="ranges.length + ' ACTIVE'"></span>
+              <button class="chip" @click="openConfig('allowlist')" title="Addresses that can never be banned">ALLOWLIST</button>
+            </span>
+          </div>
+          <div class="panel-body ranges-body">
+            <template x-for="r in ranges" :key="r.id">
+              <div class="range-row" :title="(r.source_ips || []).length ? 'Attackers: ' + r.source_ips.join(', ') : ''">
+                <div class="range-main">
+                  <span class="cidr neon-red" x-text="r.cidr"></span>
+                  <span class="scope-tag" x-text="r.scope"></span>
+                  <span class="srv-tag" x-text="targetLabel(r.firewall_target)"></span>
+                  <span class="grow"></span>
+                  <button class="btn small ghost" @click="unbanRange(r)" :disabled="!!rangeBusy[r.id]" x-text="rangeBusy[r.id] ? '…' : 'UNBAN'"></button>
+                </div>
+                <div class="range-reason" x-text="r.reason || '—'"></div>
+                <div class="range-meta muted" x-text="fmtTime(r.banned_at) + ' · ' + fmtNum(r.size) + ' addr · ' + (r.banned_by || '')"></div>
+              </div>
+            </template>
+            <div class="empty" x-show="!ranges.length">NO RANGE BANS</div>
+          </div>
+        </div>
+
         <div class="panel" style="flex:1">
           <div class="panel-head">
             <span class="title" x-text="'Traffic Baseline' + (selected === 'all' ? ' :: Fleet' : '')"></span>
@@ -436,7 +468,7 @@
           <button class="btn small ghost" @click="cfgOpen = false">CLOSE ✕</button>
         </div>
         <nav class="tabs">
-          <template x-for="t in ['servers','alerts','firewall','ad','exchange','watchers','reports']" :key="t">
+          <template x-for="t in ['servers','alerts','firewall','allowlist','ad','exchange','watchers','reports']" :key="t">
             <button class="tab" :class="{ on: cfgTab === t }" @click="switchTab(t)" x-text="t.toUpperCase()"></button>
           </template>
         </nav>
@@ -832,6 +864,33 @@
             </template>
           </div>
 
+          <!-- ALLOWLIST -->
+          <div x-show="cfgTab === 'allowlist'">
+            <div class="muted small" style="margin-bottom:12px">
+              Addresses and ranges that Sentinel must never block (office egress, partners, monitoring, the servers themselves).
+              Any ban, single IP or CIDR range, that overlaps an entry is refused, including a /16 that merely contains an allowlisted /32.
+            </div>
+            <div class="form-grid">
+              <div class="field"><label>IP address or CIDR (IPv4 / IPv6)</label>
+                <input class="input" x-model="allow.ip" placeholder="203.0.113.0/24" @keydown.enter="addAllowlist()"></div>
+              <div class="field"><label>Description</label>
+                <input class="input" x-model="allow.description" placeholder="HQ office egress" @keydown.enter="addAllowlist()"></div>
+            </div>
+            <button class="btn small" @click="addAllowlist()" :disabled="!allow.ip.trim() || !!allow.busy._add" x-text="allow.busy._add ? 'ADDING…' : 'ADD TO ALLOWLIST'"></button>
+            <div class="section-label"><span>ALLOWLISTED</span><span x-text="allow.list.length"></span></div>
+            <div class="notice err" x-show="allow.error" x-text="allow.error"></div>
+            <table class="mini" x-show="allow.list.length">
+              <colgroup><col style="width:28%"><col style="width:36%"><col style="width:24%"><col style="width:12%"></colgroup>
+              <thead><tr><th>IP / CIDR</th><th>DESCRIPTION</th><th>ADDED</th><th></th></tr></thead>
+              <tbody><template x-for="e in allow.list" :key="e.id">
+                <tr><td class="neon-green" x-text="e.ip_or_cidr"></td><td :title="e.description" x-text="e.description || '—'"></td>
+                    <td class="muted" x-text="fmtTime(e.added_at) + ' · ' + e.added_by"></td>
+                    <td style="text-align:right"><button class="btn small ghost" @click="removeAllowlist(e)" :disabled="!!allow.busy[e.id]" x-text="allow.busy[e.id] ? '…' : 'REMOVE'"></button></td></tr>
+              </template></tbody>
+            </table>
+            <div class="muted" x-show="!allow.loading && !allow.list.length && !allow.error">The allowlist is empty.</div>
+          </div>
+
           <!-- REPORTS -->
           <div x-show="cfgTab === 'reports'">
             <div class="form-grid">
@@ -877,7 +936,7 @@
         </template>
         <div class="drawer-foot">
           <span class="muted" style="margin-right:auto;font-size:10px">Secrets (incl. WinRM passwords) are stored DPAPI-encrypted on Windows.</span>
-          <button class="btn" x-show="cfgTab !== 'servers'" @click="saveConfig()" :disabled="busy || !form">SAVE <span x-text="cfgTab.toUpperCase()"></span></button>
+          <button class="btn" x-show="cfgTab !== 'servers' && cfgTab !== 'allowlist'" @click="saveConfig()" :disabled="busy || !form">SAVE <span x-text="cfgTab.toUpperCase()"></span></button>
         </div>
       </aside>
     </div>
@@ -1009,6 +1068,84 @@
           <span class="grow" style="flex:1"></span>
           <button class="btn small ghost" @click="banAll.open = false" :disabled="banAll.busy">CANCEL</button>
           <button class="btn ban-all" @click="confirmBanAll()" :disabled="banAll.busy" x-text="banAll.busy ? 'BANNING…' : 'BAN ALL'"></button>
+        </div>
+      </div>
+    </div>
+
+    <!-- ============================================================ BAN THREAT (CIDR escalation) -->
+    <div class="overlay center" x-show="rangeBan.open" x-cloak @click.self="closeRangeBan()" @keydown.escape.window="rangeBan.open && closeRangeBan()">
+      <div class="modal ban-threat-modal" role="dialog" aria-label="Ban threat">
+        <div class="modal-head">
+          <div>
+            <div class="ip neon-red" x-text="'BAN THREAT: ' + rangeBan.ip"></div>
+            <div class="sub" x-text="(rangeBan.serverName ? 'TARGETING ' + rangeBan.serverName.toUpperCase() : 'MANUAL BAN')
+              + (rangeBan.data && rangeBan.data.threat_score != null ? ' · THREAT SCORE ' + Math.round(rangeBan.data.threat_score) : '')"></div>
+          </div>
+          <span class="grow"></span>
+          <button class="btn small ghost" @click="closeRangeBan()" :disabled="rangeBan.busy">CLOSE ✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="spinner-line" x-show="rangeBan.loading">RUNNING PRE-FLIGHT: WHOIS · ESCALATION · ALLOWLIST…</div>
+          <div class="notice err" x-show="rangeBan.error" x-text="rangeBan.error"></div>
+
+          <template x-if="rangeBan.data">
+            <div>
+              <div class="section-label"><span>WHOIS</span><span x-text="(rangeBan.data.whois && rangeBan.data.whois.registry) || ''"></span></div>
+              <div class="kv wrap" x-show="rangeBan.data.whois">
+                <span class="k">ORG</span><span class="v" x-text="(rangeBan.data.whois || {}).organization || '—'"></span>
+                <span class="k">ASN</span><span class="v" x-text="(rangeBan.data.whois || {}).asn || '—'"></span>
+                <span class="k">COUNTRY</span><span class="v" x-text="(rangeBan.data.whois || {}).country || '—'"></span>
+                <span class="k">ABUSE CONTACT</span><span class="v" x-text="[(rangeBan.data.whois || {}).abuse_email, (rangeBan.data.whois || {}).abuse_phone].filter(Boolean).join(' · ') || '—'"></span>
+                <span class="k">REGISTRY BLOCK</span><span class="v" x-text="(rangeBan.data.whois || {}).cidr_range || '—'"></span>
+              </div>
+              <div class="muted small" x-show="!rangeBan.data.whois">No WHOIS data available</div>
+
+              <div class="section-label"><span>RECOMMENDATION</span><span x-text="rangeBan.data.attack_count + ' RELATED ATTACK' + (rangeBan.data.attack_count === 1 ? '' : 'S')"></span></div>
+              <div class="rb-rec">
+                <span class="cidr neon-red" x-text="rangeBan.data.recommended_cidr"></span>
+                <span class="scope-tag" x-text="rangeBan.data.scope"></span>
+              </div>
+              <div class="small" style="margin-top:4px" x-text="rangeBan.data.reason"></div>
+              <div class="small muted" style="margin-top:4px" x-show="(rangeBan.data.attacker_ips || []).length"
+                   x-text="'Related attackers: ' + rangeBan.data.attacker_ips.slice(0, 12).join(', ') + (rangeBan.data.attacker_ips.length > 12 ? ' …' : '')"></div>
+              <div class="notice err" style="margin-top:8px" x-show="rangeBan.data.allowlisted"
+                   x-text="'ALLOWLIST: the recommended range overlaps ' + (rangeBan.data.options.find((o) => o.recommended) || { allowlist: [] }).allowlist.map((a) => a.ip_or_cidr + (a.description ? ' (' + a.description + ')' : '')).join(', ') + '. Choose a narrower scope.'"></div>
+            </div>
+          </template>
+
+          <template x-if="rbOptions().length">
+            <div>
+              <div class="section-label"><span>SCOPE</span><span></span></div>
+              <div class="rb-choices">
+                <template x-for="o in rbOptions()" :key="o.scope">
+                  <label class="rb-choice" :class="{ on: rangeBan.scope === o.scope, blocked: o.blocked, rec: o.recommended }">
+                    <input type="radio" name="rb-scope" :value="o.scope" x-model="rangeBan.scope" :disabled="o.blocked || rangeBan.busy">
+                    <span class="lbl" x-text="rbScopeLabel(o)"></span>
+                    <span class="muted small" x-text="o.cidr + ' · ' + fmtNum(o.size) + ' addr'"></span>
+                    <span class="neon-red small rb-err" x-show="o.blocked" x-text="o.error"></span>
+                  </label>
+                </template>
+              </div>
+
+              <div class="section-label"><span>FIREWALL TARGET</span><span></span></div>
+              <div class="rb-choices">
+                <template x-for="t in [['windows','Windows Firewall'],['sonicwall','SonicWall Group'],['both','Both']]" :key="t[0]">
+                  <label class="rb-choice" :class="{ on: rangeBan.target === t[0], blocked: rangeBan.data && !rbTargetReady(t[0]) }">
+                    <input type="radio" name="rb-target" :value="t[0]" x-model="rangeBan.target" :disabled="rangeBan.busy || (rangeBan.data && !rbTargetReady(t[0]))">
+                    <span class="lbl" x-text="t[1] + (rangeBan.data && rangeBan.data.default_target === t[0] ? ' (default)' : '')"></span>
+                    <span class="muted small" x-show="t[0] !== 'windows' && rangeBan.data && rangeBan.data.targets.sonicwall.group" x-text="'group ' + (rangeBan.data ? rangeBan.data.targets.sonicwall.group : '')"></span>
+                    <span class="neon-red small rb-err" x-show="rbTargetError(t[0])" x-text="rbTargetError(t[0])"></span>
+                  </label>
+                </template>
+              </div>
+            </div>
+          </template>
+        </div>
+        <div class="modal-foot">
+          <span class="small muted" x-text="rbSelected() ? 'Blocks ' + rbSelected().cidr + ' inbound on ' + targetLabel(rangeBan.target || (rangeBan.data && rangeBan.data.default_target) || 'windows') : ''"></span>
+          <span class="grow" style="flex:1"></span>
+          <button class="btn small ghost" @click="closeRangeBan()" :disabled="rangeBan.busy">CANCEL</button>
+          <button class="btn ban-all" @click="confirmRangeBan()" :disabled="!rbCanConfirm()" x-text="rangeBan.busy ? 'EXECUTING…' : 'CONFIRM BAN'"></button>
         </div>
       </div>
     </div>

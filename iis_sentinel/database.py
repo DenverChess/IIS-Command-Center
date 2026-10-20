@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import copy
+import ipaddress
 import json
 import logging
 import os
@@ -202,6 +203,43 @@ class BannedIP(Base):
     active: Mapped[bool] = mapped_column(Boolean, default=True)
 
     __table_args__ = (Index("ix_ban_server_ip", "server_id", "ip_address"),)
+
+
+class BannedRange(Base):
+    """A CIDR block (single /32 or /128 included) pushed to Windows Firewall and/or the SonicWall group."""
+    __tablename__ = "banned_ranges"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    cidr_notation: Mapped[str] = mapped_column(String(64), index=True)
+    scope: Mapped[str] = mapped_column(String(8))  # "/32" "/24" "/16" (IPv6: "/128" "/64" "/48")
+    reason: Mapped[str] = mapped_column(Text, default="")
+    threat_score: Mapped[float] = mapped_column(Float, default=0.0)
+    banned_at: Mapped[datetime] = mapped_column(DateTime, index=True)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    source_ip_count: Mapped[int] = mapped_column(Integer, default=0)
+    source_ips: Mapped[str] = mapped_column(Text, default="[]")  # JSON array of the attacker IPs behind the ban
+    # Attacked server (Windows rule target); NULL = perimeter-only, or every server for windows bans without one.
+    server_id: Mapped[int | None] = mapped_column(Integer, ForeignKey("monitored_servers.id"), nullable=True)
+    firewall_target: Mapped[str] = mapped_column(String(16), default="windows")  # windows | sonicwall | both
+    # JSON {"windows": [server ids with a rule], "sonicwall": "<group>"}: exactly what UNBAN has to remove.
+    applied: Mapped[str] = mapped_column(Text, default="{}")
+    alert_id: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    banned_by: Mapped[str] = mapped_column(String(256), default="")
+    output: Mapped[str] = mapped_column(Text, default="")
+    lifted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    lifted_by: Mapped[str] = mapped_column(String(256), default="")
+
+
+class AllowlistEntry(Base):
+    """Addresses / ranges Sentinel must never block (partners, monitoring, your own egress)."""
+    __tablename__ = "allowlist"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    ip_or_cidr: Mapped[str] = mapped_column(String(64))
+    description: Mapped[str] = mapped_column(String(256), default="")
+    added_by: Mapped[str] = mapped_column(String(256), default="")
+    added_at: Mapped[datetime] = mapped_column(DateTime)
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
 
 
 class Config(Base):
@@ -913,6 +951,34 @@ class ConfigStore:
                 row.updated_at = utcnow()
 
         await run_db(_op)
+
+
+def parse_network(value: str) -> ipaddress.IPv4Network | ipaddress.IPv6Network:
+    """'1.2.3.4', '1.2.3.0/24', '2001:db8::/48' -> network (host bits masked, IPv4-mapped IPv6 unwrapped)."""
+    net = ipaddress.ip_network(str(value).strip(), strict=False)
+    if net.version == 6 and net.network_address.ipv4_mapped is not None and net.prefixlen >= 96:
+        net = ipaddress.ip_network(f"{net.network_address.ipv4_mapped}/{net.prefixlen - 96}", strict=False)
+    return net
+
+
+async def allowlist_overlaps(cidr: str) -> list[dict[str, Any]]:
+    """Active allowlist entries that overlap `cidr` in either direction (nested ranges included)."""
+    net = parse_network(cidr)
+    async with SessionLocal() as s:
+        rows = (await s.execute(select(AllowlistEntry).where(AllowlistEntry.is_active.is_(True)))).scalars().all()
+    hits = []
+    for r in rows:
+        try:
+            other = parse_network(r.ip_or_cidr)
+        except ValueError:
+            continue
+        if other.version == net.version and net.overlaps(other):
+            hits.append({"id": r.id, "ip_or_cidr": r.ip_or_cidr, "description": r.description})
+    return hits
+
+
+async def is_cidr_allowlisted(cidr: str) -> bool:
+    return bool(await allowlist_overlaps(cidr))
 
 
 async def kv_get(key: str, default: Any = None) -> Any:
