@@ -206,6 +206,15 @@ function dashboardApp() {
     // BAN ALL
     banAll: { open: false, busy: false, ips: 0, servers: 0, alertIds: [] },
 
+    // BAN THREAT dialog (CIDR escalation), banned ranges, allowlist
+    rangeBan: { open: false, loading: false, busy: false, ip: "", serverId: null, serverName: "", alertId: null, key: "",
+                data: null, error: "", scope: "", target: "" },
+    _rbSeq: 0,
+    ranges: [],
+    rangeBusy: {},
+    rangeBanners: [],
+    allow: { list: [], loading: false, error: "", ip: "", description: "", busy: {} },
+
     // SonicWall address groups (CONFIG > FIREWALL)
     fwGroups: { list: [], loaded: false, loading: false, error: "", name: "", description: "", busy: {} },
 
@@ -307,6 +316,7 @@ function dashboardApp() {
           this.addLogs(msg.logs || []);
           this.loadPending();
           this.loadBans();
+          this.loadRanges();
           this.loadAlertHistory();
           break;
         case "servers":
@@ -328,6 +338,15 @@ function dashboardApp() {
           break;
         case "unban":
           this.bans = this.bans.filter((b) => b.id !== msg.id);
+          break;
+        case "range_ban_notification":
+          this.onRangeBan(msg);
+          break;
+        case "range_unban":
+          this.ranges = this.ranges.filter((r) => r.id !== msg.id);
+          break;
+        case "allowlist":
+          if (this.cfgOpen && this.cfgTab === "allowlist") this.loadAllowlist();
           break;
         case "logs":
           this.addLogs(msg.data || []);
@@ -387,6 +406,7 @@ function dashboardApp() {
 
     /* ------------------------------------------------------------ log feed */
     passes(l) {
+      if (l.kind === "banner") return true;
       const sel = this.selId();
       if (sel != null && l.server_id !== sel) return false;
       if (this.feedMode === "errors") return l.status >= 400 || !!l.tags;
@@ -396,6 +416,12 @@ function dashboardApp() {
 
     renderLine(l) {
       const div = document.createElement("div");
+      if (l.kind === "banner") {
+        div.className = "sentinel-banner";
+        div.textContent = l.text;
+        div.title = `${l.ts}  ${l.text}`;
+        return div;
+      }
       div.className = `log-line ${l.level}`;
       const span = (cls, text) => {
         const s = document.createElement("span");
@@ -694,17 +720,180 @@ function dashboardApp() {
     },
 
     async approveBan(p) {
-      if (this.banBusy[p.key]) return;
-      const ok = window.confirm(this.banPrompt(p.ip, p.server_name));
-      if (!ok) return;
-      this.banBusy[p.key] = true;
+      if (this.banBusy[p.key] || !p.ip) return;
+      const rb = this.rangeBan;
+      Object.assign(rb, { open: true, loading: true, busy: false, ip: p.ip, serverId: p.server_id ?? null, serverName: p.server_name || "",
+                          alertId: p.top ? p.top.id : null, key: p.key, data: null, error: "", scope: "", target: "" });
+      const seq = ++this._rbSeq;
+      const params = new URLSearchParams({ ip: p.ip });
+      if (p.server_id != null) params.set("server_id", String(p.server_id));
       try {
-        const r = await api("/defense/ban", { method: "POST", body: JSON.stringify({ alert_id: p.top.id }) });
-        this.onBan({ data: r.ban, alert_ids: r.alert_ids, status: "Approved" });
+        const r = await api(`/intel/recommend-cidr?${params}`);
+        if (seq !== this._rbSeq || !rb.open) return;
+        rb.data = r;
+        const opts = r.options || [];
+        const rec = Math.max(0, opts.findIndex((o) => o.recommended));
+        const pick = opts.slice(0, rec + 1).reverse().find((o) => !o.blocked) || opts.find((o) => !o.blocked);
+        rb.scope = pick ? pick.scope : "";
+        rb.target = this.rbTargetReady(r.default_target) ? r.default_target
+          : ["windows", "sonicwall"].find((t) => this.rbTargetReady(t)) || r.default_target;
       } catch (e) {
-        this.toast({ severity: "CRITICAL", category: "ban failed", server_name: p.server_name, title: e.message }, 10000);
+        if (seq !== this._rbSeq) return;
+        rb.error = `Pre-flight unavailable (${e.message}). Only a single-IP ban can be offered.`;
+        rb.scope = "single";
       } finally {
-        delete this.banBusy[p.key];
+        if (seq === this._rbSeq) rb.loading = false;
+      }
+    },
+
+    rbOptions() {
+      const rb = this.rangeBan;
+      if (rb.data) return rb.data.options || [];
+      if (!rb.error) return [];
+      const v6 = rb.ip.includes(":");
+      return [{ tier: "single", label: "Single IP", scope: "single", cidr: `${rb.ip}/${v6 ? 128 : 32}`, size: 1, recommended: true, blocked: false }];
+    },
+
+    rbScopeLabel(o) {
+      return `${o.label} (${o.scope === "single" ? (this.rangeBan.ip.includes(":") ? "/128" : "/32") : o.scope})${o.recommended ? " — RECOMMENDED" : ""}`;
+    },
+
+    rbTargetReady(t) {
+      const tg = this.rangeBan.data && this.rangeBan.data.targets;
+      if (!tg) return t === "windows";
+      if (t === "both") return tg.windows.ready && tg.sonicwall.ready;
+      return !!(tg[t] && tg[t].ready);
+    },
+
+    rbTargetError(t) {
+      const tg = this.rangeBan.data && this.rangeBan.data.targets;
+      if (!tg || this.rbTargetReady(t)) return "";
+      if (t === "both") return [tg.windows.error, tg.sonicwall.error].filter(Boolean).join("; ");
+      return (tg[t] && tg[t].error) || "not available";
+    },
+
+    rbSelected() { return this.rbOptions().find((o) => o.scope === this.rangeBan.scope) || null; },
+
+    rbCanConfirm() {
+      const rb = this.rangeBan, o = this.rbSelected();
+      return rb.open && !rb.loading && !rb.busy && !!o && !o.blocked && (!rb.data || this.rbTargetReady(rb.target));
+    },
+
+    closeRangeBan() {
+      if (this.rangeBan.busy) return;
+      this.rangeBan.open = false;
+      ++this._rbSeq;
+    },
+
+    async confirmRangeBan() {
+      const rb = this.rangeBan;
+      if (!this.rbCanConfirm()) return;
+      rb.busy = true;
+      if (rb.key) this.banBusy[rb.key] = true;
+      const body = { scope: rb.scope };
+      if (rb.target) body.firewall_target = rb.target;
+      if (rb.alertId != null) body.alert_id = rb.alertId;
+      else Object.assign(body, { ip: rb.ip, server_id: rb.serverId });
+      try {
+        const r = await api("/defense/ban-range", { method: "POST", body: JSON.stringify(body) });
+        this.setAlertStatus(r.alert_ids || [], "Approved");
+        if (r.range && r.range.id && !this.ranges.some((x) => x.id === r.range.id)) this.ranges.unshift(r.range);
+        rb.open = false;
+        const failed = (r.results || []).filter((x) => !x.ok);
+        this.toast({ severity: failed.length ? "WARNING" : "INFO", ok: !failed.length, category: "range ban",
+                     title: r.already ? `${r.cidr} is already banned` : `${r.cidr} (${r.scope}) blocked`,
+                     message: failed.map((x) => `${x.target}${x.server ? " " + x.server : ""}: ${x.message}`).join("\n") },
+                   failed.length ? 15000 : 8000);
+      } catch (e) {
+        rb.error = e.message;
+        this.toast({ severity: "CRITICAL", category: "range ban failed", server_name: rb.serverName, title: e.message }, 12000);
+      } finally {
+        rb.busy = false;
+        if (rb.key) delete this.banBusy[rb.key];
+      }
+    },
+
+    onRangeBan(msg) {
+      this.setAlertStatus(msg.alert_ids || [], "Approved");
+      const d = msg.data;
+      if (d && d.id && !this.ranges.some((x) => x.id === d.id)) this.ranges.unshift(d);
+      const ts = new Date(Date.now() + this.serverOffset).toISOString();
+      const text = `[SENTINEL] RANGE BANNED: ${msg.cidr} (${msg.scope}) — ${msg.reason}`;
+      this.addLogs([{ kind: "banner", ts, server_id: null, text }]);
+      const k = ++this._k;
+      this.rangeBanners = [{ k, ts, text }, ...this.rangeBanners].slice(0, 3);
+      setTimeout(() => { this.rangeBanners = this.rangeBanners.filter((x) => x.k !== k); }, 120000);
+    },
+
+    async loadRanges() {
+      try {
+        const r = await api("/banned-ranges?active=true&page_size=200");
+        this.ranges = r.ranges || [];
+      } catch (e) { console.error(e); }
+    },
+
+    targetLabel(t) {
+      return { windows: "WINDOWS", sonicwall: "SONICWALL", both: "WIN + SONICWALL" }[t] || (t || "").toUpperCase();
+    },
+
+    async unbanRange(r) {
+      if (!window.confirm(`Lift range ban on ${r.cidr}?\n\nThe Sentinel block will be removed from ${this.targetLabel(r.firewall_target)}.`)) return;
+      this.rangeBusy[r.id] = true;
+      try {
+        await api(`/banned-ranges/${r.id}`, { method: "DELETE" });
+        this.ranges = this.ranges.filter((x) => x.id !== r.id);
+      } catch (e) {
+        this.toast({ severity: "CRITICAL", category: "unban failed", title: `${r.cidr}: ${e.message}` }, 12000);
+      } finally {
+        delete this.rangeBusy[r.id];
+      }
+    },
+
+    async loadAllowlist() {
+      const a = this.allow;
+      a.loading = true;
+      a.error = "";
+      try {
+        a.list = (await api("/allowlist")).entries || [];
+      } catch (e) {
+        a.error = e.message;
+      } finally {
+        a.loading = false;
+      }
+    },
+
+    async addAllowlist() {
+      const a = this.allow;
+      const value = a.ip.trim();
+      if (!value || a.busy._add) return;
+      a.busy._add = true;
+      try {
+        const r = await api("/allowlist", { method: "POST", body: JSON.stringify({ ip_or_cidr: value, description: a.description.trim() }) });
+        a.ip = "";
+        a.description = "";
+        const overlap = r.overlapping_bans || [];
+        this.cfgMsg = overlap.length
+          ? { ok: false, text: `${r.entry.ip_or_cidr} allowlisted, but it is inside active range ban(s): ${overlap.join(", ")}. UNBAN them to restore access.` }
+          : { ok: true, text: `${r.entry.ip_or_cidr} added to the allowlist. It can no longer be banned.` };
+        await this.loadAllowlist();
+      } catch (e) {
+        this.cfgMsg = { ok: false, text: e.message };
+      } finally {
+        delete a.busy._add;
+      }
+    },
+
+    async removeAllowlist(entry) {
+      if (!window.confirm(`Remove ${entry.ip_or_cidr} from the allowlist?\n\nIt will become bannable again.`)) return;
+      const a = this.allow;
+      a.busy[entry.id] = true;
+      try {
+        await api(`/allowlist/${entry.id}`, { method: "DELETE" });
+        a.list = a.list.filter((x) => x.id !== entry.id);
+      } catch (e) {
+        this.cfgMsg = { ok: false, text: e.message };
+      } finally {
+        delete a.busy[entry.id];
       }
     },
 
@@ -1014,12 +1203,14 @@ function dashboardApp() {
       this.refreshServers();
       this.loadReports();
       this.loadAlertCatalog();
+      if (this.cfgTab === "allowlist") this.loadAllowlist();
     },
 
     switchTab(t) {
       this.cfgTab = t;
       this.cfgMsg = { ok: true, text: "" };
       if (t === "alerts") this.loadAlertCatalog();
+      if (t === "allowlist") this.loadAllowlist();
       if (t === "watchers") { this.refreshServers(); this.loadGeoStatus(); }
     },
 
