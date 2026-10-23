@@ -277,6 +277,13 @@ SET_ORDER = list(SET_TITLES)
 _KEEP_CASE = {"asp.net": "ASP.NET", "url": "URL", "uri": "URI", "cgi": "CGI", "isapi": "ISAPI", "io": "IO", "id": "ID",
               "ws": "WS", "http": "HTTP", "sec": "sec", "mbytes": "MBytes", "kbytes": "KBytes", "was": "WAS",
               "nonanonymous": "NonAnonymous", "wpi": "WPI", "tcpv4": "TCPv4", "tcpv6": "TCPv6"}
+# HTTP.sys counters are CamelCase without spaces; Get-Counter returns them lower-cased.
+_HTTPSYS = ["ArrivalRate", "CacheHitRate", "CurrentQueueSize", "MaxQueueItemAge", "RejectedRequests", "RejectionRate",
+            "CurrentConnections", "MaxConnections", "ConnectionAttempts", "BytesSentRate", "BytesReceivedRate",
+            "BytesTransferredRate", "GetRequestsRate", "HeadRequestsRate", "AllRequestsRate", "AllRequests",
+            "SendErrors", "SendRate", "TotalUrisCached", "UriCacheHits", "UriCacheMisses", "UriCacheFlushes",
+            "CurrentUrisCached", "BytesSent", "BytesReceived", "BytesTransferred", "GetRequests", "HeadRequests"]
+_KEEP_CASE.update({n.lower(): n for n in _HTTPSYS})
 
 
 def counter_label(name: str) -> str:
