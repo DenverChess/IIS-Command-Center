@@ -80,6 +80,7 @@ from defense_engine import DefenseEngine
 from whois_lookup import WhoisClient, calculate_escalation_cidr, network_for_scope
 from mailer import Mailer, render_alert_html
 from remote_manager import RemoteError, RemoteManager, validate_ban_ip
+from resource_monitor import RESOURCE_KINDS
 from reporter import Reporter
 from system_health import HealthMonitor
 from threat_rules import ThreatEngine
@@ -1626,6 +1627,28 @@ async def delete_server(server_id: int, user: dict[str, Any] = Depends(current_u
                                f"{name} is no longer monitored.", details={"user": user["u"], "server": name},
                                event="server_config_changed")
     return {"ok": True}
+
+
+@app.get("/servers/{server_id}/resources")
+async def server_resources(server_id: int, kind: str = "site", name: str = "",
+                           _user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    if S.registry.get(server_id) is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+    if kind not in RESOURCE_KINDS:
+        raise HTTPException(status_code=400, detail=f"kind must be one of {', '.join(RESOURCE_KINDS)}")
+    name = name.strip()
+    if kind != "server" and not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    if len(name) > 260:
+        raise HTTPException(status_code=400, detail="name is too long")
+    health = next((h for h in S.health.snapshot() if h.get("server_id") == server_id), None)
+    try:
+        return await S.remote.resources(server_id, kind, name, health)
+    except RemoteError as exc:
+        raise HTTPException(status_code=502, detail=f"Could not read resources from {S.registry.name(server_id)}: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Resource query on server %s failed: %s", server_id, exc)
+        raise HTTPException(status_code=502, detail=f"Resource query failed: {type(exc).__name__}: {exc}") from exc
 
 
 @app.post("/servers/{server_id}/test", dependencies=[Depends(same_origin_guard)])
