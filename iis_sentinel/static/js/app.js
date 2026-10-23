@@ -75,6 +75,25 @@ const SEV_RANK = { INFO: 0, WARNING: 1, HIGH: 2, CRITICAL: 3 };
 
 // Kept outside Alpine's reactive proxies: the feed is rendered imperatively for speed.
 const feed = { buffer: [] };
+// ip -> time it was last asked of /intel/abuseipdb/lookup (not reactive on purpose).
+const abuseAsked = new Map();
+
+const THEMES = [
+  { id: "cyber", label: "Cyber", desc: "Neon on black with glow and scanlines (the original look)." },
+  { id: "dark", label: "Dark", desc: "Calm dark grey, no glow or animated effects." },
+  { id: "lite", label: "Lite", desc: "Light background with dark text, for bright rooms." },
+  { id: "large", label: "Large Print", desc: "Bigger text and controls with high contrast." },
+];
+const THEME_KEY = "sentinel.theme";
+const DEFAULT_THEME_KEY = "sentinel.default_theme";
+function applyTheme(id) {
+  const t = THEMES.some((x) => x.id === id) ? id : "cyber";
+  document.documentElement.setAttribute("data-theme", t);
+  return t;
+}
+function storedTheme() {
+  try { return localStorage.getItem(THEME_KEY) || ""; } catch (_) { return ""; }
+}
 const termEl = () => document.getElementById("terminal");
 
 /* =====================================================================================
@@ -218,6 +237,15 @@ function dashboardApp() {
     // SonicWall address groups (CONFIG > FIREWALL)
     fwGroups: { list: [], loaded: false, loading: false, error: "", name: "", description: "", busy: {} },
 
+    // AbuseIPDB reputation (ip -> result) and UI theme
+    abuse: {},
+    abuseStatus: {},
+    abuseTest: { busy: false, ok: null, text: "" },
+    THEMES,
+    theme: document.documentElement.getAttribute("data-theme") || "cyber",
+    themeLocal: storedTheme(),
+    defaultTheme: "cyber",
+
     _k: 0,
 
     init() {
@@ -229,6 +257,7 @@ function dashboardApp() {
       this.connect();
       setInterval(() => this.updateClock(), 250);
       setInterval(() => this.watchdog(), 5000);
+      setInterval(() => this.syncAbuse(), 3000);
       setInterval(() => {
         if (this.ws && this.ws.readyState === WebSocket.OPEN) this.ws.send("ping");
       }, 20000);
@@ -311,6 +340,7 @@ function dashboardApp() {
           if (msg.baseline) this.baseline = msg.baseline;
           this.pipeline = msg.pipeline || {};
           if (msg.firewall) this.firewall = msg.firewall;
+          this.onGeneral(msg);
           feed.buffer = [];
           termEl().replaceChildren();
           this.addLogs(msg.logs || []);
@@ -387,6 +417,13 @@ function dashboardApp() {
           break;
         case "firewall":
           if (msg.data) this.firewall = msg.data;
+          break;
+        case "general":
+          this.onGeneral(msg);
+          break;
+        case "abuseipdb":
+          Object.assign(this.abuse, msg.data || {});
+          if (this.whoisOpen && msg.data && msg.data[this.whois.ip]) this.whois.abuse = msg.data[this.whois.ip];
           break;
         case "pong":
           this.setServerTime(msg.server_time);
@@ -1012,15 +1049,141 @@ function dashboardApp() {
       // Mutate Alpine's reactive proxy, not the plain object assigned above, or the modal never re-renders.
       const state = this.whois;
       const enc = encodeURIComponent(ip);
-      const [w, intel] = await Promise.allSettled([
+      state.abuse = keep ? keep.abuse : (this.abuse[ip] || null);
+      const [w, intel, ab] = await Promise.allSettled([
         api(`/threats/whois/${enc}${refresh ? "?refresh=true" : ""}`),
         api(`/threats/ip/${enc}`),
+        this.abuseStatus.enabled ? api(`/intel/abuseipdb/${enc}${refresh ? "?refresh=true" : ""}`) : Promise.resolve(null),
       ]);
       if (this.whois !== state) return;
       if (w.status === "fulfilled") state.data = w.value;
       else state.error = `WHOIS: ${w.reason.message}`;
       if (intel.status === "fulfilled") state.intel = intel.value;
+      if (ab.status === "fulfilled" && ab.value) {
+        state.abuse = ab.value;
+        if (ab.value.score != null) this.abuse[ip] = ab.value;
+      } else if (ab.status === "rejected") {
+        state.abuse = { ip, score: null, error: ab.reason.message };
+      }
       state.loading = false;
+    },
+
+    WH() {
+      const h = this.whois.data && this.whois.data.history;
+      return h || { total: 0, ip_bans: 0, range_bans: 0, active: 0, events: [] };
+    },
+
+    historyHeadline() {
+      const h = this.WH();
+      if (!h.total) return "Never banned by Sentinel";
+      const times = `${h.total} time${h.total === 1 ? "" : "s"}`;
+      const parts = [];
+      if (h.ip_bans) parts.push(`${h.ip_bans} single-IP`);
+      if (h.range_bans) parts.push(`${h.range_bans} range`);
+      return `Banned ${times} by Sentinel (${parts.join(" + ")})` + (h.active ? ` · ${h.active} active now` : " · none active");
+    },
+
+    fmtSpan(sec) {
+      if (sec == null) return "";
+      if (sec < 60) return `${sec}s`;
+      if (sec < 3600) return `${Math.round(sec / 60)}m`;
+      if (sec < 86400) return `${(sec / 3600).toFixed(1)}h`;
+      return `${(sec / 86400).toFixed(1)}d`;
+    },
+
+    /* ------------------------------------------------------------ AbuseIPDB */
+    syncAbuse() {
+      if (!this.abuseStatus.enabled || !this.abuseStatus.auto_lookup || !this.connected) return;
+      const now = Date.now();
+      const want = [];
+      const add = (ip) => {
+        if (!ip || this.abuse[ip]) return;
+        const t = abuseAsked.get(ip);
+        if (t && now - t < 120000) return;
+        abuseAsked.set(ip, now);
+        want.push(ip);
+      };
+      this.pendingGroups().forEach((g) => add(g.ip));
+      this.visibleThreats().forEach((t) => add(t.ip));
+      if (!want.length) return;
+      api("/intel/abuseipdb/lookup", { method: "POST", body: JSON.stringify({ ips: want.slice(0, 200) }) })
+        .then((r) => {
+          Object.assign(this.abuse, r.results || {});
+          this.abuseStatus = { ...this.abuseStatus, ...r, results: undefined };
+        })
+        .catch((e) => console.warn("abuseipdb lookup", e));
+    },
+
+    ipdb(ip) { return this.abuse[ip] || null; },
+    ipdbText(ip) {
+      const a = this.ipdb(ip);
+      if (!a) return "…";
+      if (a.public === false) return "LAN";
+      if (a.score == null) return a.error ? "ERR" : "—";
+      return `${a.score}%`;
+    },
+    ipdbClass(ip) {
+      const a = this.ipdb(ip);
+      if (!a || a.score == null) return "none";
+      return a.score >= 75 ? "red" : a.score >= 25 ? "amber" : "green";
+    },
+    ipdbTitle(ip) {
+      const a = this.ipdb(ip);
+      if (!a) return "AbuseIPDB: lookup queued";
+      if (a.public === false) return "AbuseIPDB: private / reserved address, not looked up";
+      if (a.score == null) return `AbuseIPDB: ${a.error || "no data"}`;
+      return `AbuseIPDB confidence ${a.score}% · ${this.fmtNum(a.reports || 0)} report(s) from ${this.fmtNum(a.users || 0)} user(s)` +
+        (a.isp ? ` · ${a.isp}` : "") + (a.usage ? ` · ${a.usage}` : "") + (a.tor ? " · TOR EXIT" : "") +
+        (a.last_reported ? ` · last reported ${a.last_reported.slice(0, 10)}` : "");
+    },
+
+    async testAbuseIPDB() {
+      const t = this.abuseTest;
+      t.busy = true;
+      t.ok = null;
+      t.text = "Contacting AbuseIPDB…";
+      try {
+        const key = this.form && this.form.general ? this.form.general.abuseipdb_api_key : "";
+        const r = await api("/intel/abuseipdb/test", { method: "POST", body: JSON.stringify({ api_key: key || null }) });
+        t.ok = r.ok;
+        t.text = (r.ok ? r.message : r.error) + (r.remaining != null ? ` · ${r.remaining}/${r.limit} checks left today` : "");
+      } catch (e) {
+        t.ok = false;
+        t.text = e.message;
+      } finally {
+        t.busy = false;
+      }
+    },
+
+    async refreshAbuseStatus() {
+      try { this.abuseStatus = await api("/intel/abuseipdb"); } catch (_) {}
+    },
+
+    abuseStatusText() {
+      const s = this.abuseStatus || {};
+      if (!s.configured) return "Not configured: add an API key to see AbuseIPDB scores next to Sentinel's.";
+      if (!s.enabled) return "Configured but turned off.";
+      const quota = s.remaining != null ? `${s.remaining} / ${s.limit} checks left today` : "quota unknown until the first lookup";
+      return `ON · ${s.cached} cached · ${s.queued} queued · ${quota}` + (s.error ? ` · ${s.error}` : "");
+    },
+
+    /* ------------------------------------------------------------ themes */
+    onGeneral(msg) {
+      if (msg.abuseipdb) this.abuseStatus = msg.abuseipdb;
+      if (msg.default_theme) {
+        this.defaultTheme = msg.default_theme;
+        try { localStorage.setItem(DEFAULT_THEME_KEY, msg.default_theme); } catch (_) {}
+        if (!this.themeLocal) this.theme = applyTheme(msg.default_theme);
+      }
+    },
+
+    setTheme(id) {
+      this.themeLocal = id || "";
+      try {
+        if (id) localStorage.setItem(THEME_KEY, id);
+        else localStorage.removeItem(THEME_KEY);
+      } catch (_) {}
+      this.theme = applyTheme(id || this.defaultTheme);
     },
 
     closeWhois() { this.whoisOpen = false; },
@@ -1204,12 +1367,14 @@ function dashboardApp() {
       this.loadReports();
       this.loadAlertCatalog();
       if (this.cfgTab === "allowlist") this.loadAllowlist();
+      if (this.cfgTab === "general") { this.refreshAbuseStatus(); this.loadGeoStatus(); }
     },
 
     switchTab(t) {
       this.cfgTab = t;
       this.cfgMsg = { ok: true, text: "" };
       if (t === "alerts") this.loadAlertCatalog();
+      if (t === "general") { this.refreshAbuseStatus(); this.loadGeoStatus(); }
       if (t === "allowlist") this.loadAllowlist();
       if (t === "watchers") { this.refreshServers(); this.loadGeoStatus(); }
     },
@@ -1354,11 +1519,15 @@ function dashboardApp() {
       const section = this.cfgTab;
       try {
         const payload = { [section]: { ...this.form[section] } };
+        if (section === "general") {
+          payload.watchers = { retention_days: this.form.watchers.retention_days, geoip_auto_download: this.form.watchers.geoip_auto_download };
+        }
         await api("/config", { method: "POST", body: JSON.stringify(payload) });
         await this.loadConfig();
         if (section === "alerts" || section === "exchange") this.loadAlertCatalog();
         if (section === "firewall") { try { this.firewall = await api("/firewall"); } catch (_) {} }
-        if (section === "watchers") this.loadGeoStatus();
+        if (section === "watchers" || section === "general") this.loadGeoStatus();
+        if (section === "general") { abuseAsked.clear(); this.refreshAbuseStatus(); }
         this.cfgMsg = { ok: true, text: `${section.toUpperCase()} configuration saved.` };
       } catch (e) {
         this.cfgMsg = { ok: false, text: e.message };

@@ -8,7 +8,9 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;700&display=swap">
   <link rel="icon" href="data:,">
+  <script src="/static/js/theme.js"></script>
   <link rel="stylesheet" href="/static/css/style.css">
+  <link rel="stylesheet" href="/static/css/themes.css">
   <script src="/static/js/app.js"></script>
   <script defer src="/static/js/vendor/alpine.min.js"></script>
 </head>
@@ -126,7 +128,7 @@
               <button class="ptab" :class="{ on: centerTab === 'bans' }" @click="centerTab = 'bans'; loadBans()">BANS <b x-text="visibleBans().length"></b></button>
             </span>
             <span class="meta">
-              <span class="muted" style="margin-right:10px" :title="firewall.error || firewall.target" x-text="'BANS → ' + (firewall.label || '').toUpperCase()"></span>
+              <span style="margin-right:10px" :class="firewall.error ? 'neon-red' : 'muted'" :title="firewall.error || firewall.target" x-text="'BANS → ' + (firewall.label || '').toUpperCase() + (firewall.error ? ' (NOT READY)' : '')"></span>
               <span :class="activeCount() ? 'neon-red' : 'neon-green'" x-text="activeCount() ? 'HOSTILES ENGAGED' : 'PERIMETER SECURE'"></span>
             </span>
           </div>
@@ -138,8 +140,8 @@
               <button class="btn ban-all" @click="openBanAll()" :disabled="banAll.busy" x-text="banAll.busy ? 'BANNING…' : 'BAN ALL'"></button>
             </div>
             <table class="matrix">
-              <colgroup><col style="width:21%"><col style="width:16%"><col style="width:29%"><col style="width:12%"><col style="width:22%"></colgroup>
-              <thead><tr><th>SOURCE IP</th><th>TARGET SERVER</th><th>THREAT</th><th>SCORE</th><th style="text-align:right">ACTION</th></tr></thead>
+              <colgroup><col style="width:20%"><col style="width:12%"><col style="width:27%"><col style="width:20%"><col style="width:21%"></colgroup>
+              <thead><tr><th>SOURCE IP</th><th>TARGET</th><th>THREAT</th><th :title="abuseStatus.enabled ? 'Sentinel threat score · AbuseIPDB confidence' : 'Sentinel threat score'" x-text="abuseStatus.enabled ? 'SCORE · IPDB' : 'SCORE'"></th><th style="text-align:right">ACTION</th></tr></thead>
               <tbody>
                 <template x-for="p in pendingGroups()" :key="p.key">
                   <tr :class="{ 'active-threat': p.active, attacking: p.attacking }">
@@ -155,7 +157,10 @@
                         <span class="sevtag" :class="p.top.severity" x-text="p.top.severity"></span>
                       </div>
                     </td>
-                    <td><span class="num" :class="p.active ? 'neon-red' : (p.score >= 25 ? 'neon-amber' : 'neon-cyan')" x-text="p.score == null ? '—' : Math.round(p.score)"></span></td>
+                    <td class="score-cell">
+                      <span class="num" title="Sentinel threat score" :class="p.active ? 'neon-red' : (p.score >= 25 ? 'neon-amber' : 'neon-cyan')" x-text="p.score == null ? '—' : Math.round(p.score)"></span>
+                      <span class="ipdb" x-show="abuseStatus.enabled" :class="ipdbClass(p.ip)" :title="ipdbTitle(p.ip)" x-text="ipdbText(p.ip)"></span>
+                    </td>
                     <td class="actions">
                       <button class="btn small danger" @click="approveBan(p)" :disabled="!!banBusy[p.key]" x-text="banBusy[p.key] ? 'EXECUTING…' : 'APPROVE BAN'"></button>
                       <button class="btn small ghost" @click="dismissGroup(p)" :disabled="!!banBusy[p.key]" title="Dismiss (no action)">✕</button>
@@ -173,8 +178,8 @@
           <!-- THREAT MATRIX: live per-(server, IP) scoring -->
           <div class="panel-body" style="padding:0" x-show="centerTab === 'matrix'">
             <table class="matrix">
-              <colgroup><col style="width:21%"><col style="width:15%"><col style="width:14%"><col style="width:24%"><col style="width:26%"></colgroup>
-              <thead><tr><th>IP ADDRESS</th><th>TARGET SERVER</th><th>GEO</th><th>THREAT SCORE</th><th>LAST PAYLOAD</th></tr></thead>
+              <colgroup><col style="width:20%"><col style="width:13%"><col style="width:13%"><col style="width:30%"><col style="width:24%"></colgroup>
+              <thead><tr><th>IP ADDRESS</th><th>TARGET</th><th>GEO</th><th x-text="abuseStatus.enabled ? 'THREAT SCORE · IPDB' : 'THREAT SCORE'"></th><th>LAST PAYLOAD</th></tr></thead>
               <tbody>
                 <template x-for="t in visibleThreats()" :key="t.key">
                   <tr :class="{ 'active-threat': t.active, attacking: t.attacking }">
@@ -190,7 +195,8 @@
                           <div class="fill" :class="scoreClass(t)" :style="'width:' + scoreWidth(t) + '%'"></div>
                           <div class="thr" style="left:50%"></div>
                         </div>
-                        <span class="num" :class="t.active ? 'neon-red' : (t.score >= t.threshold * 0.5 ? 'neon-amber' : 'neon-cyan')" x-text="Math.round(t.score)"></span>
+                        <span class="num" title="Sentinel threat score" :class="t.active ? 'neon-red' : (t.score >= t.threshold * 0.5 ? 'neon-amber' : 'neon-cyan')" x-text="Math.round(t.score)"></span>
+                        <span class="ipdb" x-show="abuseStatus.enabled" :class="ipdbClass(t.ip)" :title="ipdbTitle(t.ip)" x-text="ipdbText(t.ip)"></span>
                       </div>
                       <div class="tagline">
                         <template x-for="(n, tag) in t.tags" :key="tag"><span x-text="tag + '×' + n"></span></template>
@@ -242,6 +248,7 @@
                     <span class="srv-tag" x-show="a.server_name" x-text="a.server_name"></span>
                     <span class="site-tag" x-show="a.details && a.details.site_name" x-text="a.details && a.details.site_name"></span>
                     <span x-text="a.title"></span>
+                    <span class="ip-link alert-ip" x-show="a.source_ip && !(a.title || '').includes(a.source_ip)" title="WHOIS / IP intel · ban history" @click="openWhois(a.source_ip, a.server_id)" x-text="a.source_ip"></span>
                   </div>
                   <div class="msg" :title="a.message" x-text="a.message"></div>
                 </div>
@@ -354,48 +361,7 @@
           </div>
         </div>
 
-        <div class="panel fw-card" :class="{ alarm: !!firewall.error }">
-          <div class="panel-head">
-            <span class="title">Perimeter Firewall</span>
-            <span class="meta" :class="firewall.error ? 'neon-red' : 'neon-green'" x-text="firewall.error ? 'NOT READY' : 'ARMED'"></span>
-          </div>
-          <div class="panel-body">
-            <div class="kv">
-              <span class="k">BANS GO TO</span><span class="v neon-cyan" x-text="firewall.label || '—'"></span>
-              <span class="k">TARGET</span><span class="v" :title="firewall.target" x-text="firewall.target || '—'"></span>
-            </div>
-            <div class="small neon-red" style="margin-top:6px" x-show="firewall.error" x-text="firewall.error"></div>
-            <button class="btn small" style="margin-top:8px;width:100%" @click="openConfig('firewall')">FIREWALL SETTINGS</button>
-          </div>
-        </div>
-
-        <div class="panel ranges-card">
-          <div class="panel-head">
-            <span class="title">Banned Ranges</span>
-            <span class="meta">
-              <span :class="ranges.length ? 'neon-red' : 'muted'" x-text="ranges.length + ' ACTIVE'"></span>
-              <button class="chip" @click="openConfig('allowlist')" title="Addresses that can never be banned">ALLOWLIST</button>
-            </span>
-          </div>
-          <div class="panel-body ranges-body">
-            <template x-for="r in ranges" :key="r.id">
-              <div class="range-row" :title="(r.source_ips || []).length ? 'Attackers: ' + r.source_ips.join(', ') : ''">
-                <div class="range-main">
-                  <span class="cidr neon-red" x-text="r.cidr"></span>
-                  <span class="scope-tag" x-text="r.scope"></span>
-                  <span class="srv-tag" x-text="targetLabel(r.firewall_target)"></span>
-                  <span class="grow"></span>
-                  <button class="btn small ghost" @click="unbanRange(r)" :disabled="!!rangeBusy[r.id]" x-text="rangeBusy[r.id] ? '…' : 'UNBAN'"></button>
-                </div>
-                <div class="range-reason" x-text="r.reason || '—'"></div>
-                <div class="range-meta muted" x-text="fmtTime(r.banned_at) + ' · ' + fmtNum(r.size) + ' addr · ' + (r.banned_by || '')"></div>
-              </div>
-            </template>
-            <div class="empty" x-show="!ranges.length">NO RANGE BANS</div>
-          </div>
-        </div>
-
-        <div class="panel" style="flex:1">
+        <div class="panel baseline-card">
           <div class="panel-head">
             <span class="title" x-text="'Traffic Baseline' + (selected === 'all' ? ' :: Fleet' : '')"></span>
             <span class="meta" x-text="baseline.last_computed ? 'MODEL ' + fmtTime(baseline.last_computed) : 'LEARNING…'"></span>
@@ -433,6 +399,32 @@
             </div>
           </div>
         </div>
+
+        <div class="panel ranges-card">
+          <div class="panel-head">
+            <span class="title">Banned Ranges</span>
+            <span class="meta">
+              <span :class="ranges.length ? 'neon-red' : 'muted'" x-text="ranges.length + ' ACTIVE'"></span>
+              <button class="chip" @click="openConfig('allowlist')" title="Addresses that can never be banned">ALLOWLIST</button>
+            </span>
+          </div>
+          <div class="panel-body ranges-body">
+            <template x-for="r in ranges" :key="r.id">
+              <div class="range-row" :title="(r.source_ips || []).length ? 'Attackers: ' + r.source_ips.join(', ') : ''">
+                <div class="range-main">
+                  <span class="cidr neon-red" x-text="r.cidr"></span>
+                  <span class="scope-tag" x-text="r.scope"></span>
+                  <span class="srv-tag" x-text="targetLabel(r.firewall_target)"></span>
+                  <span class="grow"></span>
+                  <button class="btn small ghost" @click="unbanRange(r)" :disabled="!!rangeBusy[r.id]" x-text="rangeBusy[r.id] ? '…' : 'UNBAN'"></button>
+                </div>
+                <div class="range-reason" x-text="r.reason || '—'"></div>
+                <div class="range-meta muted" x-text="fmtTime(r.banned_at) + ' · ' + fmtNum(r.size) + ' addr · ' + (r.banned_by || '')"></div>
+              </div>
+            </template>
+            <div class="empty" x-show="!ranges.length">NO RANGE BANS</div>
+          </div>
+        </div>
       </section>
     </main>
 
@@ -468,13 +460,70 @@
           <button class="btn small ghost" @click="cfgOpen = false">CLOSE ✕</button>
         </div>
         <nav class="tabs">
-          <template x-for="t in ['servers','alerts','firewall','allowlist','ad','exchange','watchers','reports']" :key="t">
+          <template x-for="t in ['general','servers','alerts','firewall','allowlist','ad','exchange','watchers','reports']" :key="t">
             <button class="tab" :class="{ on: cfgTab === t }" @click="switchTab(t)" x-text="t.toUpperCase()"></button>
           </template>
         </nav>
         <template x-if="form">
         <div class="drawer-body">
           <div class="notice" :class="cfgMsg.ok ? 'ok' : 'err'" x-show="cfgMsg.text" x-text="cfgMsg.text"></div>
+
+          <!-- GENERAL -->
+          <div x-show="cfgTab === 'general'">
+            <div class="section-label" style="margin-top:0"><span>APPEARANCE</span><span x-text="'ACTIVE: ' + (THEMES.find((x) => x.id === theme) || {}).label"></span></div>
+            <div class="fw-options theme-options">
+              <template x-for="t in THEMES" :key="t.id">
+                <label class="fw-opt" :class="{ on: theme === t.id }">
+                  <input type="radio" name="ui-theme" :value="t.id" :checked="theme === t.id" @change="setTheme(t.id)">
+                  <div><b x-text="t.label"></b><div class="small muted" x-text="t.desc"></div></div>
+                </label>
+              </template>
+            </div>
+            <div class="small muted" style="margin:-4px 0 10px">
+              <span x-text="themeLocal ? 'This browser uses its own choice. ' : 'This browser follows the default below. '"></span>
+              <button class="chip" x-show="themeLocal" @click="setTheme('')">USE DEFAULT</button>
+            </div>
+            <div class="form-grid">
+              <div class="field"><label>Default theme (consoles that haven't picked one)</label>
+                <select class="input" x-model="form.general.default_theme">
+                  <template x-for="t in THEMES" :key="t.id"><option :value="t.id" x-text="t.label"></option></template>
+                </select>
+              </div>
+            </div>
+
+            <div class="section-label"><span>ABUSEIPDB REPUTATION</span><span :class="abuseStatus.enabled ? 'neon-green' : 'muted'" x-text="abuseStatus.enabled ? 'ON' : 'OFF'"></span></div>
+            <div class="small muted" style="margin-bottom:10px">
+              Shows each attacker's AbuseIPDB confidence score next to Sentinel's own score in PENDING THREATS and THREAT MATRIX, and the full report in the IP intel dialog.
+              Create a free account at <a href="https://www.abuseipdb.com/register" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">abuseipdb.com</a>,
+              then copy a key from <a href="https://www.abuseipdb.com/account/api" target="_blank" rel="noopener noreferrer" style="color:var(--cyan)">Account → API</a>.
+              The free plan allows 1,000 checks a day; results are cached so each address is looked up at most once per cache window.
+            </div>
+            <label class="check"><input type="checkbox" x-model="form.general.abuseipdb_enabled"> Enable AbuseIPDB lookups</label>
+            <div class="form-grid">
+              <div class="field full"><label>API key</label>
+                <div class="input-row">
+                  <input class="input" type="password" autocomplete="off" x-model="form.general.abuseipdb_api_key" placeholder="paste the key from abuseipdb.com/account/api">
+                  <button class="btn small" @click="testAbuseIPDB()" :disabled="abuseTest.busy || !form.general.abuseipdb_api_key" x-text="abuseTest.busy ? 'TESTING…' : 'TEST KEY'"></button>
+                </div>
+                <div class="hint" :class="abuseTest.ok === false ? 'neon-red' : abuseTest.ok ? 'neon-green' : ''" x-show="abuseTest.text" x-text="abuseTest.text"></div>
+              </div>
+              <div class="field"><label>Reports from the last (days)</label><input class="input" type="number" min="1" max="365" x-model.number="form.general.abuseipdb_max_age_days"></div>
+              <div class="field"><label>Cache results for (hours)</label><input class="input" type="number" min="1" max="720" x-model.number="form.general.abuseipdb_cache_hours"></div>
+            </div>
+            <label class="check"><input type="checkbox" x-model="form.general.abuseipdb_auto_lookup"> Look up every attacker in PENDING THREATS / THREAT MATRIX automatically (off = only when an IP is clicked)</label>
+            <div class="small muted" style="margin:-8px 0 12px 23px" x-text="abuseStatusText()"></div>
+
+            <div class="section-label"><span>DATA &amp; LOCATION</span><span></span></div>
+            <div class="form-grid">
+              <div class="field"><label>Keep logs and alerts for (days)</label><input class="input" type="number" x-model.number="form.watchers.retention_days"></div>
+            </div>
+            <label class="check"><input type="checkbox" x-model="form.watchers.geoip_auto_download"> Download the free DB-IP City Lite GeoIP database and refresh it monthly (threat matrix locations)</label>
+            <div class="small muted" style="margin:-8px 0 12px 23px" x-show="geoStatus">
+              <span x-text="geoStatusText()"></span>
+              <div class="neon-amber" x-show="geoStatus && geoStatus.error" x-text="geoStatus && geoStatus.error"></div>
+              <div>Or drop a MaxMind GeoLite2-City.mmdb into the <code>geoip</code> folder of the data directory; it takes precedence. IP geolocation by <a href="https://db-ip.com" target="_blank" rel="noopener" style="color:inherit">DB-IP</a> (CC BY 4.0).</div>
+            </div>
+          </div>
 
           <!-- SERVERS -->
           <div x-show="cfgTab === 'servers'">
@@ -651,6 +700,10 @@
           <div x-show="cfgTab === 'firewall'">
             <template x-if="form.firewall">
             <div>
+              <div class="notice" style="display:flex;align-items:center;gap:10px">
+                <span style="flex:1" x-text="'AbuseIPDB reputation lookups (IPDB score in the threat panes): ' + (abuseStatus.enabled ? 'ON' : abuseStatus.configured ? 'configured, turned off' : 'not configured') + '. The account is set up under GENERAL.'"></span>
+                <button class="chip on" @click="switchTab('general')">ABUSEIPDB ACCOUNT →</button>
+              </div>
               <div class="section-label" style="margin-top:0"><span>WHERE "APPROVE BAN" BLOCKS THE ATTACKER</span><span></span></div>
               <div class="fw-options">
                 <template x-for="p in FIREWALLS" :key="p.id">
@@ -840,13 +893,6 @@
               <div class="field"><label>401/403 spike threshold</label><input class="input" type="number" x-model.number="form.watchers.spike_auth_threshold"></div>
               <div class="field"><label>Active threat score</label><input class="input" type="number" x-model.number="form.watchers.threat_score_threshold"></div>
               <div class="field"><label>Score half-life (min)</label><input class="input" type="number" x-model.number="form.watchers.threat_half_life_minutes"></div>
-              <div class="field"><label>Retention (days)</label><input class="input" type="number" x-model.number="form.watchers.retention_days"></div>
-            </div>
-            <label class="check"><input type="checkbox" x-model="form.watchers.geoip_auto_download"> Download the free DB-IP City Lite GeoIP database and refresh it monthly (threat matrix locations)</label>
-            <div class="small muted" style="margin:-8px 0 12px 23px" x-show="geoStatus">
-              <span x-text="geoStatusText()"></span>
-              <div class="neon-amber" x-show="geoStatus && geoStatus.error" x-text="geoStatus && geoStatus.error"></div>
-              <div>Or drop a MaxMind GeoLite2-City.mmdb into the <code>geoip</code> folder of the data directory; it takes precedence. IP geolocation by <a href="https://db-ip.com" target="_blank" rel="noopener" style="color:inherit">DB-IP</a> (CC BY 4.0).</div>
             </div>
             <div class="section-label"><span>WATCHER STATUS</span></div>
             <template x-for="w in watcherStatus" :key="w.server_id + '|' + w.directory">
@@ -966,6 +1012,7 @@
               <span x-show="W().country" x-text="' · ' + W().country"></span>
               <span x-show="W().registry" x-text="' · ' + W().registry"></span>
               <div class="small muted" x-show="W().summary && W().scope === 'private'" x-text="W().summary"></div>
+              <div class="ban-count" :class="WH().total ? (WH().active ? 'hot' : 'warm') : 'clean'" x-text="historyHeadline()"></div>
             </div>
             <div class="notice err" x-show="W().error" x-text="W().error"></div>
             <div class="whois-grid">
@@ -986,6 +1033,25 @@
                 <span class="k">ADDRESS</span><span class="v" x-text="W().registrant_address || '—'"></span>
               </div>
             </div>
+            <div class="section-label"><span>BAN HISTORY</span>
+              <span x-text="WH().total ? WH().total + ' BAN' + (WH().total === 1 ? '' : 'S') + (WH().first_banned ? ' · FIRST ' + fmtDate(WH().first_banned) : '') : ''"></span></div>
+            <div class="muted small" x-show="whois.data && !WH().total" x-text="WH().error || 'Sentinel has never banned this address (no single-IP or range ban covered it).'"></div>
+            <template x-if="WH().total">
+              <table class="mini ban-history">
+                <colgroup><col style="width:17%"><col style="width:19%"><col style="width:22%"><col style="width:24%"><col style="width:18%"></colgroup>
+                <thead><tr><th>BANNED</th><th>BAN</th><th>WHERE</th><th>REASON</th><th>STATUS</th></tr></thead>
+                <tbody><template x-for="e in WH().events" :key="e.kind + e.id">
+                  <tr :class="{ live: e.active }">
+                    <td :title="e.banned_at + (e.banned_by ? ' by ' + e.banned_by : '')" x-text="fmtDate(e.banned_at) + ' ' + fmtTime(e.banned_at)"></td>
+                    <td :title="e.rule"><span x-text="e.target"></span> <span class="scope-tag" x-show="e.kind === 'range'" x-text="e.scope"></span></td>
+                    <td :title="e.where" x-text="e.where"></td>
+                    <td :title="e.reason + (e.banned_by ? '\nApproved by ' + e.banned_by : '')" x-text="e.reason || ('by ' + (e.banned_by || '—'))"></td>
+                    <td :class="e.active ? 'bad' : 'muted'" :title="e.lifted_at ? 'Lifted ' + e.lifted_at + (e.lifted_by ? ' by ' + e.lifted_by : '') : ''"
+                        x-text="e.active ? 'ACTIVE' : 'LIFTED' + (e.duration_seconds != null ? ' after ' + fmtSpan(e.duration_seconds) : '')"></td>
+                  </tr>
+                </template></tbody>
+              </table>
+            </template>
             <template x-if="(W().remarks || []).length">
               <div><div class="section-label"><span>REMARKS</span><span></span></div>
                 <div class="remarks"><template x-for="(r, i) in W().remarks" :key="i"><div x-text="r"></div></template></div></div>
@@ -1004,6 +1070,28 @@
               </div>
             </template>
           </div>
+          </template>
+
+          <template x-if="abuseStatus.enabled || whois.abuse">
+            <div>
+              <div class="section-label"><span>ABUSEIPDB REPUTATION</span>
+                <span x-text="whois.abuse && whois.abuse.checked_at ? 'CHECKED ' + fmtTime(whois.abuse.checked_at) + ' · LAST ' + (whois.abuse.max_age_days || 90) + ' DAYS' : ''"></span></div>
+              <div class="spinner-line" x-show="!whois.abuse && whois.loading">QUERYING ABUSEIPDB…</div>
+              <div class="muted small" x-show="whois.abuse && whois.abuse.score == null" x-text="whois.abuse && (whois.abuse.note || whois.abuse.error || 'No AbuseIPDB data')"></div>
+              <template x-if="whois.abuse && whois.abuse.score != null">
+                <div class="abuse-box">
+                  <div class="abuse-score" :class="ipdbClass(whois.ip)">
+                    <b x-text="whois.abuse.score + '%'"></b><span>CONFIDENCE OF ABUSE</span>
+                  </div>
+                  <div class="kv wrap">
+                    <span class="k">REPORTS</span><span class="v" x-text="fmtNum(whois.abuse.reports) + ' from ' + fmtNum(whois.abuse.users) + ' user(s)'"></span>
+                    <span class="k">LAST REPORTED</span><span class="v" x-text="whois.abuse.last_reported ? fmtDate(whois.abuse.last_reported) + ' ' + fmtTime(whois.abuse.last_reported) : 'never'"></span>
+                    <span class="k">ISP / DOMAIN</span><span class="v" x-text="[whois.abuse.isp, whois.abuse.domain].filter(Boolean).join(' · ') || '—'"></span>
+                    <span class="k">USAGE</span><span class="v" x-text="(whois.abuse.usage || '—') + (whois.abuse.tor ? ' · TOR EXIT NODE' : '') + (whois.abuse.whitelisted ? ' · WHITELISTED' : '')"></span>
+                  </div>
+                </div>
+              </template>
+            </div>
           </template>
 
           <div class="section-label"><span>SENTINEL HISTORY</span>
@@ -1029,14 +1117,6 @@
           </template>
           <div class="muted small" x-show="whois.intel && !WI().recent.length && !WI().state">No requests from this address in the log database.</div>
 
-          <template x-if="WB().length">
-            <div>
-              <div class="section-label"><span>ACTIVE BANS</span><span x-text="WB().length"></span></div>
-              <template x-for="b in WB()" :key="b.id">
-                <div class="small"><span class="srv-tag" x-text="b.server_name"></span> <span class="neon-red" x-text="b.rule_name"></span> <span class="muted" x-text="' · ' + fmtTime(b.banned_at) + ' by ' + b.banned_by"></span></div>
-              </template>
-            </div>
-          </template>
         </div>
         <div class="modal-foot">
           <a :href="'https://www.abuseipdb.com/check/' + encodeURIComponent(whois.ip)" target="_blank" rel="noopener noreferrer">ABUSEIPDB ↗</a>

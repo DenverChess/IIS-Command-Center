@@ -369,7 +369,7 @@ select.input { appearance: none; background-image: linear-gradient(45deg, transp
 @keyframes drawer-in { from { transform: translateX(40px); opacity: 0; } }
 .drawer-head { display: flex; justify-content: space-between; align-items: center; padding: 14px 18px; border-bottom: 1px solid var(--line); letter-spacing: 4px; color: var(--cyan); }
 .tabs { display: flex; border-bottom: 1px solid var(--line); }
-.tab { flex: 1; font-family: var(--font); background: none; border: none; border-bottom: 2px solid transparent; color: var(--muted); padding: 10px; letter-spacing: 2px; font-size: 11px; cursor: pointer; }
+.tab { flex: 1; font-family: var(--font); background: none; border: none; border-bottom: 2px solid transparent; color: var(--muted); padding: 10px 4px; letter-spacing: 1px; font-size: 10.5px; cursor: pointer; white-space: nowrap; }
 .tab.on { color: var(--cyan); border-bottom-color: var(--cyan); text-shadow: var(--glow-cyan); }
 .drawer-body { flex: 1; overflow: auto; padding: 18px; }
 .drawer-foot { padding: 12px 18px; border-top: 1px solid var(--line); display: flex; gap: 10px; justify-content: flex-end; align-items: center; }
@@ -580,8 +580,7 @@ select.input { appearance: none; background-image: linear-gradient(45deg, transp
 .modal.ban-all-modal { width: min(560px, 94vw); border-color: var(--red); box-shadow: 0 0 50px rgba(255, 0, 51, 0.35); }
 .ban-all-warning { font-size: 16px; line-height: 1.5; color: var(--red); text-shadow: var(--glow-red); font-weight: 700; letter-spacing: 0.5px; }
 
-/* ---------------------------------------------------------------- firewall card / groups */
-.panel.fw-card { flex: none; }
+/* ---------------------------------------------------------------- firewall groups */
 .input-row { display: flex; gap: 6px; align-items: stretch; }
 .input-row .input { flex: 1; min-width: 0; }
 .input-row .btn { white-space: nowrap; flex: none; }
@@ -598,7 +597,8 @@ select.input { appearance: none; background-image: linear-gradient(45deg, transp
 }
 @keyframes banner-glow { 50% { box-shadow: 0 0 30px rgba(255, 0, 51, 0.95), inset 0 0 20px rgba(255, 0, 51, 0.55); } }
 
-.panel.ranges-card { flex: none; max-height: 34vh; }
+.panel.baseline-card { flex: none; }
+.panel.ranges-card { flex: 1; min-height: 150px; }
 .ranges-body { overflow: auto; padding: 6px 10px; }
 .range-row { padding: 6px 0; border-bottom: 1px solid var(--line); font-size: 11px; }
 .range-row:last-child { border-bottom: 0; }
@@ -626,3 +626,34 @@ select.input { appearance: none; background-image: linear-gradient(45deg, transp
 .sentinel-banner.pinned span { flex: 1; }
 .banner-x { background: none; border: 0; color: #fff; cursor: pointer; font: inherit; opacity: 0.7; padding: 0; }
 .banner-x:hover { opacity: 1; }
+
+/* ---------------------------------------------------------------- AbuseIPDB score */
+.matrix td.actions .btn { padding: 3px 6px; letter-spacing: 0.5px; font-size: 9.5px; }
+.matrix td.actions .btn.ghost { padding: 3px 4px; }
+.matrix td.score-cell { white-space: nowrap; text-overflow: clip; padding-left: 6px; padding-right: 4px; }
+.score-cell .num { display: inline-block; min-width: 26px; }
+.ipdb {
+  display: inline-block; min-width: 36px; margin-left: 5px; padding: 0 3px; font-size: 10px; font-weight: 700; letter-spacing: 0;
+  text-align: center; border: 1px solid currentColor; color: var(--muted); vertical-align: middle; cursor: help;
+}
+.ipdb::before { content: "IPDB "; font-weight: 400; font-size: 7.5px; letter-spacing: 0; opacity: 0.75; }
+.ipdb.green { color: var(--green); }
+.ipdb.amber { color: var(--amber); }
+.ipdb.red { color: var(--red); text-shadow: var(--glow-red); background: rgba(255, 0, 51, 0.1); }
+.score .ipdb { margin-left: 0; flex: none; }
+.abuse-box { display: grid; grid-template-columns: 130px 1fr; gap: 14px; align-items: center; }
+.abuse-score { text-align: center; border: 1px solid currentColor; padding: 8px 4px; color: var(--muted); }
+.abuse-score b { display: block; font-size: 26px; line-height: 1.1; }
+.abuse-score span { font-size: 8.5px; letter-spacing: 1.5px; }
+.abuse-score.green { color: var(--green); }
+.abuse-score.amber { color: var(--amber); }
+.abuse-score.red { color: var(--red); text-shadow: var(--glow-red); }
+
+/* ---------------------------------------------------------------- ban history */
+.ban-count { margin-top: 6px; font-size: 12px; font-weight: 700; letter-spacing: 1px; }
+.ban-count.clean { color: var(--muted); font-weight: 400; }
+.ban-count.warm { color: var(--amber); }
+.ban-count.hot { color: var(--red); text-shadow: var(--glow-red); }
+.ban-history tr.live td:first-child { box-shadow: inset 3px 0 0 var(--red); }
+.alert-ip { margin-left: 6px; font-size: 10.5px; color: var(--muted); }
+.theme-options { grid-template-columns: 1fr 1fr; }
