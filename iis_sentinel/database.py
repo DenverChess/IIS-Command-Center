@@ -201,8 +201,19 @@ class BannedIP(Base):
     banned_by: Mapped[str] = mapped_column(String(256), default="")
     banned_at: Mapped[datetime] = mapped_column(DateTime)
     active: Mapped[bool] = mapped_column(Boolean, default=True)
+    lifted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    lifted_by: Mapped[str] = mapped_column(String(256), default="")
 
     __table_args__ = (Index("ix_ban_server_ip", "server_id", "ip_address"),)
+
+
+class AbuseScore(Base):
+    """Cached AbuseIPDB /check result per IP (keeps the daily API quota for new addresses)."""
+    __tablename__ = "abuse_scores"
+
+    ip: Mapped[str] = mapped_column(String(64), primary_key=True)
+    data: Mapped[str] = mapped_column(Text, default="{}")
+    checked_at: Mapped[datetime] = mapped_column(DateTime, index=True)
 
 
 class BannedRange(Base):
@@ -295,7 +306,8 @@ _ADDITIVE_COLUMNS: dict[str, dict[str, str]] = {
     "alerts": {"server_id": "INTEGER NOT NULL DEFAULT 0", "status": "VARCHAR(16) NOT NULL DEFAULT 'Pending'",
                "event": "VARCHAR(48) NOT NULL DEFAULT ''"},
     "banned_ips": {"provider": "VARCHAR(16) NOT NULL DEFAULT 'windows'",
-                   "windows_rule": "VARCHAR(256) NOT NULL DEFAULT ''"},
+                   "windows_rule": "VARCHAR(256) NOT NULL DEFAULT ''",
+                   "lifted_at": "DATETIME", "lifted_by": "VARCHAR(256) NOT NULL DEFAULT ''"},
     "monitored_servers": {"log_start_mode": "VARCHAR(8) NOT NULL DEFAULT 'end'",
                           "log_tail_lines": "INTEGER NOT NULL DEFAULT 1000"},
 }
@@ -479,11 +491,23 @@ SECRET_FIELDS: set[tuple[str, str]] = {
     ("firewall", "pfsense_api_key"), ("firewall", "pfsense_api_secret"),
     ("firewall", "sonicwall_password"),
     ("firewall", "paloalto_api_key"), ("firewall", "paloalto_password"),
+    ("general", "abuseipdb_api_key"),
 }
 FIREWALL_PROVIDERS = ("windows", "pfsense", "sonicwall", "paloalto")
+UI_THEMES = ("cyber", "dark", "lite", "large")
 LOG_START_MODES = ("end", "tail", "full")
 
 DEFAULT_CONFIG: dict[str, dict[str, Any]] = {
+    "general": {
+        # Theme for consoles that haven't picked one (each browser can override it).
+        "default_theme": "cyber",
+        "abuseipdb_enabled": False,
+        "abuseipdb_api_key": "",
+        # Look up every IP in PENDING THREATS / THREAT MATRIX automatically (uses the daily quota).
+        "abuseipdb_auto_lookup": True,
+        "abuseipdb_max_age_days": 90,
+        "abuseipdb_cache_hours": 24,
+    },
     "ad": {
         "servers": [],
         "port": 636,
@@ -695,6 +719,9 @@ def _alert_events(v: dict[str, dict[str, Any]]) -> None:
 
 
 VALIDATORS: dict[tuple[str, str], Callable[[Any], None]] = {
+    ("general", "default_theme"): _choice(*UI_THEMES),
+    ("general", "abuseipdb_max_age_days"): _range(1, 365),
+    ("general", "abuseipdb_cache_hours"): _range(1, 720),
     ("ad", "port"): _range(1, 65535),
     ("ad", "timeout"): _range(1, 120),
     ("exchange", "auth_type"): _choice("NTLM", "basic", "digest", "GSSAPI", "SSPI"),
