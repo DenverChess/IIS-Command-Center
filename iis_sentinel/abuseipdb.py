@@ -183,7 +183,7 @@ class AbuseIPDB:
         if api_key is None:
             self._inflight[ip] = fut
         try:
-            entry = await self._fetch(ip, str(key))
+            entry = await self._fetch(ip, str(key), probe=api_key is not None)
             if api_key is None or not entry.get("error"):
                 self._cache[ip] = entry
                 if not entry.get("error"):
@@ -200,7 +200,8 @@ class AbuseIPDB:
             if self._inflight.get(ip) is fut:
                 del self._inflight[ip]
 
-    async def _fetch(self, ip: str, key: str) -> dict[str, Any]:
+    async def _fetch(self, ip: str, key: str, probe: bool = False) -> dict[str, Any]:
+        """`probe` (a key test) reports errors without pausing or flagging the saved configuration."""
         days = int(self._s().get("abuseipdb_max_age_days") or 90)
         now = time.time()
         try:
@@ -208,9 +209,15 @@ class AbuseIPDB:
                 resp = await client.get(API_URL, params={"ipAddress": ip, "maxAgeInDays": days},
                                         headers={"Key": key, "Accept": "application/json", "User-Agent": "IIS-Sentinel"})
         except httpx.HTTPError as exc:
-            self.last_error = f"AbuseIPDB unreachable: {type(exc).__name__}: {exc}"[:300]
-            return {"ip": ip, "score": None, "error": self.last_error, "_ts": now}
+            err = f"AbuseIPDB unreachable: {type(exc).__name__}: {exc}"[:300]
+            if not probe:
+                self.last_error = err
+            return {"ip": ip, "score": None, "error": err, "_ts": now}
         self._rate(resp)
+        if probe and resp.status_code != 200:
+            if resp.status_code in (401, 403):
+                return {"ip": ip, "score": None, "error": f"AbuseIPDB rejected the API key (HTTP {resp.status_code})", "_ts": now}
+            return {"ip": ip, "score": None, "error": f"AbuseIPDB HTTP {resp.status_code}: {resp.text[:200]}", "_ts": now}
         if resp.status_code == 429:
             retry = resp.headers.get("Retry-After")
             reset = resp.headers.get("X-RateLimit-Reset")
