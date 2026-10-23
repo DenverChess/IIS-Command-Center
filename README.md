@@ -61,6 +61,7 @@ backoff **while the rest of the fleet keeps streaming**.
 - CPU / RAM / log-drive disk on every server over WinRM
 - **App pool** and **W3SVC / WAS** state, with a CRITICAL alert the moment a pool stops
 - Fleet health grid; offline servers are flagged red and never block the others
+- Click a **site**, **app pool** or **RESOURCES** in Server Health for a live **resource monitor**: current connections, active and queued requests, requests executing right now, TCP clients, w3wp CPU / memory and every IIS / ASP.NET / HTTP.sys performance counter
 - Live WebSocket stream to every connected console
 
 </td>
@@ -353,6 +354,28 @@ starts with a headline such as *Banned 3 times by Sentinel (2 single-IP + 1 rang
 table: when, server or firewall, scope, reason, who approved it, and when and by whom it was lifted. Range bans that
 contain the IP count too. Lifted bans are kept, so the history keeps growing.
 
+### Resource monitor
+
+Select a server and click one of its **IIS SITES** or **IIS APP POOLS** in the Server Health panel. You can also click
+**RESOURCES** in the panel header to see the whole server. Sentinel runs one PowerShell query over WinRM and opens a
+dialog that refreshes every 5 seconds (**PAUSE** stops it). The dialog shows:
+
+- **Headline:** current connections (IIS's own per-site count, plus the peak since IIS started and the server total),
+  active requests, requests/sec, bandwidth, established TCP connections and unique clients, HTTP.sys and ASP.NET queues,
+  w3wp CPU and memory, current users, and app pool recycles and worker failures.
+- **Configuration:** the site's bindings, limits and applications, and each app pool's runtime, identity, queue
+  length, recycling, idle timeout and CPU limit.
+- **Worker processes:** PID, CPU, private bytes, working set, handles, threads, active requests and requests/sec.
+- **Requests executing now:** URL, client, elapsed time, pipeline stage and module, longest first. This needs the IIS
+  *Request Monitor* role service (`Web-Request-Monitor`). Without it, the dialog says so and shows everything else.
+- **TCP connections** on the site's ports, by state, by port and by client IP. Click a client for WHOIS.
+- **All performance counters** from *Web Service*, *Web Service Cache*, *APP_POOL_WAS*, *W3SVC_W3WP*, *HTTP Service
+  Request Queues*, *ASP.NET* / *ASP.NET Applications*, plus processor, memory, disk, network and w3wp process counters,
+  with a filter box.
+
+The WinRM account needs the same rights as for health monitoring (local Administrators). If the server can't be
+reached, the dialog shows the error and the rest of the dashboard carries on.
+
 ### Themes
 
 **CONFIG → GENERAL** offers **Cyber** (the original look), **Dark**, **Lite** and **Large Print** (bigger text and
@@ -583,6 +606,7 @@ Every log line, health sample, threat and alert pushed over the WebSocket carrie
 | `POST` | `/servers` | `{server_name, ip_address, winrm_username, winrm_password, log_unc_path, log_start_mode?, log_tail_lines?, winrm_transport?, winrm_port?, winrm_use_ssl?, winrm_verify_ssl?}` |
 | `PUT` / `DELETE` | `/servers/{id}` | Update (a blank password keeps the stored one) / remove |
 | `POST` | `/servers/{id}/test` | Check WinRM and the log share without consuming log lines |
+| `GET` | `/servers/{id}/resources?kind=site\|pool\|server&name=` | Live resource metrics for a site (ID or name), app pool or the whole server: `{headline, site, sites, pools, processes, requests, tcp, counter_groups, host, notes}`. `502` if the server can't be reached |
 | `POST` | `/defense/ban` | `{alert_id}` (or `{server_id, ip}`): firewall ban on the alert's server; the alert becomes `Approved` |
 | `POST` | `/defense/dismiss` | `{alert_id}`: the alert becomes `Dismissed` |
 | `GET` / `DELETE` | `/defense/bans`, `/defense/bans/{id}` | Active bans / lift a ban |
