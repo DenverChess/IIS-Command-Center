@@ -74,10 +74,13 @@ import sonicwall_api
 from geoip import GeoResolver
 from http_monitor import HttpMonitor
 from log_tailer import LogTailer, run_demo_fleet
+from abuseipdb import AbuseIPDB
+from abuseipdb import normalize_ip as normalize_abuse_ip
 from defense_engine import DefenseEngine
 from whois_lookup import WhoisClient, calculate_escalation_cidr, network_for_scope
 from mailer import Mailer, render_alert_html
 from remote_manager import RemoteError, RemoteManager, validate_ban_ip
+from resource_monitor import RESOURCE_KINDS
 from reporter import Reporter
 from system_health import HealthMonitor
 from threat_rules import ThreatEngine
@@ -511,6 +514,7 @@ class State:
     geo: GeoResolver
     firewall: FirewallManager
     defense: DefenseEngine
+    abuse: AbuseIPDB
     reporter: Reporter
     signer: SessionSigner
     throttle: LoginThrottle
@@ -681,6 +685,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
     S.threats = ThreatEngine(S.config, S.registry.name, S.geo.quick)
     S.firewall = FirewallManager(S.config, S.remote)
     S.defense = DefenseEngine(S.config, S.registry, S.remote, S.firewall)
+    S.abuse = AbuseIPDB(S.config, lambda r: S.hub.broadcast({"type": "abuseipdb", "data": {r["ip"]: r}}))
     S.baseliner = Baseliner(S.config)
     S.health = HealthMonitor(S.config, S.alerts, S.hub, S.registry, S.remote)
     queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=50000)
@@ -708,6 +713,10 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
             _on_servers_changed()
         elif section == "firewall":
             S.hub.broadcast({"type": "firewall", "data": S.firewall.summary()})
+        elif section == "general":
+            S.abuse.settings_changed()
+            S.hub.broadcast({"type": "general", "default_theme": S.config.value("general", "default_theme", "cyber"),
+                             "abuseipdb": S.abuse.status()})
 
     S.config.on_change(_on_config)
     S.registry.on_change(_on_servers_changed)
@@ -726,6 +735,7 @@ async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
         "geo_enricher": geo_enricher,
         "enum_persist": persist_enum_counters,
         "fts_backfill": fts_backfill,
+        "abuseipdb": S.abuse.run,
     }
     if DEMO_MODE:
         jobs["demo_traffic"] = run_demo_fleet
@@ -1307,7 +1317,119 @@ async def threat_whois(ip: str, refresh: bool = False, _user: dict[str, Any] = D
         bans = (await s.execute(select(BannedIP).where(BannedIP.ip_address == result["ip"], BannedIP.active.is_(True)))).scalars().all()
         alert_count = (await s.execute(
             select(func.count(ActionableAlert.id)).where(ActionableAlert.source_ip == result["ip"]))).scalar_one()
-    return {"whois": result, "bans": [_ban_dict(b) for b in bans], "alert_count": alert_count}
+    try:
+        history = await ban_history(result["ip"])
+    except Exception:  # noqa: BLE001
+        log.exception("Ban history for %s failed", result["ip"])
+        history = {"total": 0, "events": [], "error": "ban history unavailable"}
+    return {"whois": result, "bans": [_ban_dict(b) for b in bans], "alert_count": alert_count, "history": history}
+
+
+async def ban_history(ip: str) -> dict[str, Any]:
+    """Every ban Sentinel has ever applied to `ip`: single-IP bans (active and lifted) plus range bans that covered it."""
+    addr = parse_network(ip).network_address
+    async with SessionLocal() as s:
+        ip_rows = (await s.execute(select(BannedIP).where(BannedIP.ip_address == str(addr))
+                                   .order_by(desc(BannedIP.banned_at)).limit(1000))).scalars().all()
+        range_rows = (await s.execute(select(BannedRange).order_by(desc(BannedRange.banned_at)).limit(20000))).scalars().all()
+        alert_ids = {r.alert_id for r in ip_rows if r.alert_id}
+        titles = dict((await s.execute(select(ActionableAlert.id, ActionableAlert.title)
+                                       .where(ActionableAlert.id.in_(alert_ids)))).all()) if alert_ids else {}
+
+    def _dur(start: datetime | None, end: datetime | None) -> int | None:
+        return int((end - start).total_seconds()) if start and end else None
+
+    events: list[dict[str, Any]] = []
+    for b in ip_rows:
+        provider = b.provider or "windows"
+        events.append({
+            "kind": "ip", "id": b.id, "target": b.ip_address, "scope": "single IP",
+            "where": FIREWALL_PROVIDERS.get(provider, provider) if provider != "windows" else f"Windows Firewall · {S.registry.name(b.server_id)}",
+            "server_name": S.registry.name(b.server_id), "reason": titles.get(b.alert_id, ""), "rule": b.rule_name,
+            "banned_at": iso(b.banned_at), "banned_by": b.banned_by, "active": bool(b.active),
+            "lifted_at": iso(b.lifted_at), "lifted_by": b.lifted_by or "", "duration_seconds": _dur(b.banned_at, b.lifted_at),
+        })
+    for r in range_rows:
+        try:
+            net = parse_network(r.cidr_notation)
+        except ValueError:
+            continue
+        if net.version != addr.version or addr not in net:
+            continue
+        where = {"windows": "Windows Firewall", "sonicwall": "SonicWall group", "both": "Windows Firewall + SonicWall"}
+        events.append({
+            "kind": "range", "id": r.id, "target": r.cidr_notation, "scope": r.scope,
+            "where": where.get(r.firewall_target, r.firewall_target),
+            "server_name": S.registry.name(r.server_id) if r.server_id is not None else "", "reason": r.reason or "",
+            "rule": f"SENTINEL BAN: {r.cidr_notation}", "banned_at": iso(r.banned_at), "banned_by": r.banned_by or "",
+            "active": bool(r.is_active), "lifted_at": iso(r.lifted_at), "lifted_by": r.lifted_by or "",
+            "duration_seconds": _dur(r.banned_at, r.lifted_at),
+        })
+    events.sort(key=lambda e: e["banned_at"] or "", reverse=True)
+    return {
+        "total": len(events), "ip_bans": sum(e["kind"] == "ip" for e in events),
+        "range_bans": sum(e["kind"] == "range" for e in events), "active": sum(e["active"] for e in events),
+        "first_banned": events[-1]["banned_at"] if events else None, "last_banned": events[0]["banned_at"] if events else None,
+        "events": events[:200],
+    }
+
+
+@app.get("/threats/ban-history/{ip}")
+async def threat_ban_history(ip: str, _user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    try:
+        return await ban_history(ip)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"'{ip[:64]}' is not a valid IP address") from exc
+
+
+class AbuseLookupBody(BaseModel):
+    ips: list[str] = Field(default_factory=list, max_length=500)
+
+
+class AbuseTestBody(BaseModel):
+    api_key: str | None = Field(default=None, max_length=256)
+
+
+@app.get("/intel/abuseipdb")
+async def abuseipdb_status(_user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    return S.abuse.status()
+
+
+@app.post("/intel/abuseipdb/lookup")
+async def abuseipdb_lookup(body: AbuseLookupBody, _user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    """Cached scores now; uncached public IPs are queued and arrive later as WS `abuseipdb` messages."""
+    status = S.abuse.status()
+    if not status["enabled"]:
+        return {**status, "results": {}}
+    return {**status, "results": S.abuse.request(body.ips)}
+
+
+@app.get("/intel/abuseipdb/{ip}")
+async def abuseipdb_check(ip: str, refresh: bool = False, _user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    try:
+        ip = normalize_abuse_ip(ip)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"'{ip[:64]}' is not a valid IP address") from exc
+    if not S.abuse.enabled():
+        return {"ip": ip, "score": None, "disabled": True,
+                "error": "AbuseIPDB lookups are turned off (CONFIG > GENERAL)" if S.abuse.configured()
+                else "AbuseIPDB is not configured (CONFIG > GENERAL)"}
+    result = await S.abuse.check(ip, refresh=refresh)
+    if result.get("score") is not None:
+        S.hub.broadcast({"type": "abuseipdb", "data": {result["ip"]: result}})
+    return result
+
+
+@app.post("/intel/abuseipdb/test", dependencies=[Depends(same_origin_guard)])
+async def abuseipdb_test(body: AbuseTestBody, _user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    """Check a well-known public address with the given (or saved) key, without saving anything."""
+    result = await S.abuse.check("8.8.8.8", api_key=body.api_key if body.api_key else "")
+    status = S.abuse.status()
+    if result.get("error"):
+        return {"ok": False, "error": result["error"], **{k: status[k] for k in ("limit", "remaining")}}
+    return {"ok": True, "message": f"API key accepted: 8.8.8.8 scores {result.get('score')}% "
+                                   f"({result.get('reports', 0)} reports, {result.get('isp') or 'unknown ISP'})",
+            "limit": status["limit"], "remaining": status["remaining"]}
 
 
 @app.get("/system/health")
@@ -1505,6 +1627,28 @@ async def delete_server(server_id: int, user: dict[str, Any] = Depends(current_u
                                f"{name} is no longer monitored.", details={"user": user["u"], "server": name},
                                event="server_config_changed")
     return {"ok": True}
+
+
+@app.get("/servers/{server_id}/resources")
+async def server_resources(server_id: int, kind: str = "site", name: str = "",
+                           _user: dict[str, Any] = Depends(current_user)) -> dict[str, Any]:
+    if S.registry.get(server_id) is None:
+        raise HTTPException(status_code=404, detail="Server not found")
+    if kind not in RESOURCE_KINDS:
+        raise HTTPException(status_code=400, detail=f"kind must be one of {', '.join(RESOURCE_KINDS)}")
+    name = name.strip()
+    if kind != "server" and not name:
+        raise HTTPException(status_code=400, detail="name is required")
+    if len(name) > 260:
+        raise HTTPException(status_code=400, detail="name is too long")
+    health = next((h for h in S.health.snapshot() if h.get("server_id") == server_id), None)
+    try:
+        return await S.remote.resources(server_id, kind, name, health)
+    except RemoteError as exc:
+        raise HTTPException(status_code=502, detail=f"Could not read resources from {S.registry.name(server_id)}: {exc}") from exc
+    except Exception as exc:  # noqa: BLE001
+        log.warning("Resource query on server %s failed: %s", server_id, exc)
+        raise HTTPException(status_code=502, detail=f"Resource query failed: {type(exc).__name__}: {exc}") from exc
 
 
 @app.post("/servers/{server_id}/test", dependencies=[Depends(same_origin_guard)])
@@ -1787,7 +1931,7 @@ async def lift_ban(ban_id: int, user: dict[str, Any] = Depends(current_user)) ->
             extra = f" The Windows Firewall rule on {S.registry.name(ban.server_id)} could not be removed: {exc}"
 
     async def _op(s):  # type: ignore[no-untyped-def]
-        await s.execute(update(BannedIP).where(BannedIP.id == ban_id).values(active=False))
+        await s.execute(update(BannedIP).where(BannedIP.id == ban_id).values(active=False, lifted_at=utcnow(), lifted_by=user["u"]))
 
     await run_db(_op)
     log.warning("Ban %s (%s on %s) lifted by %s", ban_id, ban.ip_address, name, user["u"])
@@ -2122,6 +2266,8 @@ async def ws_dashboard(ws: WebSocket) -> None:
         "baseline": S.baseliner.snapshot(),
         "pipeline": S.pipeline.stats(),
         "firewall": S.firewall.summary(),
+        "default_theme": S.config.value("general", "default_theme", "cyber"),
+        "abuseipdb": S.abuse.status(),
     }
 
     async def sender() -> None:

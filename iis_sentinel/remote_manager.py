@@ -24,6 +24,7 @@ from typing import Any
 
 from database import IS_WINDOWS, LOCAL_SERVER_ID, ConfigStore, ServerRegistry, iso, utcnow
 from log_tailer import DEMO_SITES, SiteSetTailer, demo_site_ids, discover_sites
+from resource_monitor import build_script, normalize_resources, run_local, simulate_resources
 
 log = logging.getLogger("sentinel.remote")
 
@@ -313,6 +314,22 @@ def get_remote_health(server_ip: str, username: str, password: str, **opts: Any)
     return normalize_health(json.loads(line))
 
 
+def _last_json(out: str, what: str) -> dict[str, Any]:
+    line = next((ln for ln in reversed(out.splitlines()) if ln.strip().startswith("{")), "")
+    if not line:
+        raise RemoteError(f"{what} script returned no JSON: {out[:300]}")
+    return json.loads(line)
+
+
+def get_remote_resources(server_ip: str, username: str, password: str, kind: str, target: str, **opts: Any) -> dict[str, Any]:
+    """Run the resource-metrics PowerShell over WinRM; returns the raw RESOURCE_PS payload."""
+    out_b, err_b, code = _run_ps_stdin(_session(server_ip, username, password, **opts), build_script(kind, target))
+    out = _decode(out_b).strip()
+    if code != 0 and "{" not in out:
+        raise RemoteError(f"resource script exited {code}: {(_decode(err_b).strip() or out)[:500]}")
+    return _last_json(out, "resource")
+
+
 def _netsh_args(action: str, ip: str) -> list[str]:
     name = f'name="{BAN_RULE_PREFIX}{ip}"'
     if action == "add":
@@ -531,6 +548,32 @@ class RemoteManager:
             "certs": certs, "w3svc_state": "RUNNING", "was_state": "RUNNING",
             "uptime_seconds": round(time.time() - st["boot"]),
         }
+
+    # ------------------------------------------------------------------ resource monitor
+    async def resources(self, server_id: int, kind: str, target: str, health: dict[str, Any] | None = None) -> dict[str, Any]:
+        """On-demand performance metrics for one IIS site, app pool or the whole server."""
+        server = self.registry.get(server_id)
+        if server is None:
+            raise RemoteError(f"server {server_id} is not registered")
+        key = (server_id, f"resources:{kind}:{target}")
+        timeout = self._timeout() + 20
+        if server.get("simulated"):
+            await asyncio.sleep(random.uniform(0.3, 0.8))
+            raw, source = simulate_resources(server, health or self._simulated_health(server), kind, target), "simulated"
+        elif server_id == LOCAL_SERVER_ID:
+            if not IS_WINDOWS:
+                raise RemoteError("the local host is not Windows, so there is no IIS to query")
+            out = await self._guard.shared(key, timeout, run_local, kind, target, timeout)
+            raw, source = _last_json(out, "resource"), "local"
+        else:
+            raw = await self._guard.shared(
+                key, timeout, get_remote_resources, server["ip_address"], server["winrm_username"],
+                server["winrm_password"], kind, target, **self._opts(server, self._timeout()),
+            )
+            source = "winrm"
+        result = normalize_resources(raw, server_id=server_id, server_name=server["server_name"], source=source)
+        result["collected_at"] = iso(utcnow())
+        return result
 
     # ------------------------------------------------------------------ logs
     def _tailer_for(self, server: dict[str, Any]) -> SiteSetTailer | None:
