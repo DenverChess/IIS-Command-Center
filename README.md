@@ -76,7 +76,9 @@ backoff **while the rest of the fleet keeps streaming**.
 - Perimeter bans on **SonicWall**, pfSense / OPNsense or Palo Alto, with SonicWall address-group management in the UI
 - Ban history, one-click unban, dismiss without action
 - **Live log search** (full-text, status / IP / URI / date filters) over everything Sentinel has stored
-- Click any IP for **WHOIS / IP intel**: owner, network, abuse contact, reverse DNS, its request history, ban on any server
+- Click any IP for **WHOIS / IP intel**: owner, network, abuse contact, reverse DNS, **ban history** (every time Sentinel has banned it, single IP or range, active or lifted), AbuseIPDB reputation, its request history, ban on any server
+- **AbuseIPDB score** next to Sentinel's own score in the pending queue and the threat matrix
+- Four UI themes: **Cyber**, **Dark**, **Lite** and **Large Print**
 - Nothing is ever blocked automatically: a human always approves
 
 </td>
@@ -331,15 +333,37 @@ Pick one provider with the radio buttons. The setup steps for each one are shown
   committed configuration.
 - **Errors:** wrong credentials, a missing group and HTTP 429 rate limiting each get a clear error. A 429 is retried
   automatically, honouring `Retry-After`.
-- **Open the settings:** the **Perimeter Firewall** card in the right-hand panel shows where bans go and opens
-  **FIREWALL SETTINGS**.
+- **Open the settings:** **CONFIG → FIREWALL**. The **BANS →** label in the threat matrix header shows where bans go
+  and turns red with *(NOT READY)* when the firewall can't be reached.
+
+### AbuseIPDB reputation
+
+Set up the account under **CONFIG → GENERAL**: tick *Enable*, paste the API key from
+[abuseipdb.com/account/api](https://www.abuseipdb.com/account/api) and press **TEST KEY**. The free plan allows 1,000
+checks a day. Sentinel looks up the IPs in the pending queue and the threat matrix in the background and caches each
+result (24 h by default, stored in the database so restarts don't use up quota). Private and LAN addresses are never
+sent. The badge next to Sentinel's score is green below 25, amber from 25 and red from 75. If you hit the daily limit
+or the key is rejected, lookups pause and the badges keep their cached values. The dashboard keeps working without
+AbuseIPDB.
+
+### Ban history
+
+Clicking an IP anywhere (pending threats, threat matrix, alert stream, banned lists) opens the WHOIS dialog, which now
+starts with a headline such as *Banned 3 times by Sentinel (2 single-IP + 1 range) · 2 active now* and a **BAN HISTORY**
+table: when, server or firewall, scope, reason, who approved it, and when and by whom it was lifted. Range bans that
+contain the IP count too. Lifted bans are kept, so the history keeps growing.
+
+### Themes
+
+**CONFIG → GENERAL** offers **Cyber** (the original look), **Dark**, **Lite** and **Large Print** (bigger text and
+controls). The choice is saved per browser; *Default theme* sets what new browsers start with.
 
 ### Locations in the threat matrix
 
 The GEO column comes from a local GeoIP database. On first start, Sentinel downloads the free DB-IP *IP to City Lite*
 database (CC BY 4.0, about 130 MB, no account needed) into `data\geoip\` and refreshes it monthly. A MaxMind
 `GeoLite2-City.mmdb` placed in that folder takes precedence. On a host without internet access, Sentinel shows the
-WHOIS registry country instead. You can turn the download off under **WATCHERS**.
+WHOIS registry country instead. You can turn the download off under **GENERAL**.
 
 <table>
 <tr>
@@ -562,10 +586,15 @@ Every log line, health sample, threat and alert pushed over the WebSocket carrie
 | `POST` | `/defense/ban` | `{alert_id}` (or `{server_id, ip}`): firewall ban on the alert's server; the alert becomes `Approved` |
 | `POST` | `/defense/dismiss` | `{alert_id}`: the alert becomes `Dismissed` |
 | `GET` / `DELETE` | `/defense/bans`, `/defense/bans/{id}` | Active bans / lift a ban |
-| `GET` / `POST` | `/config` | `ad`, `exchange`, `watchers`, `reports`, `alerts`, `firewall` sections (secrets masked) |
+| `GET` / `POST` | `/config` | `general`, `ad`, `exchange`, `watchers`, `reports`, `alerts`, `firewall` sections (secrets masked) |
 | `GET` | `/alerts/catalog` | Every notifiable event with its defaults, plus Exchange delivery status |
 | `POST` | `/alerts/test` | `{desktop, email, severity}`: raise a test notification and optionally send a test email |
-| `GET` | `/threats/whois/{ip}?refresh=` | RDAP WHOIS + reverse DNS (cached 6 h), active bans and alert count for an IP |
+| `GET` | `/threats/whois/{ip}?refresh=` | RDAP WHOIS + reverse DNS (cached 6 h), active bans, alert count and `history` (ban history) for an IP |
+| `GET` | `/threats/ban-history/{ip}` | `{total, ip_bans, range_bans, active, first_banned, last_banned, events[]}`: every single-IP and containing range ban, active or lifted |
+| `GET` | `/intel/abuseipdb` | AbuseIPDB status: enabled, configured, daily limit / remaining, cache size, queue, pause |
+| `POST` | `/intel/abuseipdb/lookup` | `{ips: [...]}`: cached results now, the rest queued (results arrive over the WebSocket) |
+| `GET` | `/intel/abuseipdb/{ip}?refresh=` | Look up one IP now |
+| `POST` | `/intel/abuseipdb/test` | `{api_key?}`: test a key (unsaved or saved) without affecting live lookups |
 | `POST` | `/config/test/exchange` | Send a test mail |
 | `POST` | `/defense/ban-all` | `{alert_ids: [...]}`: ban every attacker behind those Pending alerts. Returns `{banned, failed, skipped, alert_ids, ip_count, server_count}` |
 | `GET` | `/intel/recommend-cidr?ip=&server_id=` | Escalation recommendation `{recommended_cidr, scope, reason, attack_count, attacker_ips, options[]}` plus WHOIS (or `whois_error`), allowlist hits, ready targets |
@@ -585,7 +614,7 @@ Every log line, health sample, threat and alert pushed over the WebSocket carrie
 | `GET` | `/stats/baseline?server_id=` | Baseline model, pipeline and watcher status |
 | `GET` / `POST` | `/alerts?server_id=&status=&severity=`, `/alerts/{id}/ack` | Alert history / acknowledge |
 | `GET` / `POST` | `/reports`, `/reports/run`, `/reports/{id}/html` | Report history, run now, view HTML |
-| `WS` | `/ws/dashboard` | `hello` `logs` `health` `servers` `server_status` `threats` `alert` `ban` `alert_status` `range_ban_notification` (`{cidr, scope, reason, firewall_target}`) `range_unban` `allowlist` `baseline` `tick` |
+| `WS` | `/ws/dashboard` | `hello` `logs` `health` `servers` `server_status` `threats` `alert` `ban` `alert_status` `range_ban_notification` (`{cidr, scope, reason, firewall_target}`) `range_unban` `allowlist` `abuseipdb` `general` `baseline` `tick` |
 
 </details>
 
