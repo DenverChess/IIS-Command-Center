@@ -312,7 +312,7 @@
           <div class="panel-head">
             <span class="title" x-text="'Server Health :: ' + selectedName()"></span>
             <span class="meta">
-              <span x-text="health.hostname || (serverById(selId()) || {}).ip_address || '—'"></span>
+              <button class="chip" @click="openResources('server', '', 'All sites')" title="Live performance metrics for every site and app pool on this server">RESOURCES</button>
               <button class="chip" @click="selectServer('all')">◂ FLEET</button>
             </span>
           </div>
@@ -337,13 +337,27 @@
               </template>
             </div>
 
+            <div class="section-label"><span>IIS SITES</span><span x-text="(health.sites || []).length ? 'CLICK FOR LIVE METRICS' : ''"></span></div>
+            <div class="pools">
+              <template x-for="s in (health.sites || [])" :key="s.id">
+                <button type="button" class="pool clickable" :class="{ down: !s.running }" @click="openResources('site', s.id, s.name)"
+                        :title="'Live performance metrics for ' + s.name + ((s.bindings || []).length ? '\n' + s.bindings.join('\n') : '')">
+                  <span class="name"><span class="dot" :class="s.running ? 'run' : 'down'"></span><span x-text="s.name"></span><span class="site-id" x-text="'#' + s.id"></span></span>
+                  <span class="state" x-text="(s.running ? 'RUNNING' : String(s.state || 'UNKNOWN').toUpperCase()) + ' ›'"></span>
+                </button>
+              </template>
+              <div class="muted" style="font-size:11px" x-show="!(health.sites || []).length"
+                   x-text="health.online === false ? 'NO TELEMETRY' : 'NO SITE LIST FROM THIS SERVER YET'"></div>
+            </div>
+
             <div class="section-label"><span>IIS APP POOLS</span><span x-text="(health.app_pool_source || '').toUpperCase()"></span></div>
             <div class="pools">
               <template x-for="p in (health.app_pools || [])" :key="p.name">
-                <div class="pool" :class="{ down: !p.running }">
+                <button type="button" class="pool clickable" :class="{ down: !p.running }" @click="openResources('pool', p.name, p.name)"
+                        :title="'Live performance metrics for app pool ' + p.name">
                   <span class="name"><span class="dot" :class="p.running ? 'run' : 'down'"></span><span x-text="p.name"></span></span>
-                  <span class="state" x-text="p.running ? 'RUNNING' : p.state.toUpperCase()"></span>
-                </div>
+                  <span class="state" x-text="(p.running ? 'RUNNING' : p.state.toUpperCase()) + ' ›'"></span>
+                </button>
               </template>
               <div class="muted" style="font-size:11px" x-show="!(health.app_pools || []).length"
                    x-text="health.app_pool_error ? 'APP POOL QUERY UNAVAILABLE: ' + health.app_pool_error : (health.online === false ? 'NO TELEMETRY' : 'AWAITING TELEMETRY…')"></div>
@@ -353,6 +367,7 @@
             <div class="kv">
               <span class="k">W3SVC</span><span class="v" :class="svcClass(health.w3svc_state)" x-text="health.w3svc_state || '—'"></span>
               <span class="k">WAS</span><span class="v" :class="svcClass(health.was_state)" x-text="health.was_state || '—'"></span>
+              <span class="k">HOSTNAME</span><span class="v" x-text="(health.hostname || '—') + ' · ' + ((serverById(selId()) || {}).ip_address || '—')"></span>
               <span class="k">UPTIME</span><span class="v neon-cyan" x-text="fmtDuration(health.uptime_seconds)"></span>
               <span class="k">LOG VOLUME FREE</span><span class="v" x-text="health.disk_free_gb != null ? health.disk_free_gb.toFixed(1) + ' GB (' + health.disk_path + ')' : '—'"></span>
               <span class="k">RAM</span><span class="v" x-text="health.ram_total_gb ? health.ram_used_gb + ' / ' + health.ram_total_gb + ' GB' : '—'"></span>
@@ -985,6 +1000,189 @@
           <button class="btn" x-show="cfgTab !== 'servers' && cfgTab !== 'allowlist'" @click="saveConfig()" :disabled="busy || !form">SAVE <span x-text="cfgTab.toUpperCase()"></span></button>
         </div>
       </aside>
+    </div>
+
+    <!-- ============================================================ RESOURCE MONITOR -->
+    <div class="overlay center" x-show="res.open" x-cloak @click.self="closeResources()" @keydown.escape.window="!whoisOpen && closeResources()">
+      <template x-if="res.open">
+      <div class="modal wide" role="dialog" aria-label="Resource monitor">
+        <div class="modal-head">
+          <div>
+            <div class="ip" x-text="res.label"></div>
+            <div class="sub" x-text="resTitle()"></div>
+          </div>
+          <span class="grow"></span>
+          <span class="live-dot" :class="{ on: res.auto && !res.error }" x-text="res.loading ? 'SAMPLING…' : (res.auto ? 'LIVE · 5s' : 'PAUSED')"></span>
+          <button class="btn small ghost" @click="res.auto = !res.auto" x-text="res.auto ? 'PAUSE' : 'RESUME'"></button>
+          <button class="btn small" @click="loadResources()" :disabled="res.loading">REFRESH</button>
+          <button class="btn small ghost" @click="closeResources()">CLOSE ✕</button>
+        </div>
+        <div class="modal-body">
+          <div class="spinner-line" x-show="res.loading && !res.data">RUNNING WINRM QUERY ON <span x-text="res.serverName"></span>…</div>
+          <div class="notice err" x-show="res.error" x-text="res.error + (res.data ? ' (showing the last good sample)' : '')"></div>
+          <template x-for="(n, i) in RD().notes" :key="i"><div class="notice warn" x-text="n"></div></template>
+
+          <template x-if="res.data">
+          <div>
+            <div class="res-tiles">
+              <template x-for="t in resTiles()" :key="t.k">
+                <div class="metric-card" :class="[t.cls, t.big ? 'big' : '']">
+                  <div class="l" x-text="t.k"></div>
+                  <div class="v" x-text="t.v"></div>
+                  <div class="b" x-text="t.sub"></div>
+                </div>
+              </template>
+            </div>
+
+            <div class="whois-grid">
+              <div>
+                <template x-if="RD().site">
+                  <div>
+                    <div class="section-label"><span>SITE</span><span x-text="'ID ' + RS().id + ' · ' + RS().log_folder"></span></div>
+                    <div class="kv wrap">
+                      <span class="k">STATE</span><span class="v" :class="RS().state === 'Started' ? 'neon-green' : 'neon-red'" x-text="RS().state + (RS().auto_start ? ' · AUTO-START' : '')"></span>
+                      <span class="k">BINDINGS</span><span class="v" x-text="resBindings(RS())"></span>
+                      <span class="k">MAX CONNECTIONS</span><span class="v" x-text="RS().max_connections == null ? 'Unlimited' : fmtNum(RS().max_connections)"></span>
+                      <span class="k">MAX BANDWIDTH</span><span class="v" x-text="RS().max_bandwidth == null ? 'Unlimited' : fmtBytes(RS().max_bandwidth) + '/s'"></span>
+                      <span class="k">CONNECTION TIMEOUT</span><span class="v" x-text="RS().connection_timeout_s != null ? RS().connection_timeout_s + ' s' : '—'"></span>
+                      <span class="k">LOGGING</span><span class="v" x-text="(RS().log_enabled ? '' : 'OFF · ') + (RS().log_dir || '—')"></span>
+                    </div>
+                  </div>
+                </template>
+                <template x-if="!RD().site">
+                  <div>
+                    <div class="section-label"><span x-text="res.kind === 'pool' ? 'SITES USING THIS POOL' : 'SITES'"></span><span x-text="RD().sites.length"></span></div>
+                    <div class="kv wrap">
+                      <template x-for="s in RD().sites" :key="s.id">
+                        <span style="display:contents">
+                          <span class="k"><a class="ip-link" @click="openResources('site', s.id, s.name)" x-text="s.name"></a></span>
+                          <span class="v" :class="s.state === 'Started' ? '' : 'neon-red'" x-text="s.state + ' · ' + resBindings(s)"></span>
+                        </span>
+                      </template>
+                    </div>
+                    <div class="muted small" x-show="!RD().sites.length">No sites run in this pool.</div>
+                  </div>
+                </template>
+              </div>
+              <div>
+                <div class="section-label"><span>HOST</span><span x-text="(RD().source || '').toUpperCase()"></span></div>
+                <div class="kv wrap">
+                  <span class="k">OS</span><span class="v" x-text="RD().host.os || '—'"></span>
+                  <span class="k">CPU</span><span class="v" x-text="(RD().host.cpu_percent != null ? RD().host.cpu_percent.toFixed(1) + '% · ' : '') + (RD().host.cpu_count || '?') + ' logical cores'"></span>
+                  <span class="k">RAM</span><span class="v" x-text="RD().host.ram_total_bytes ? fmtBytes(RD().host.ram_used_bytes) + ' / ' + fmtBytes(RD().host.ram_total_bytes) : '—'"></span>
+                  <span class="k">UPTIME</span><span class="v" x-text="fmtDuration(RD().host.uptime_seconds)"></span>
+                  <span class="k">SAMPLED</span><span class="v" x-text="fmtTime(RD().collected_at) + ' · query took ' + (RD().duration_ms / 1000).toFixed(1) + ' s'"></span>
+                </div>
+              </div>
+            </div>
+
+            <template x-if="RD().site && RS().applications.length">
+              <div>
+                <div class="section-label"><span>APPLICATIONS</span><span x-text="RS().applications.length"></span></div>
+                <table class="mini">
+                  <colgroup><col style="width:22%"><col style="width:24%"><col style="width:54%"></colgroup>
+                  <thead><tr><th>PATH</th><th>APP POOL</th><th>PHYSICAL PATH</th></tr></thead>
+                  <tbody><template x-for="a in RS().applications" :key="a.path">
+                    <tr><td x-text="a.path"></td><td><a class="ip-link" @click="openResources('pool', a.pool, a.pool)" x-text="a.pool"></a></td>
+                        <td :title="a.physical_path" x-text="a.physical_path || '—'"></td></tr>
+                  </template></tbody>
+                </table>
+              </div>
+            </template>
+
+            <div class="section-label"><span>APPLICATION POOLS</span><span x-text="RD().pools.length"></span></div>
+            <table class="mini" x-show="RD().pools.length">
+              <colgroup><col style="width:17%"><col style="width:9%"><col style="width:13%"><col style="width:16%"><col style="width:8%"><col style="width:15%"><col style="width:10%"><col style="width:12%"></colgroup>
+              <thead><tr><th>POOL</th><th>STATE</th><th>RUNTIME</th><th>IDENTITY</th><th>QUEUE</th><th>RECYCLE</th><th>IDLE</th><th>CPU LIMIT</th></tr></thead>
+              <tbody><template x-for="p in RD().pools" :key="p.name">
+                <tr>
+                  <td :title="p.name"><a class="ip-link" @click="res.kind !== 'pool' && openResources('pool', p.name, p.name)" x-text="p.name"></a></td>
+                  <td :class="p.state === 'Started' ? '' : 'bad'" x-text="p.state"></td>
+                  <td :title="(p.enable32 ? '32-bit · ' : '64-bit · ') + 'start mode ' + (p.start_mode || '—')" x-text="(p.runtime || 'No managed code') + ' ' + (p.pipeline || '')"></td>
+                  <td :title="p.user" x-text="p.identity + (p.user ? ' (' + p.user + ')' : '')"></td>
+                  <td x-text="fmtNum(p.queue_length)"></td>
+                  <td :title="'Requests: ' + (p.recycle_requests || 'off') + ' · memory: ' + (p.recycle_memory_kb ? fmtBytes(p.recycle_memory_kb * 1024) : 'off') + ' · private: ' + (p.recycle_private_kb ? fmtBytes(p.recycle_private_kb * 1024) : 'off')"
+                      x-text="(p.recycle_minutes ? fmtSpan(p.recycle_minutes * 60) : 'off') + (p.recycle_schedule.length ? ' + ' + p.recycle_schedule.join(', ') : '')"></td>
+                  <td x-text="p.idle_timeout_min ? p.idle_timeout_min + ' min' : 'off'"></td>
+                  <td :title="'Rapid-fail protection ' + (p.rapid_fail ? 'on (' + p.rapid_fail_max + ' crashes)' : 'off')" x-text="p.cpu_limit ? (p.cpu_limit / 1000) + '% · ' + p.cpu_action : 'none'"></td>
+                </tr>
+              </template></tbody>
+            </table>
+
+            <div class="section-label"><span>WORKER PROCESSES (W3WP)</span><span x-text="RD().processes.length"></span></div>
+            <div class="muted small" x-show="!RD().processes.length">No worker process is running (the pool is stopped or idle; IIS starts one on the next request).</div>
+            <table class="mini" x-show="RD().processes.length">
+              <colgroup><col style="width:8%"><col style="width:16%"><col style="width:8%"><col style="width:11%"><col style="width:11%"><col style="width:9%"><col style="width:8%"><col style="width:9%"><col style="width:9%"><col style="width:11%"></colgroup>
+              <thead><tr><th>PID</th><th>POOL</th><th>CPU</th><th>PRIVATE</th><th>WORKING SET</th><th>HANDLES</th><th>THREADS</th><th>ACTIVE REQ</th><th>REQ/SEC</th><th>STARTED</th></tr></thead>
+              <tbody><template x-for="w in RD().processes" :key="w.pid">
+                <tr>
+                  <td x-text="w.pid"></td><td :title="w.pool" x-text="w.pool"></td>
+                  <td :class="w.cpu_percent > 80 ? 'bad' : w.cpu_percent > 50 ? 'warn' : ''" x-text="w.cpu_percent != null ? w.cpu_percent.toFixed(1) + '%' : '—'"></td>
+                  <td :title="'Virtual ' + fmtBytes(w.virtual_bytes) + ' · peak working set ' + fmtBytes(w.peak_working_set)" x-text="fmtBytes(w.private_bytes)"></td>
+                  <td x-text="fmtBytes(w.working_set)"></td><td x-text="fmtNum(w.handles)"></td><td x-text="w.threads"></td>
+                  <td x-text="w.active_requests != null ? w.active_requests : '—'"></td>
+                  <td x-text="w.requests_per_sec != null ? fmtUnit(w.requests_per_sec, '/s') : '—'"></td>
+                  <td :title="w.started + ' · CPU time ' + fmtSpan(Math.round(w.cpu_seconds || 0))" x-text="fmtDate(w.started) + ' ' + fmtTime(w.started)"></td>
+                </tr>
+              </template></tbody>
+            </table>
+
+            <div class="section-label"><span>REQUESTS EXECUTING NOW</span><span x-text="RD().requests.length ? RD().requests.length + ' · LONGEST FIRST' : ''"></span></div>
+            <div class="muted small" x-show="!RD().requests.length" x-text="RD().headline.requests_in_flight == null ? 'Not available on this server (see the note above).' : 'No requests executing at the moment of the sample.'"></div>
+            <table class="mini" x-show="RD().requests.length">
+              <colgroup><col style="width:9%"><col style="width:6%"><col style="width:33%"><col style="width:15%"><col style="width:13%"><col style="width:12%"><col style="width:12%"></colgroup>
+              <thead><tr><th>ELAPSED</th><th>VERB</th><th>URL</th><th>HOST</th><th>CLIENT</th><th>STAGE</th><th>MODULE</th></tr></thead>
+              <tbody><template x-for="(q, i) in RD().requests" :key="i">
+                <tr>
+                  <td :class="q.elapsed_ms > 5000 ? 'bad' : q.elapsed_ms > 1000 ? 'warn' : ''" x-text="fmtUnit(q.elapsed_ms, 'ms')"></td>
+                  <td x-text="q.verb"></td><td :title="q.url" x-text="q.url"></td><td :title="q.host" x-text="q.host"></td>
+                  <td><a class="ip-link" @click="openWhois(q.client, res.serverId)" x-text="q.client"></a></td>
+                  <td :title="q.stage" x-text="q.stage"></td><td :title="q.module" x-text="q.module"></td>
+                </tr>
+              </template></tbody>
+            </table>
+
+            <template x-if="RD().tcp">
+              <div>
+                <div class="section-label"><span>TCP CONNECTIONS</span>
+                  <span x-text="'PORTS ' + RT().ports.join(', ') + ' · ' + RT().source.toUpperCase()"></span></div>
+                <div class="tcp-states">
+                  <template x-for="s in RT().by_state" :key="s.state">
+                    <span class="chip on" :class="s.state === 'Established' ? '' : 'amber'" x-text="s.state.toUpperCase() + ' ' + fmtNum(s.count)"></span>
+                  </template>
+                  <template x-for="p in RT().by_port" :key="p.port">
+                    <span class="chip" x-text="':' + p.port + ' → ' + fmtNum(p.count) + ' ESTABLISHED'"></span>
+                  </template>
+                </div>
+                <div class="muted small" style="margin:6px 0" x-show="res.kind === 'site'">Counted on this site's ports, so other sites bound to the same port are included. CURRENT CONNECTIONS above is IIS's own per-site count.</div>
+                <div class="top-clients" x-show="RT().top_clients.length">
+                  <template x-for="c in RT().top_clients" :key="c.ip">
+                    <span class="tc"><a class="ip-link" @click="openWhois(c.ip, res.serverId)" x-text="c.ip"></a><b x-text="c.count"></b></span>
+                  </template>
+                </div>
+              </div>
+            </template>
+
+            <div class="section-label"><span x-text="'ALL PERFORMANCE COUNTERS (' + RD().counter_count + ')'"></span>
+              <input class="input counter-filter" type="search" placeholder="filter counters…" x-model="res.filter" aria-label="Filter counters"></div>
+            <div class="muted small" x-show="!RD().counter_groups.length">No performance counters were returned.</div>
+            <div class="counter-groups">
+              <template x-for="g in resGroups()" :key="g.set + '|' + g.instance">
+                <div class="counter-group">
+                  <div class="cg-title" :title="g.title" x-text="g.title"></div>
+                  <div class="kv">
+                    <template x-for="r in g.rows" :key="r.key">
+                      <span style="display:contents"><span class="k" :title="r.name" x-text="r.name"></span><span class="v" x-text="r.text || fmtUnit(r.value, r.unit)"></span></span>
+                    </template>
+                  </div>
+                </div>
+              </template>
+            </div>
+          </div>
+          </template>
+        </div>
+      </div>
+      </template>
     </div>
 
     <!-- ============================================================ WHOIS / IP INTEL -->

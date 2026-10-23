@@ -45,7 +45,7 @@ html:is([data-theme="dark"], [data-theme="lite"], [data-theme="large"]) .log-lin
 html:is([data-theme="dark"], [data-theme="lite"], [data-theme="large"]) :is(.matrix td, .mini td, .alert-item, .report-row, .srv-row, .ev-table td) { border-bottom-color: var(--line); }
 html:is([data-theme="dark"], [data-theme="lite"], [data-theme="large"]) .matrix tbody tr:hover { background: var(--hover); }
 html:is([data-theme="dark"], [data-theme="lite"], [data-theme="large"]) .matrix tr.attacking .payload { color: var(--red); }
-html:is([data-theme="dark"], [data-theme="lite"], [data-theme="large"]) :is(.hcard, .metric-card, .srv-tag, .pool) { background: var(--card); border-color: var(--line); }
+html:is([data-theme="dark"], [data-theme="lite"], [data-theme="large"]) :is(.hcard, .metric-card, .srv-tag, .pool, .counter-group) { background: var(--card); border-color: var(--line); }
 html:is([data-theme="dark"], [data-theme="lite"], [data-theme="large"]) .srv-tag { border-color: var(--line-strong); }
 html:is([data-theme="dark"], [data-theme="lite"], [data-theme="large"]) .hcard:hover { box-shadow: none; border-color: var(--cyan); }
 html:is([data-theme="dark"], [data-theme="lite"], [data-theme="large"]) .hcard.alarm { border-color: var(--red); background: var(--card); }

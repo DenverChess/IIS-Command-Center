@@ -215,6 +215,12 @@ function dashboardApp() {
     whois: { ip: "", data: null, intel: null },
     whoisOpen: false,
 
+    // RESOURCE MONITOR modal (site / app pool / server metrics over WinRM)
+    res: { open: false, loading: false, error: "", kind: "", name: "", label: "", serverId: null, serverName: "",
+           data: null, auto: true, filter: "" },
+    _resSeq: 0,
+    _resTimer: null,
+
     // log search (left panel) — while active, live lines are buffered but not drawn
     SEARCH_STATUS,
     search: { q: "", status: "all", active: false, loading: false, page: 1, pages: 1, total: 0, capped: false,
@@ -1066,6 +1072,118 @@ function dashboardApp() {
         state.abuse = { ip, score: null, error: ab.reason.message };
       }
       state.loading = false;
+    },
+
+    /* ------------------------------------------------------------ RESOURCE MONITOR */
+    openResources(kind, name, label) {
+      const sid = this.selId();
+      if (sid == null) return;
+      clearInterval(this._resTimer);
+      this.res = {
+        open: true, loading: true, error: "", kind, name: name == null ? "" : String(name),
+        label: label || String(name || "") || this.selectedName(), serverId: sid, serverName: this.selectedName(),
+        data: null, auto: true, filter: "",
+      };
+      this.loadResources();
+      this._resTimer = setInterval(() => {
+        if (this.res.open && this.res.auto && !this.res.loading && !document.hidden) this.loadResources();
+      }, 5000);
+    },
+
+    closeResources() {
+      this.res.open = false;
+      clearInterval(this._resTimer);
+      this._resTimer = null;
+      this._resSeq++;
+    },
+
+    async loadResources() {
+      const r = this.res;
+      const seq = ++this._resSeq;
+      r.loading = true;
+      const q = new URLSearchParams({ kind: r.kind, name: r.name });
+      try {
+        const d = await api(`/servers/${r.serverId}/resources?${q}`);
+        if (seq !== this._resSeq || this.res !== r) return;
+        r.data = d;
+        r.error = "";
+      } catch (e) {
+        if (seq !== this._resSeq || this.res !== r) return;
+        r.error = e.message;
+      } finally {
+        if (seq === this._resSeq) r.loading = false;
+      }
+    },
+
+    RD() {
+      return this.res.data || { headline: {}, host: {}, pools: [], processes: [], requests: [], sites: [], counter_groups: [], notes: [] };
+    },
+
+    RS() {
+      return this.RD().site || { bindings: [], applications: [] };
+    },
+
+    RT() {
+      return this.RD().tcp || { source: "", ports: [], by_state: [], by_port: [], top_clients: [] };
+    },
+
+    resTitle() {
+      const k = { site: "IIS SITE", pool: "APP POOL", server: "SERVER" }[this.res.kind] || "";
+      return `${k} RESOURCES // ${this.res.serverName}` + (this.RD().hostname ? ` (${this.RD().hostname})` : "");
+    },
+
+    fmtUnit(v, unit) {
+      if (v == null || Number.isNaN(Number(v))) return "—";
+      v = Number(v);
+      switch (unit) {
+        case "%": return `${v.toFixed(1)}%`;
+        case "B": return this.fmtBytes(v);
+        case "B/s": return `${this.fmtBytes(v)}/s`;
+        case "MB": return this.fmtBytes(v * 1048576);
+        case "ms": return `${Math.round(v).toLocaleString()} ms`;
+        case "s": return v >= 120 ? this.fmtSpan(Math.round(v)) : v > 0 && v < 1 ? `${(v * 1000).toFixed(1)} ms` : `${v.toFixed(1)} s`;
+        case "bit/s": return v >= 1e9 ? `${(v / 1e9).toFixed(1)} Gbit/s` : `${Math.round(v / 1e6)} Mbit/s`;
+        case "/s": return `${v >= 100 ? Math.round(v).toLocaleString() : v.toFixed(1)}/s`;
+        default: return Number.isInteger(v) ? v.toLocaleString() : v.toFixed(2);
+      }
+    },
+
+    resTiles() {
+      const h = this.RD().headline || {};
+      const n = (v) => (v == null ? "—" : this.fmtNum(Math.round(v)));
+      const tiles = [
+        { k: "CURRENT CONNECTIONS", v: n(h.current_connections), big: true,
+          sub: [h.peak_connections != null ? `peak ${n(h.peak_connections)} since IIS start` : "",
+                h.server_current_connections != null ? `server total ${n(h.server_current_connections)}` : ""].filter(Boolean).join(" · ") },
+        { k: "ACTIVE REQUESTS", v: n(h.active_requests), cls: h.active_requests > 50 ? "warn" : "",
+          sub: h.requests_in_flight != null ? `${h.requests_in_flight} listed below` : "executing in w3wp" },
+        { k: "REQUESTS / SEC", v: h.requests_per_sec == null ? "—" : this.fmtUnit(h.requests_per_sec, "/s"), sub: "all HTTP methods" },
+        { k: "BANDWIDTH", v: h.bytes_per_sec == null ? "—" : this.fmtUnit(h.bytes_per_sec, "B/s"), sub: "sent + received" },
+        { k: "TCP ESTABLISHED", v: n(h.tcp_established), sub: h.unique_clients != null ? `${n(h.unique_clients)} unique client IPs` : "" },
+        { k: "QUEUED REQUESTS", v: n(h.http_queue), cls: h.http_queue > 0 ? "warn" : "",
+          sub: `HTTP.sys queue` + (h.asp_queued != null ? ` · ASP.NET ${n(h.asp_queued)}` : "") + (h.http_rejected ? ` · ${n(h.http_rejected)} rejected` : "") },
+        { k: "W3WP CPU", v: h.w3wp_cpu_percent == null ? "—" : `${h.w3wp_cpu_percent.toFixed(1)}%`, cls: h.w3wp_cpu_percent > 80 ? "bad" : h.w3wp_cpu_percent > 50 ? "warn" : "",
+          sub: `${h.worker_processes || 0} worker process${h.worker_processes === 1 ? "" : "es"}` },
+        { k: "W3WP MEMORY", v: h.w3wp_private_bytes == null ? "—" : this.fmtBytes(h.w3wp_private_bytes),
+          sub: h.w3wp_working_set != null ? `private · ${this.fmtBytes(h.w3wp_working_set)} working set` : "private bytes" },
+        { k: "CURRENT USERS", v: n(h.current_users), sub: "anonymous + authenticated" },
+        { k: "RECYCLES / FAILURES", v: `${n(h.pool_recycles)} / ${n(h.worker_failures)}`, cls: h.worker_failures > 0 ? "warn" : "",
+          sub: "app pool recycles / worker failures" },
+      ];
+      return tiles;
+    },
+
+    resGroups() {
+      const f = (this.res.filter || "").trim().toLowerCase();
+      const groups = this.RD().counter_groups || [];
+      if (!f) return groups;
+      return groups
+        .map((g) => (g.title.toLowerCase().includes(f) ? g : { ...g, rows: g.rows.filter((r) => r.name.toLowerCase().includes(f)) }))
+        .filter((g) => g.rows.length);
+    },
+
+    resBindings(s) {
+      return (s.bindings || []).map((b) => `${b.protocol}/${b.info}`).join("  ·  ") || "—";
     },
 
     WH() {
